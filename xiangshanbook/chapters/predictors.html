@@ -1,0 +1,1395 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>방향과 목적지 예측기 · XiangShanBook</title>
+<meta name="description" content="XiangShan 곤명호 v3(kunminghu-v3)의 TAGE·SC·ITTAGE·RAS를 해부한다. 경로 히스토리와 접힌 히스토리, 실제 인덱스·태그 해시, 할당과 쓸모 카운터, SC 문턱, ITTAGE의 영역 압축, 연결 리스트 RAS를 직접 굴려 본다.">
+<link rel="icon" type="image/svg+xml" href="../favicon.svg">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/common.js"></script>
+<style>
+  .lane-grid { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); padding: 12px 18px; border-top: 1px solid var(--border); }
+  .lane-card { border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; background: var(--bg); font-size: 13px; display: grid; gap: 6px; }
+  .lane-card h5 { margin: 0; font-size: 12.5px; font-family: var(--mono); }
+  .lane-card .seg button { font-size: 12px; padding: 3px 8px; }
+  .hash-input { font: inherit; font-family: var(--mono); font-size: 14px; padding: 6px 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg-elev); color: var(--text); width: 150px; }
+  .event-log { font-family: var(--mono); font-size: 12.5px; line-height: 1.6; padding: 10px 18px; border-top: 1px solid var(--border); background: var(--surface); min-height: 64px; max-height: 150px; overflow-y: auto; }
+  .event-log b { color: var(--accent); }
+  .sc-grid { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); padding: 12px 18px; }
+  .sc-card { border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; background: var(--bg); font-size: 13px; }
+  .sc-card h5 { margin: 0 0 2px; font-size: 12.5px; font-family: var(--mono); }
+</style>
+</head>
+<body data-chapter="predictors">
+<main class="chapter">
+  <header class="chapter-hero">
+    <div class="eyebrow">Chapter 04</div>
+    <h1>방향과 목적지 예측기</h1>
+    <p class="lead">3장에서 BPU의 큰 그림을 봤다. 이 장에서는 s2와 s3에서 최종 답을 내는 예측기를 하나씩 연다. 조건 분기의 <b>방향</b>을 맞히는 TAGE와 SC, 간접 점프의 <b>목적지</b>를 맞히는 ITTAGE, 함수 반환 주소를 맞히는 RAS다. 이들이 공통으로 쓰는 재료는 '지금까지 어떤 길을 지나왔는가'라는 히스토리다. 그래서 히스토리부터 시작한다.</p>
+    <ul class="objectives">
+      <li>경로 히스토리(PHR)와 전역·후방·루프 히스토리가 각각 무엇을 기록하는지 비교한다.</li>
+      <li>TAGE의 실제 인덱스·태그 해시를 PC와 히스토리로 직접 계산한다.</li>
+      <li>수백 비트 히스토리를 몇 비트로 접는 XOR 폴딩과, 매 사이클 증분으로 갱신하는 원리를 확인한다.</li>
+      <li>provider·alt·UseAltOnNa 선택과 할당·쓸모 카운터 정책을 단계별 시뮬레이터로 따라간다.</li>
+      <li>SC의 합과 확신도별 문턱, ITTAGE의 목적지 압축, 연결 리스트로 된 RAS를 만져 본다.</li>
+    </ul>
+  </header>
+
+  <!-- ============================================================ 1 -->
+  <section id="history">
+    <h2>네 가지 히스토리</h2>
+    <p>kunminghu-v3의 BPU에는 히스토리가 두 모듈로 나뉘어 있다. <code>history/phr</code>의 <span class="term">PHR</span><span class="en">(path history register)</span>은 taken 분기가 지나갈 때마다 그 분기 주소와 목적지로 만든 15비트 경로 해시를 섞어 넣는다. 한 번에 2비트를 밀어 넣고, 나머지 13비트는 최근 비트들에 XOR한다. TAGE, ITTAGE, uTAGE, SC의 Path 테이블이 모두 이 PHR을 접어 쓴다. <code>history/commonhr</code>에는 SC의 나머지 테이블이 쓰는 세 히스토리가 있다.</p>
+    <div class="table-wrap"><table>
+      <tr><th>히스토리</th><th>무엇을 기록하나</th><th>길이</th><th>쓰는 곳</th></tr>
+      <tr><td>PHR</td><td>taken 분기의 경로 해시 <code>Cat(pc[9:1], 0000) ^ target[16:2]</code>, taken마다 2비트 이동</td><td class="mono">532비트</td><td>TAGE, ITTAGE, uTAGE, aBTB 해시, SC Path</td></tr>
+      <tr><td>GHR</td><td>조건 분기 결과. 블록 안 첫 taken 앞의 조건 분기 수만큼 0을 밀고, taken 조건 분기면 1을 붙인다</td><td class="mono">16비트</td><td>SC Global</td></tr>
+      <tr><td>BWHR</td><td>GHR과 같은 규칙인데, 붙이는 비트가 'taken이면서 후방 분기인가'</td><td class="mono">8비트</td><td>SC BW</td></tr>
+      <tr><td>IMLI</td><td>안쪽 루프 반복 횟수. 후방 taken 조건 분기면 +1(255에서 포화), 아니면 0</td><td class="mono">8비트</td><td>SC IMLI</td></tr>
+    </table></div>
+    <p>PHR의 길이 532는 가장 긴 히스토리 테이블(TAGE 397) + FTQ가 가득 찼을 때 쌓일 수 있는 이동량(2 × 64) + 여유 4를 4의 배수로 올린 값이다(<code>FrontendParameters.scala:40-58</code>). 덮어쓰기나 리다이렉트로 되돌아갈 때 지워진 비트를 되살려야 하므로 그만큼 더 길게 둔다.</p>
+
+    <div class="sim" id="sim-history">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>한 블록이 네 히스토리를 어떻게 바꾸나</h3>
+        <div class="ctrl-row"><button class="btn sm primary" id="hz-apply">이 블록을 실행 →</button><button class="btn sm" id="hz-reset">비우기</button></div>
+      </div>
+      <div class="sim-view"><canvas id="cv-history"></canvas></div>
+      <div class="lane-grid" id="hz-lanes"></div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">조건 분기 적중 수 numHit</span><span class="v" id="hz-hit">—</span></div>
+        <div class="stat"><span class="k">첫 taken 앞 numLess</span><span class="v" id="hz-less">—</span></div>
+        <div class="stat"><span class="k">GHR 이동</span><span class="v" id="hz-shift">—</span></div>
+        <div class="stat"><span class="k">IMLI</span><span class="v" id="hz-imli">—</span></div>
+      </div>
+      <figcaption><span class="try">눌러 보기</span>한 페치 블록 안의 조건 분기 네 개를 켜고 끄고, 방향(taken/not)과 후방 여부를 고른다. 블록 끝은 첫 taken 분기다. '이 블록을 실행'을 누르면 GHR·BWHR은 <code>getNewHR</code> 규칙대로, IMLI는 후방 taken 조건 분기 여부로, PHR은 taken이 있을 때만 바뀐다. 모든 분기가 not taken이면 GHR은 조건 분기 수만큼 0만 밀려 들어오고 PHR은 그대로다. 이 차이가 아래 TAGE 시뮬레이터에서 중요해진다.</figcaption>
+    </div>
+    <div class="callout code"><strong>getNewHR: 블록 하나로 GHR을 갱신하는 규칙</strong>
+<pre><code><span class="c">// frontend/bpu/history/commonhr/Helpers.scala:25-35 (요약)</span>
+<span class="k">def</span> getNewHR(oldGhr, numLess, numHit, taken, isCond, histBit = None)(histLen) = {
+  <span class="k">val</span> numShift = Mux(taken, numLess, numHit)
+  Mux(isCond &amp;&amp; taken,
+      Cat(oldGhr &lt;&lt; numShift, histBit.getOrElse(taken)),   <span class="c">// 0을 numLess개 밀고 1을 붙임</span>
+      oldGhr &lt;&lt; numShift)(histLen - 1, 0)                   <span class="c">// 0만 numHit개 밀어 넣음</span>
+}</code></pre>
+    </div>
+  </section>
+
+  <!-- ============================================================ 2 -->
+  <section id="tage-hash">
+    <h2>TAGE의 인덱스와 태그</h2>
+    <p>TAGE 테이블 8개는 모두 4,096엔트리, 2-way, 4뱅크다. 뱅크 하나에는 512집합이 있으니 집합 번호는 9비트다. 태그는 13비트, 방향 카운터는 3비트, 쓸모 카운터는 2비트다. 테이블마다 보는 PHR 길이만 4, 9, 17, 29, 56, 109, 211, 397로 다르다.</p>
+    <p>시작 주소 PC는 네 필드로 잘린다. 최하위 1비트(명령어 정렬), 뱅크 2비트, 집합 9비트, 태그 13비트다. 집합 번호는 PC의 집합 필드에 그 테이블 길이만큼의 PHR을 9비트로 접은 값을 XOR한다. 태그는 PC의 태그 필드에 PHR을 13비트로 접은 값과 12비트로 접어 한 칸 민 값을 XOR하고, 마지막으로 블록 안 분기 위치(cfiPosition)를 XOR한다. 위치를 섞기 때문에 한 블록 안의 여러 분기가 같은 집합의 서로 다른 way를 나눠 쓸 수 있다.</p>
+    <div class="formula">$$\text{set}_t = \text{pc}[11{:}3] \oplus \text{fold}(\text{PHR}[L_t{-}1{:}0],\,9), \qquad \text{tag}_t = \text{pc}[24{:}12] \oplus \text{fold}(\cdot,\,13) \oplus (\text{fold}(\cdot,\,12) \ll 1) \oplus \text{pos}$$
+      <div class="where">\(L_t\): 테이블 \(t\)의 히스토리 길이. fold(h, w)는 h를 w비트 덩어리로 잘라 모두 XOR한 값이다. \(L_t\)가 w보다 짧으면 w 대신 \(L_t\)비트로 접는다(<code>Types.scala:67-75</code>).</div></div>
+    <div class="sim" id="sim-hash">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>TAGE 해시 계산기</h3></div>
+      <div class="sim-view"><canvas id="cv-hash"></canvas></div>
+      <div class="sim-controls">
+        <div class="ctrl"><span>시작 주소 PC (16진)</span><input class="hash-input" id="hs-pc" value="80001a40" spellcheck="false"></div>
+        <label class="ctrl"><span>블록 안 분기 위치 cfiPosition <output id="hs-pos-out"></output></span><input type="range" id="hs-pos" min="0" max="31" step="1" value="5"></label>
+        <div class="ctrl"><span>PHR 바꾸기</span><div class="ctrl-row"><button class="btn sm" id="hs-taken">taken 분기 하나 지나감</button><button class="btn sm" id="hs-clear">PHR 비우기</button></div></div>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">PC 뱅크</span><span class="v" id="hs-bank">—</span></div>
+        <div class="stat"><span class="k">PC 집합 필드</span><span class="v" id="hs-set">—</span></div>
+        <div class="stat"><span class="k">PC 태그 필드</span><span class="v" id="hs-tag">—</span></div>
+        <div class="stat"><span class="k">지나간 taken 분기</span><span class="v" id="hs-count">0</span></div>
+      </div>
+      <figcaption><span class="try">계산해 보기</span>위쪽 띠는 PHR의 최근 64비트(왼쪽이 가장 최근)다. 아래 표는 테이블별로 실제 해시가 만든 집합 번호와 태그다. 'taken 분기 하나 지나감'을 누르면 무작위 경로 해시가 PHR에 들어간다. 짧은 테이블(T0, T1)은 최근 몇 비트만 보므로 값이 금방 같은 곳으로 돌아오지만, 긴 테이블은 한참 전의 경로까지 기억한다. PHR을 비우면 모든 테이블의 집합 번호가 PC 집합 필드와 같아진다. 분기 위치를 바꾸면 태그만 바뀌고 집합 번호는 그대로다.</figcaption>
+    </div>
+    <div class="callout code"><strong>TableHelper: 필드 나누기와 해시</strong>
+<pre><code><span class="c">// frontend/bpu/tage/Helpers.scala:43-66 (요약)</span>
+<span class="k">val</span> addrFields = AddrField(Seq(
+  (<span class="s">"instOffset"</span>, instOffsetBits), (<span class="s">"bankIdx"</span>, BankIdxWidth),
+  (<span class="s">"setIdx"</span>, SetIdxWidth), (<span class="s">"tag"</span>, TagWidth)), maxWidth = Option(VAddrBits))
+<span class="k">def</span> getSetIndex(pc, hist) = addrFields.extract(<span class="s">"setIdx"</span>, pc) ^ hist
+<span class="k">def</span> getTag(pc, hist, position) =
+  addrFields.extract(<span class="s">"tag"</span>, pc) ^ hist(0) ^ hist(1) ^ position</code></pre>
+    </div>
+  </section>
+
+  <!-- ============================================================ 3 -->
+  <section id="folding">
+    <h2>접힌 히스토리와 증분 갱신</h2>
+    <p>397비트 히스토리를 매 사이클 9비트로 접으려면 XOR 입력이 45개쯤 되는 트리가 테이블마다 필요하다. 그 대신 접힌 값을 레지스터에 들고 다니며 고친다. 히스토리에 비트 하나가 들어오면 기존 비트는 모두 한 칸씩 밀린다. 접힌 값에서는 모든 비트의 자리가 한 칸 돌아가는 것과 같다. 그래서 접힌 값을 왼쪽으로 한 칸 <b>회전</b>하고, 히스토리 끝에서 빠져나가는 비트를 그 자리(L mod w)에서 XOR로 지우고, 새 비트를 0번 자리에 XOR하면 된다. 입력 3개짜리 XOR로 끝난다.</p>
+    <div class="formula">$$F' = \operatorname{rotl}_w(F, 1) \;\oplus\; (h_{L-1} \ll (L \bmod w)) \;\oplus\; b_\text{new}$$
+      <div class="where">\(F\): 접힌 값(w비트), \(h_{L-1}\): 길이 L 히스토리에서 빠져나가는 가장 오래된 비트, \(b_\text{new}\): 새로 들어오는 비트. PHR은 taken마다 2비트를 넣으므로 RTL은 이 과정을 두 번 한꺼번에 하고, 경로 해시의 상위 13비트를 접은 값도 함께 XOR한다(<code>history/phr/Bundles.scala:129-168</code>).</div></div>
+    <figure class="play" id="fig-fold">
+      <div class="play-view"><canvas id="cv-fold"></canvas></div>
+      <div class="play-ctrl">
+        <label class="ctrl"><span>히스토리 길이 L <output id="fd-length-out"></output></span><input type="range" id="fd-length" min="4" max="64" step="1" value="29"></label>
+        <label class="ctrl"><span>접는 폭 w <output id="fd-width-out"></output></span><input type="range" id="fd-width" min="3" max="13" step="1" value="9"></label>
+        <div class="ctrl-row"><button class="btn sm primary" id="fd-push1">1 밀어 넣기</button><button class="btn sm" id="fd-push0">0 밀어 넣기</button><button class="btn sm" id="fd-random">무작위 20개</button></div>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">처음부터 다시 접은 값</span><span class="v" id="fd-full">—</span></div>
+        <div class="stat"><span class="k">증분으로 고친 값</span><span class="v" id="fd-incremental">—</span></div>
+        <div class="stat"><span class="k">일치</span><span class="v" id="fd-match">—</span></div>
+        <div class="stat"><span class="k">빠져나간 비트가 지워지는 자리</span><span class="v" id="fd-out">—</span></div>
+      </div>
+      <figcaption><span class="try">밀어 넣어 보기</span>위의 비트 줄이 히스토리(왼쪽이 최근)이고, w비트마다 색을 바꿔 덩어리를 표시했다. 덩어리들을 세로로 쌓아 XOR한 결과가 아래의 접힌 값이다. 비트 칸을 누르면 뒤집힌다. 그때는 증분 값을 처음부터 다시 맞춘다. 버튼으로 비트를 밀어 넣으면 증분 공식으로만 고친 값과 처음부터 다시 접은 값이 언제나 같다. 길이와 폭을 바꿔 가며 확인해 보자.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ============================================================ 4 -->
+  <section id="tage-policy">
+    <h2>TAGE의 예측과 학습 규칙</h2>
+    <p>예측할 때는 8개 테이블의 태그를 동시에 비교한다. 맞은 테이블 중 가장 긴 히스토리를 쓰는 것이 <span class="term">provider</span>, 그다음이 <span class="term">alt</span>다. provider의 카운터가 막 할당된 약한 상태(3 또는 4)라면 아직 믿기 이르다. 그래서 <span class="term">UseAltOnNa</span> 카운터(5비트, 테이블당 2개, 모두 16개)가 양수일 때는 alt를 쓴다. 이 카운터는 'provider 테이블 번호'와 'alt가 확신하는가'로 고른다. alt가 없으면 mBTB의 기본 카운터가 그 자리를 대신한다(<code>tage/Tage.scala:147-176</code>).</p>
+    <p>학습 규칙은 네 가지다(<code>Tage.scala:405-431, 490-540</code>).</p>
+    <ol>
+      <li><b>카운터</b>: provider의 카운터를 결과 쪽으로 1 움직인다. alt를 실제로 썼다면 alt도 움직인다.</li>
+      <li><b>쓸모</b>: provider가 맞았고 alt(또는 기본)와 답이 달랐다면 provider의 2비트 쓸모 카운터를 +1 한다. 쓸모를 깎는 규칙은 따로 없다.</li>
+      <li><b>할당</b>: 최종 예측이 틀렸으면 provider보다 긴 테이블에 새 엔트리를 하나 만든다. 이미 가장 긴 테이블이 provider였거나, 약한 provider가 사실은 맞았는데 무시된 경우는 빼고 만든다. 테이블마다 빈 way, 약하고 쓸모없는 way, 쓸모없는 way 순으로 후보를 찾는다. 후보가 있는 테이블 중 15비트 LFSR로 무작위로 거른 뒤 가장 짧은 테이블을 고른다. 새 엔트리의 카운터는 결과 쪽 약한 값(4 또는 3), 쓸모는 0이다.</li>
+      <li><b>쓸모 리셋</b>: 할당하려 했는데 자리가 없으면 8비트 카운터를 올린다. 이 카운터가 255에 차면 모든 테이블의 쓸모 카운터를 한꺼번에 0으로 만든다. 오래 자리를 차지하던 엔트리에게 다시 경쟁할 기회를 주는 장치다.</li>
+    </ol>
+    <div class="sim" id="sim-tage">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>축소 TAGE 한 걸음씩</h3>
+        <div class="seg" id="tg-trace"><button data-value="loopOnly" class="on">루프 5회(혼자)</button><button data-value="loopOuter">루프 5회 + 바깥 점프</button><button data-value="alternate">번갈아 T/N</button><button data-value="correlated">상관 분기</button><button data-value="random">무작위 50%</button></div>
+      </div>
+      <div class="sim-view"><canvas id="cv-tage"></canvas></div>
+      <div class="sim-controls" style="grid-template-columns:1fr">
+        <div class="ctrl-row">
+          <button class="btn sm" id="tg-reset">⏮ 처음</button>
+          <button class="btn sm primary" id="tg-step">분기 1개 →</button>
+          <button class="btn sm" id="tg-play">▶ 자동</button>
+          <button class="btn sm" id="tg-fast">+500개</button>
+        </div>
+      </div>
+      <div class="event-log" id="tg-log">버튼을 눌러 시작하자.</div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">관찰 분기 정확도(최근 200)</span><span class="v" id="tg-accuracy">—</span></div>
+        <div class="stat"><span class="k">할당 성공 / 실패</span><span class="v" id="tg-alloc">—</span></div>
+        <div class="stat"><span class="k">쓸모 리셋 카운터</span><span class="v" id="tg-resetCounter">—</span></div>
+        <div class="stat"><span class="k">테이블 점유</span><span class="v" id="tg-occupancy">—</span></div>
+      </div>
+      <figcaption><span class="try">따라가 보기</span>웹용으로 줄인 TAGE다. 테이블은 4개(히스토리 4·9·17·29), 각 32집합 × 2way, 태그 8비트이고, 기본 예측은 PC별 2비트 카운터다. 예측·학습·할당 규칙과 PHR 갱신 방식은 위의 kunminghu-v3 규칙을 그대로 따랐다. 위쪽 격자는 테이블별 엔트리이고, 색은 카운터 방향, 굵은 테두리는 지금 분기가 맞은 칸이다. 아래 기록창에 provider·alt 선택과 학습 동작이 나온다. '루프 5회(혼자)'는 정확도가 80%에서 멈춘다. 이유는 아래 예측해 보기 상자에 있다.</figcaption>
+    </div>
+    <div class="predict"><strong>루프 하나만 도는데 왜 마지막 반복을 못 맞힐까</strong>
+      <p>taken 4번, not taken 1번을 반복하는 루프 분기만 있는 프로그램에서, 축소 TAGE는 정확도 80%에 머문다. 바깥에 taken 점프 하나를 더한 '루프 5회 + 바깥 점프'에서는 100%가 된다. 차이는 어디서 올까?</p>
+      <details><summary>답 보기</summary><p>PHR은 taken 분기만 기록한다. 루프 탈출(not taken) 직후의 PHR은 탈출 직전의 PHR과 똑같다. 그래서 '네 번째 taken 뒤'(다음은 탈출)와 '탈출 뒤 첫 반복'(다음은 taken)이 같은 히스토리로 보이고, 둘 중 하나는 늘 틀린다. 실제 프로그램에서는 루프를 빠져나간 뒤 다른 taken 분기를 지나 다시 루프에 들어오므로 이 문제가 거의 없다. 바깥 점프가 그 역할을 한다. not taken도 0으로 기록하는 GHR을 SC의 Global 테이블이 따로 쓰는 이유 중 하나이기도 하다.</p></details>
+    </div>
+  </section>
+
+  <!-- ============================================================ 5 -->
+  <section id="sc">
+    <h2>SC: TAGE를 고쳐 쓰는 통계적 보정기</h2>
+    <p>kunminghu-v3의 SC<span class="en">(statistical corrector)</span>는 서브테이블 8개를 갖는다. Path 2개(PHR 8·16), Global 2개(GHR 8·16), BW 2개(BWHR 4·8), IMLI 1개(8), Bias 1개다. 모든 테이블은 128집합, 6비트 부호 카운터(−32~31)이고, 블록 안 분기 자리(way 8개)마다 카운터가 따로 있다. Bias 테이블은 히스토리를 보지 않는 대신 TAGE의 '약함' 비트와 '방향' 비트로 칸을 한 번 더 나눈다(<code>sc/Parameters.scala:23-50</code>).</p>
+    <p>예측은 각 카운터 c를 <code>2c+1</code>로 바꿔 모두 더한 합의 부호다. SC가 TAGE를 덮어쓰려면 |합|이 문턱을 넘어야 한다. 문턱은 13비트 카운터 T(초기 1130)를 TAGE provider의 확신도에 따라 다르게 줄인 값이다. 포화(0 또는 7)면 T&gt;&gt;4, 약함(3 또는 4)이면 T&gt;&gt;6, 나머지는 T&gt;&gt;5다. 학습은 SC가 틀렸거나 |합|이 문턱을 넘지 못했을 때만 한다. T도 함께 움직여, SC가 틀리면 +1, 맞았지만 문턱 아래면 −1이다. 다만 [MinThreshold, MaxThreshold] 범위를 벗어나는 값은 받아들이지 않는다. 8개 테이블 기준으로 이 범위는 832부터 8064까지다(<code>sc/Parameters.scala:88-90</code>).</p>
+    <div class="sim" id="sim-sc">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>SC 합과 문턱</h3>
+        <div class="seg" id="sc-preset"><button data-value="agree" class="on">모두 동의</button><button data-value="split">엇갈림</button><button data-value="bias">Bias만 반대</button><button data-value="zero">초기화</button></div>
+      </div>
+      <div class="sc-grid" id="sc-cards"></div>
+      <div class="sim-view"><canvas id="cv-sc"></canvas></div>
+      <div class="sim-controls">
+        <label class="ctrl"><span>TAGE provider 카운터 <output id="sc-tage-out"></output></span><input type="range" id="sc-tage" min="0" max="7" step="1" value="5"></label>
+        <label class="ctrl"><span>문턱 카운터 T <output id="sc-threshold-out"></output></span><input type="range" id="sc-threshold" min="832" max="8064" step="2" value="1130"></label>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">합 SUM</span><span class="v" id="sc-sum">—</span></div>
+        <div class="stat"><span class="k">TAGE 확신도 → 문턱</span><span class="v" id="sc-gate">—</span></div>
+        <div class="stat"><span class="k">최종 방향</span><span class="v" id="sc-final">—</span></div>
+        <div class="stat"><span class="k">학습할까</span><span class="v" id="sc-train">—</span></div>
+      </div>
+      <figcaption><span class="try">만져 보기</span>카드의 슬라이더가 각 서브테이블에서 읽은 카운터다. 아래 막대는 2c+1을 차례로 쌓은 합이고, 회색 띠는 ±문턱이다. 합이 띠 밖으로 나가야 SC를 쓴다. TAGE 카운터를 7로 올리면 문턱이 T/16으로 커져 SC가 쉽게 덮어쓰지 못하고, 3이나 4로 내리면 T/64로 작아진다. '학습할까'는 실제 결과가 SC 예측과 같다고 가정했을 때의 판단이다.</figcaption>
+    </div>
+    <div class="callout code"><strong>확신도별 문턱 고르기</strong>
+<pre><code><span class="c">// frontend/bpu/sc/Sc.scala:267-313 (요약)</span>
+Seq(4, 5, 6).map(shiftRight =&gt; aboveThreshold(percsum, scThreshold(idx).value &gt;&gt; shiftRight))
+<span class="k">val</span> conf = MuxCase(false.B, Seq(
+  (predValid &amp;&amp; tageConfHigh) -&gt; s2_sumAboveThresholdShift1(i),   <span class="c">// T &gt;&gt; 4</span>
+  (predValid &amp;&amp; tageConfMid)  -&gt; s2_sumAboveThresholdShift2(i),   <span class="c">// T &gt;&gt; 5</span>
+  (predValid &amp;&amp; tageConfLow)  -&gt; s2_sumAboveThresholdShift3(i)))  <span class="c">// T &gt;&gt; 6</span>
+s2_useScPred(i) := conf &amp;&amp; io.enable</code></pre>
+    </div>
+    <div class="callout tip"><strong>SC는 TAGE provider가 있어야 움직인다</strong>
+      <p><code>predValid</code>는 mBTB가 그 분기를 알고 TAGE provider가 있을 때만 참이다. provider가 없는 분기에서 SC는 아무 말도 하지 않는다. 그래서 SC는 독립된 예측기가 아니라 TAGE의 답을 통계로 '고쳐 쓰는' 장치다.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ 6 -->
+  <section id="ittage">
+    <h2>ITTAGE: 간접 점프의 목적지</h2>
+    <p>switch 문의 점프 테이블이나 가상 함수 호출처럼 목적지가 레지스터에서 오는 간접 점프는 BTB에 마지막 목적지 하나만 적어 두면 자주 틀린다. ITTAGE는 TAGE와 같은 방식으로 PHR 길이가 다른 테이블 5개(엔트리 256·256·512·512·512, 히스토리 4·8·13·16·32)를 두고, 방향 대신 <b>목적지</b>를 기억한다. 엔트리에는 9비트 태그, 2비트 확신도, 1비트 쓸모, 목적지가 있다.</p>
+    <p>목적지는 통째로 저장하지 않는다. 가상 주소는 H 확장과 Sv48을 켠 기본 설정에서 50비트이고, 목적지는 하위 20비트(<b>오프셋</b>)와 나머지 30비트(<b>영역</b>)로 나뉜다. 대부분의 간접 점프는 같은 1 MiB 영역 안으로 가므로, 엔트리는 오프셋 20비트와 '분기 자신의 영역을 쓰라'는 표시만 갖는다. 다른 영역으로 가는 목적지는 16엔트리 <span class="term">영역 테이블</span>(PLRU 교체)에 영역을 넣고 그 번호(4비트)를 엔트리에 적는다(<code>ittage/RegionWays.scala</code>).</p>
+    <div class="sim" id="sim-region">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>목적지 압축: 영역 + 오프셋</h3></div>
+      <div class="sim-view"><canvas id="cv-region"></canvas></div>
+      <div class="sim-controls">
+        <div class="ctrl"><span>분기 주소 (16진)</span><input class="hash-input" id="rg-pc" value="80004a10" spellcheck="false"></div>
+        <div class="ctrl"><span>목적지 (16진)</span><input class="hash-input" id="rg-target" value="80031200" spellcheck="false"></div>
+        <div class="ctrl"><span>영역 테이블</span><div class="ctrl-row"><button class="btn sm primary" id="rg-write">이 목적지를 학습</button><button class="btn sm" id="rg-far">먼 목적지 여러 개</button><button class="btn sm" id="rg-reset">비우기</button></div></div>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">목적지 영역(상위 30비트)</span><span class="v" id="rg-region">—</span></div>
+        <div class="stat"><span class="k">목적지 오프셋(하위 20비트)</span><span class="v" id="rg-offset">—</span></div>
+        <div class="stat"><span class="k">현재 입력의 인코딩 후보</span><span class="v" id="rg-entry">—</span></div>
+        <div class="stat"><span class="k">목적지당 저장 비트</span><span class="v" id="rg-bits">—</span></div>
+      </div>
+      <div class="info-panel" id="rg-prediction">목적지를 학습하면 저장된 엔트리의 예측을 표시한다.</div>
+      <figcaption><span class="try">넣어 보기</span>분기 주소와 목적지를 바꾸면 영역과 오프셋이 다시 계산된다. 두 영역이 같으면 엔트리는 '분기의 영역 사용' 표시만 남긴다. 다르면 영역 테이블 16칸 중 하나를 찾거나 새로 차지하고, 엔트리에는 그 칸 번호를 적는다. '먼 목적지 여러 개'를 누르면 서로 다른 영역 20개를 차례로 학습시켜, 16칸이 넘칠 때 영역이 교체되는 모습을 보여 준다. 실제 교체는 PLRU이고 이 웹 모델은 LRU로 근사한다. 예측 시에는 포인터가 가리키는 슬롯의 valid만 확인한다. 슬롯이 교체되어도 valid는 유지되므로, 옛 포인터는 새 영역을 읽어 잘못된 목적지를 만들 수 있다(<code>RegionWays.scala:64-68, 82-86</code>). 목적지를 다른 영역으로 바꾸고 학습한 뒤 ‘먼 목적지 여러 개’를 눌러 보자. 아래 ‘저장된 엔트리의 예측’은 처음 학습한 포인터를 유지한 채 현재 슬롯에서 목적지를 복원한다. 학습할 때 영역을 검색하는 동작과 예측할 때 포인터로 읽는 동작은 다르다.</figcaption>
+    </div>
+    <p>예측 규칙도 TAGE와 닮았다. 가장 긴 적중이 provider, 그다음이 alt다. provider의 확신도가 0이고 alt가 있으면 alt의 목적지를 쓴다. 학습에서는 맞으면 확신도 +1, 틀리면 −1이고, 목적지는 <b>확신도가 0일 때만</b> 새것으로 바꾼다. 틀렸을 때는 provider보다 긴 테이블 중 적중하지 않았고 쓸모 비트가 0인 칸에 새 엔트리를 만든다(LFSR로 무작위 선택). 자리가 없으면 8비트 틱 카운터를 올리고, 이 카운터가 차면 쓸모 비트를 모두 지운다(<code>ittage/Ittage.scala:298-400</code>).</p>
+    <div class="sim" id="sim-ittage">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>가상 함수 호출 맞히기</h3>
+        <div class="seg" id="it-pattern"><button data-value="cycle" class="on">A→B→C 순환</button><button data-value="pair">A,A,B,B 반복</button><button data-value="random">무작위</button></div>
+      </div>
+      <div class="sim-view"><canvas id="cv-ittage"></canvas></div>
+      <div class="sim-controls">
+        <label class="ctrl"><span>패턴을 깨는 무작위 비율 <output id="it-noise-out"></output></span><input type="range" id="it-noise" min="0" max="0.5" step="0.05" value="0.1"></label>
+        <div class="ctrl-row"><button class="btn sm" id="it-play">▶ 재생</button><button class="btn sm" id="it-reset">처음부터</button></div>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">ITTAGE 정확도(최근 200)</span><span class="v" id="it-ittage">—</span></div>
+        <div class="stat"><span class="k">BTB 마지막 목적지(최근 200)</span><span class="v" id="it-btb">—</span></div>
+        <div class="stat"><span class="k">지금 예측의 출처</span><span class="v" id="it-source">—</span></div>
+      </div>
+      <figcaption><span class="try">돌려 보기</span>하나의 호출 지점 <code>shape-&gt;draw()</code>가 객체 종류에 따라 세 목적지 A, B, C 중 하나로 간다. 이 간접 점프 자체가 taken이므로, 그 목적지가 PHR에 들어가 다음 호출의 문맥이 된다. 막대는 최근 결과(초록=맞음, 빨강=틀림)이고, 위는 축소 ITTAGE(테이블 5개, 32집합), 아래는 마지막 목적지만 기억하는 BTB다. 'A→B→C 순환'에서 무작위 비율이 10%일 때, 2,000번 학습시킨 뒤 최근 200번의 정확도는 ITTAGE 87.5%, 마지막 목적지 BTB 5.5%다(처음 열었을 때 보이는 값). 무작위 비율을 올리면 ITTAGE도 그만큼 떨어진다.</figcaption>
+    </div>
+  </section>
+
+  <!-- ============================================================ 7 -->
+  <section id="ras">
+    <h2>RAS: 연결 리스트로 된 반환 스택</h2>
+    <p>반환 주소 스택은 두 층이다. 아래층은 커밋된 호출만 담는 <b>커밋 스택 16칸</b>이다. 위층은 아직 커밋되지 않은 투기적 호출을 담는 <b>투기 큐 32칸</b>이다. 투기 큐는 단순한 스택이 아니라 원형 버퍼 위의 <span class="term">연결 리스트</span>다. 각 칸은 반환 주소, 3비트 재귀 카운터, 그리고 '바로 아래 칸이 어디인가'를 가리키는 NOS<span class="en">(next of stack)</span> 포인터를 갖는다.</p>
+    <p>포인터는 셋이다. <b>TOSW</b>는 다음 호출을 쓸 칸, <b>TOSR</b>은 지금 스택 꼭대기 칸, <b>BOS</b>는 커밋이 끝난 경계다. 호출하면 TOSW 칸에 주소와 NOS=TOSR을 쓰고 TOSR=TOSW, TOSW+1이 된다. 반환하면 TOSR을 그 칸의 NOS로 옮길 뿐 칸을 지우지 않는다. 그래서 잘못된 경로에서 반환이 일어나 꼭대기가 내려갔다가 리다이렉트로 되돌아와도, 예측 때 저장해 둔 TOSR·TOSW만 되돌리면 지워지지 않은 칸이 그대로 살아난다. 같은 주소로 연달아 호출하면 새 칸 대신 카운터를 올린다(최대 7, <code>ras/RasStack.scala:134-175</code>).</p>
+    <div class="sim" id="sim-ras">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>투기 큐와 커밋 스택</h3></div>
+      <div class="sim-view"><canvas id="cv-ras"></canvas></div>
+      <div class="sim-controls" style="grid-template-columns:1fr">
+        <div class="ctrl-row">
+          <button class="btn sm" id="rs-call">call f()</button>
+          <button class="btn sm" id="rs-recursive">call (재귀)</button>
+          <button class="btn sm" id="rs-return">return</button>
+          <button class="btn sm primary" id="rs-commit">가장 오래된 것 커밋</button>
+        </div>
+        <div class="ctrl-row">
+          <button class="btn sm" id="rs-wrongCall">잘못된 경로: call</button>
+          <button class="btn sm" id="rs-wrongReturn">잘못된 경로: return</button>
+          <button class="btn sm" id="rs-redirect">리다이렉트(잘못된 경로 취소)</button>
+          <button class="btn sm" id="rs-deep">20단 호출 후 모두 반환</button>
+          <button class="btn sm" id="rs-reset">비우기</button>
+        </div>
+      </div>
+      <div class="event-log" id="rs-log">호출과 반환을 눌러 보자.</div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">TOSR / TOSW / BOS</span><span class="v" id="rs-pointers">—</span></div>
+        <div class="stat"><span class="k">다음 return 예측</span><span class="v" id="rs-top">—</span></div>
+        <div class="stat"><span class="k">커밋 스택 깊이</span><span class="v" id="rs-depth">—</span></div>
+        <div class="stat"><span class="k">커밋 대기 연산</span><span class="v" id="rs-pending">—</span></div>
+      </div>
+      <figcaption><span class="try">눌러 보기</span>왼쪽은 투기 큐 32칸이다. 칸 사이의 곡선 화살표가 NOS 링크이고, 진한 칸은 지금 TOSR에서 링크를 따라 닿는 '살아 있는 스택'이다. 오른쪽은 커밋 스택 16칸이다. '잘못된 경로'로 호출이나 반환을 한 뒤 '리다이렉트'를 누르면 포인터만 되돌아가고 꼭대기가 원래대로 돌아온다. '20단 호출 후 모두 반환'은 서로 다른 호출 20개를 커밋한 뒤 모두 반환한다. 커밋 스택이 16칸이라 가장 깊은 4개의 반환 주소가 덮어써지고, 브라우저 모델에서 반환 20개 중 16개만 맞는다. 이 그림은 RTL의 포인터 규칙을 따랐지만 커밋 때 BOS를 옮기는 세부 규칙 일부는 줄였다.</figcaption>
+    </div>
+  </section>
+
+  <section class="keypoints">
+    <h2>핵심 정리</h2>
+    <ol>
+      <li>PHR은 taken 분기의 경로 해시를 2비트씩 밀어 넣는 532비트 경로 히스토리로, TAGE·ITTAGE·uTAGE·SC Path가 접어 쓴다. GHR·BWHR·IMLI는 SC의 나머지 테이블을 위한 짧은 히스토리다.</li>
+      <li>TAGE의 집합 번호는 PC 집합 필드 ⊕ PHR을 9비트로 접은 값이고, 태그는 PC 태그 필드 ⊕ 두 가지로 접은 PHR ⊕ 분기 위치다.</li>
+      <li>접힌 히스토리는 회전, 나가는 비트 제거, 들어오는 비트 추가로 매 사이클 증분 갱신한다.</li>
+      <li>TAGE는 가장 긴 적중(provider)을 쓰되, 약한 provider는 UseAltOnNa가 허락하면 alt에게 양보한다. 틀리면 더 긴 테이블에 할당하고, 자리가 없을 때가 쌓이면 쓸모 카운터를 모두 지운다.</li>
+      <li>SC는 서브테이블 8개의 2c+1 합이 TAGE 확신도별 문턱(T/16·T/32·T/64)을 넘을 때 TAGE를 덮어쓴다. ITTAGE는 목적지를 영역+오프셋으로 압축해 기억하고, RAS는 NOS 링크로 투기 상태를 싸게 되돌린다.</li>
+    </ol>
+  </section>
+
+  <section id="quiz">
+    <h2>확인 퀴즈</h2>
+    <div class="quiz">
+      <div class="quiz-q" data-answer="2"><p>Q1. 블록 안 조건 분기 3개가 모두 not taken이었다. GHR과 PHR은?</p><div class="opts">
+        <button class="opt">GHR은 그대로, PHR은 0을 3개 밀어 넣는다</button><button class="opt">둘 다 그대로</button><button class="opt">GHR은 0을 3개 밀어 넣고, PHR은 그대로</button><button class="opt">둘 다 0을 3개 밀어 넣는다</button></div>
+        <div class="quiz-exp"><code>getNewHR</code>은 taken이 없으면 numHit(3)만큼 0을 민다. PHR은 taken 분기의 경로 해시만 넣으므로 바뀌지 않는다.</div></div>
+      <div class="quiz-q" data-answer="0"><p>Q2. TAGE 태그 계산에 분기 위치(cfiPosition)를 XOR하는 이유는?</p><div class="opts">
+        <button class="opt">한 블록 안의 여러 분기가 같은 집합에서 서로 다른 엔트리를 쓰게 하려고</button><button class="opt">뱅크 충돌을 피하려고</button><button class="opt">히스토리 길이를 늘리려고</button><button class="opt">쓸모 카운터를 나누려고</button></div>
+        <div class="quiz-exp">집합 번호는 블록 시작 주소와 히스토리로만 정해지므로 한 블록의 분기들이 같은 집합을 본다. 태그에 위치를 섞어 서로 다른 엔트리로 구분한다.</div></div>
+      <div class="quiz-q" data-answer="3"><p>Q3. provider 카운터가 4(약함)이고 alt가 있다. 언제 alt의 예측을 쓰는가?</p><div class="opts">
+        <button class="opt">alt가 더 긴 테이블일 때</button><button class="opt">항상</button><button class="opt">절대 쓰지 않는다</button><button class="opt">(provider 테이블, alt 확신 여부)로 고른 UseAltOnNa 카운터가 양수일 때</button></div>
+        <div class="quiz-exp"><code>useProvider = hasProvider &amp;&amp; !(useAltOnNa &amp;&amp; provider.takenCtr.isWeak)</code>. 약한 provider일 때만 UseAltOnNa가 개입한다.</div></div>
+      <div class="quiz-q" data-answer="1"><p>Q4. SC 문턱 카운터 T = 1600이고 TAGE provider 카운터가 6이다. SC가 TAGE를 덮어쓰려면 |합|이 얼마를 넘어야 하나?</p><div class="opts">
+        <button class="opt">100</button><button class="opt">50</button><button class="opt">25</button><button class="opt">200</button></div>
+        <div class="quiz-exp">6은 포화(0·7)도 약함(3·4)도 아니므로 '중간'이고, 문턱은 T&gt;&gt;5 = 50이다.</div></div>
+      <div class="quiz-q" data-answer="2"><p>Q5. RAS에서 잘못된 경로의 return이 꼭대기를 내렸다가 리다이렉트되었다. 반환 주소가 되살아나는 이유는?</p><div class="opts">
+        <button class="opt">커밋 스택에서 다시 복사해 오기 때문에</button><button class="opt">ITTAGE가 대신 예측하기 때문에</button><button class="opt">return은 TOSR을 NOS로 옮길 뿐 칸을 지우지 않고, 리다이렉트가 TOSR·TOSW를 되돌리기 때문에</button><button class="opt">투기 큐가 32칸이라서</button></div>
+        <div class="quiz-exp">투기 큐는 연결 리스트라 pop은 포인터 이동이다. 예측 때 저장한 메타로 포인터만 되돌리면 이전 꼭대기가 그대로 보인다.</div></div>
+    </div>
+  </section>
+</main>
+
+<script>
+/* 4장 예측기 엔진 (페이지와 node 테스트가 함께 쓴다) */
+const PredictorEngines = (function () {
+  "use strict";
+
+  /* ------------------------------------------------ 공통: 히스토리와 접기 */
+  /** 비트 배열(최근 것이 index 0)의 앞 length 비트를 width 비트로 XOR 접는다. computeFoldedHist와 같다. */
+  function foldHistory(bits, length, width) {
+    let folded = 0;
+    for (let i = 0; i < length; i++) if (bits[i]) folded ^= 1 << (i % width);
+    return folded;
+  }
+  /** 비트 하나를 밀어 넣을 때 접힌 값을 갱신하는 증분 공식: 왼쪽 회전, 나가는 비트 제거, 들어오는 비트 추가 */
+  function foldIncremental(folded, width, length, outgoingBit, incomingBit) {
+    const mask = (1 << width) - 1;
+    let rotated = ((folded << 1) | (folded >>> (width - 1))) & mask;
+    if (outgoingBit) rotated ^= 1 << (length % width);
+    if (incomingBit) rotated ^= 1;
+    return rotated;
+  }
+
+  /** PHR 개념 모델: taken 분기마다 경로 해시 하위 2비트를 밀어 넣고, 나머지 상위 13비트를 그 다음 비트들에 XOR한다. */
+  const PATH_SHIFT_AMOUNT = 2;
+  const PATH_HASH_WIDTH = 15;
+  function pathHash(branchPc, target) {
+    // Cat(pc(9,1), 0.U(4.W)) ^ target(16,2)
+    const pcPart = ((branchPc >>> 1) & 0x1ff) << 4;
+    const targetPart = (target >>> 2) & 0x7fff;
+    return (pcPart ^ targetPart) & ((1 << PATH_HASH_WIDTH) - 1);
+  }
+  function pushPath(history, branchPc, target, capacity) {
+    const hash = pathHash(branchPc, target);
+    const shiftBits = hash & ((1 << PATH_SHIFT_AMOUNT) - 1);
+    const hashHigh = hash >>> PATH_SHIFT_AMOUNT;
+    // 앞쪽(최근)에 2비트를 넣는다. 하위 비트가 더 최근이 되도록 hash bit1, bit0 순서로 넣는다.
+    history.unshift((shiftBits >> 0) & 1);
+    history.unshift((shiftBits >> 1) & 1);
+    for (let i = 0; i < PATH_HASH_WIDTH - PATH_SHIFT_AMOUNT; i++) {
+      if ((hashHigh >> i) & 1) history[PATH_SHIFT_AMOUNT + i] ^= 1;
+    }
+    history.length = Math.min(history.length, capacity);
+    return history;
+  }
+
+  /* ------------------------------------------------ TAGE 해시 (kunminghu-v3 그대로) */
+  const TAGE_HISTORY_LENGTHS = [4, 9, 17, 29, 56, 109, 211, 397];
+  const TAGE_SET_INDEX_WIDTH = 9;  // 4096 / 2 way / 4 bank = 512
+  const TAGE_TAG_WIDTH = 13;
+  const INSTRUCTION_OFFSET_BITS = 1;
+  const TAGE_BANK_INDEX_WIDTH = 2;
+  function tageAddressFields(pc) {
+    const bank = (pc >>> INSTRUCTION_OFFSET_BITS) & ((1 << TAGE_BANK_INDEX_WIDTH) - 1);
+    const setIndex = (pc >>> (INSTRUCTION_OFFSET_BITS + TAGE_BANK_INDEX_WIDTH)) & ((1 << TAGE_SET_INDEX_WIDTH) - 1);
+    const tag = (pc >>> (INSTRUCTION_OFFSET_BITS + TAGE_BANK_INDEX_WIDTH + TAGE_SET_INDEX_WIDTH)) & ((1 << TAGE_TAG_WIDTH) - 1);
+    return { bank, setIndex, tag };
+  }
+  function tageLookupHashes(pc, history, position) {
+    const fields = tageAddressFields(pc);
+    return TAGE_HISTORY_LENGTHS.map((length) => {
+      const indexFold = foldHistory(history, length, Math.min(length, TAGE_SET_INDEX_WIDTH));
+      const tagFoldA = foldHistory(history, length, Math.min(length, TAGE_TAG_WIDTH));
+      const tagFoldB = foldHistory(history, length, Math.min(length, TAGE_TAG_WIDTH - 1)) << 1;
+      const setIndex = (fields.setIndex ^ indexFold) & ((1 << TAGE_SET_INDEX_WIDTH) - 1);
+      const tag = (fields.tag ^ tagFoldA ^ tagFoldB ^ position) & ((1 << TAGE_TAG_WIDTH) - 1);
+      return { length, indexFold, tagFoldA, tagFoldB, setIndex, tag };
+    });
+  }
+
+  /* ------------------------------------------------ 축소 TAGE 시뮬레이터 */
+  const TAKEN_COUNTER_MAX = 7, TAKEN_WEAK_POSITIVE = 4, TAKEN_WEAK_NEGATIVE = 3;
+  const USEFUL_MAX = 3;
+  const USE_ALT_MAX = 31, USE_ALT_INIT = 16;   // 5비트, WeakPositive
+  const USEFUL_RESET_MAX = 255;                // 8비트
+  const BASE_COUNTER_MAX = 3;                  // mBTB 2비트 카운터
+  function isWeak(counter) { return counter === TAKEN_WEAK_POSITIVE || counter === TAKEN_WEAK_NEGATIVE; }
+  function lfsr15(state) { const bit = ((state >>> 14) ^ (state >>> 13)) & 1; return ((state << 1) | bit) & 0x7fff; }
+
+  class MiniTage {
+    constructor(options) {
+      const settings = Object.assign({ lengths: [4, 9, 17, 29], setBits: 5, ways: 2, tagBits: 8, historyCapacity: 64 }, options || {});
+      this.settings = settings;
+      this.tables = settings.lengths.map(() => ({
+        valid: new Uint8Array((1 << settings.setBits) * settings.ways),
+        tag: new Uint16Array((1 << settings.setBits) * settings.ways),
+        counter: new Uint8Array((1 << settings.setBits) * settings.ways),
+        useful: new Uint8Array((1 << settings.setBits) * settings.ways),
+      }));
+      this.base = new Map();              // pc -> 2비트 카운터
+      this.useAltOnNa = new Uint8Array(settings.lengths.length * 2).fill(USE_ALT_INIT);
+      this.usefulResetCounter = 0;
+      this.usefulResets = 0;
+      this.lfsrState = 0x5a5a;
+      this.history = [];
+    }
+    slot(table, set, way) { return set * this.settings.ways + way; }
+    hashes(pc) {
+      const settings = this.settings;
+      return settings.lengths.map((length) => {
+        const setMask = (1 << settings.setBits) - 1, tagMask = (1 << settings.tagBits) - 1;
+        const set = (((pc >>> 3) & setMask) ^ foldHistory(this.history, length, Math.min(length, settings.setBits))) & setMask;
+        const tag = (((pc >>> (3 + settings.setBits)) & tagMask) ^ foldHistory(this.history, length, Math.min(length, settings.tagBits)) ^ (foldHistory(this.history, length, Math.min(length, settings.tagBits - 1)) << 1)) & tagMask;
+        return { set, tag };
+      });
+    }
+    baseCounter(pc) { return this.base.has(pc) ? this.base.get(pc) : 2; }
+    predict(pc) {
+      const hashes = this.hashes(pc);
+      const hits = hashes.map((hash, t) => {
+        for (let way = 0; way < this.settings.ways; way++) {
+          const s = this.slot(t, hash.set, way);
+          if (this.tables[t].valid[s] && this.tables[t].tag[s] === hash.tag) return way;
+        }
+        return -1;
+      });
+      let provider = -1, alternate = -1;
+      hits.forEach((way, t) => { if (way >= 0) { alternate = provider; provider = t; } });
+      const counterOf = (t) => this.tables[t].counter[this.slot(t, hashes[t].set, hits[t])];
+      const baseCounter = this.baseCounter(pc);
+      const baseTaken = baseCounter >= 2;
+      const baseConfident = baseCounter === 0 || baseCounter === BASE_COUNTER_MAX;
+      const hasProvider = provider >= 0, hasAlternate = alternate >= 0;
+      const providerCounter = hasProvider ? counterOf(provider) : -1;
+      const alternateCounter = hasAlternate ? counterOf(alternate) : -1;
+      const alternateConfident = hasAlternate ? !isWeak(alternateCounter) : baseConfident;
+      const useAltIndex = hasProvider ? provider * 2 + (alternateConfident ? 1 : 0) : -1;
+      const isUseAltOnNa = hasProvider && this.useAltOnNa[useAltIndex] >= USE_ALT_INIT;
+      const useProvider = hasProvider && !(isUseAltOnNa && isWeak(providerCounter));
+      const providerTaken = providerCounter >= TAKEN_WEAK_POSITIVE;
+      const alternateOrBaseTaken = hasAlternate ? alternateCounter >= TAKEN_WEAK_POSITIVE : baseTaken;
+      const tageValid = useProvider || hasAlternate;
+      const taken = useProvider ? providerTaken : alternateOrBaseTaken;
+      return { pc, hashes, hits, provider, alternate, hasProvider, hasAlternate, providerCounter, alternateCounter, baseCounter, baseTaken, useAltIndex, isUseAltOnNa, useProvider, providerTaken, alternateOrBaseTaken, tageValid, taken };
+    }
+    update(prediction, actualTaken, target) {
+      const p = prediction, settings = this.settings, events = [];
+      const finalTaken = p.taken;
+      const isMispredict = finalTaken !== actualTaken;
+      const useAlternate = !p.useProvider && p.hasAlternate;
+      // provider 카운터
+      if (p.hasProvider) {
+        const t = p.provider, s = this.slot(t, p.hashes[t].set, p.hits[t]);
+        const old = this.tables[t].counter[s];
+        this.tables[t].counter[s] = actualTaken ? Math.min(TAKEN_COUNTER_MAX, old + 1) : Math.max(0, old - 1);
+        if (old !== this.tables[t].counter[s]) events.push(`T${t} provider 카운터 ${old}→${this.tables[t].counter[s]}`);
+        const incrementUseful = p.providerTaken === actualTaken && p.providerTaken !== p.alternateOrBaseTaken;
+        if (incrementUseful && this.tables[t].useful[s] < USEFUL_MAX) { this.tables[t].useful[s]++; events.push(`T${t} 쓸모 +1 → ${this.tables[t].useful[s]}`); }
+      }
+      if (useAlternate) {
+        const t = p.alternate, s = this.slot(t, p.hashes[t].set, p.hits[t]);
+        const old = this.tables[t].counter[s];
+        this.tables[t].counter[s] = actualTaken ? Math.min(TAKEN_COUNTER_MAX, old + 1) : Math.max(0, old - 1);
+        if (old !== this.tables[t].counter[s]) events.push(`T${t} alt 카운터 ${old}→${this.tables[t].counter[s]}`);
+      }
+      if (!p.tageValid) {
+        const old = this.baseCounter(p.pc);
+        this.base.set(p.pc, actualTaken ? Math.min(BASE_COUNTER_MAX, old + 1) : Math.max(0, old - 1));
+      }
+      // UseAltOnNa: provider가 약하고 provider와 alt/base가 다를 때만 배운다
+      if (p.hasProvider && isWeak(p.providerCounter) && p.providerTaken !== p.alternateOrBaseTaken) {
+        const index = p.useAltIndex, old = this.useAltOnNa[index];
+        if (p.alternateOrBaseTaken === actualTaken) this.useAltOnNa[index] = Math.min(USE_ALT_MAX, old + 1);
+        else this.useAltOnNa[index] = Math.max(0, old - 1);
+        events.push(`UseAltOnNa[${index}] ${old}→${this.useAltOnNa[index]}`);
+      }
+      // 할당
+      const tableCount = settings.lengths.length;
+      const isOnLastTable = p.hasProvider && p.provider === tableCount - 1;
+      const isWeakRightProviderIgnored = p.hasProvider && !p.useProvider && p.providerTaken === actualTaken && isWeak(p.providerCounter);
+      const needAllocate = isMispredict && !isOnLastTable && !isWeakRightProviderIgnored;
+      let allocatedTable = -1;
+      if (needAllocate) {
+        const candidateWays = [];
+        for (let t = 0; t < tableCount; t++) {
+          candidateWays.push([]);
+          if (p.hasProvider && t <= p.provider) continue;
+          const set = p.hashes[t].set, table = this.tables[t];
+          const ways = [...Array(settings.ways).keys()];
+          const invalidWays = ways.filter((w) => !table.valid[this.slot(t, set, w)]);
+          const weakUselessWays = ways.filter((w) => isWeak(table.counter[this.slot(t, set, w)]) && table.useful[this.slot(t, set, w)] === 0);
+          const uselessWays = ways.filter((w) => table.useful[this.slot(t, set, w)] === 0);
+          candidateWays[t] = invalidWays.length ? invalidWays : weakUselessWays.length ? weakUselessWays : uselessWays;
+        }
+        const canTables = candidateWays.map((ways) => ways.length > 0);
+        this.lfsrState = lfsr15(this.lfsrState);
+        const randomMask = this.lfsrState;
+        const randomTables = canTables.map((can, t) => can && ((randomMask >> t) & 1) === 1);
+        const preferred = randomTables.some(Boolean) ? randomTables : canTables;
+        allocatedTable = preferred.indexOf(true);
+        if (allocatedTable >= 0) {
+          const t = allocatedTable, way = candidateWays[t][0], s = this.slot(t, p.hashes[t].set, way);
+          this.tables[t].valid[s] = 1;
+          this.tables[t].tag[s] = p.hashes[t].tag;
+          this.tables[t].counter[s] = actualTaken ? TAKEN_WEAK_POSITIVE : TAKEN_WEAK_NEGATIVE;
+          this.tables[t].useful[s] = 0;
+          events.push(`T${t} way${way}에 새 엔트리 할당`);
+        } else {
+          this.usefulResetCounter++;
+          events.push(`할당 실패 → 리셋 카운터 ${this.usefulResetCounter}`);
+          if (this.usefulResetCounter >= USEFUL_RESET_MAX) {
+            this.tables.forEach((table) => table.useful.fill(0));
+            this.usefulResetCounter = 0;
+            this.usefulResets++;
+            events.push("쓸모 카운터 전체 리셋");
+          }
+        }
+      }
+      // PHR: taken일 때만 경로 해시가 들어간다
+      if (actualTaken) pushPath(this.history, prediction.pc, target, settings.historyCapacity);
+      return { isMispredict, needAllocate, allocatedTable, events };
+    }
+  }
+
+  /* ------------------------------------------------ 축소 ITTAGE */
+  const ITTAGE_CONFIDENCE_MAX = 3, ITTAGE_CONFIDENCE_WEAK_POSITIVE = 2;
+  const ITTAGE_TICK_MAX = 255;
+  class MiniIttage {
+    constructor(options) {
+      const settings = Object.assign({ lengths: [4, 8, 13, 16, 32], setBits: 5, tagBits: 9, historyCapacity: 64 }, options || {});
+      this.settings = settings;
+      this.tables = settings.lengths.map(() => ({ valid: new Uint8Array(1 << settings.setBits), tag: new Uint16Array(1 << settings.setBits), confidence: new Uint8Array(1 << settings.setBits), useful: new Uint8Array(1 << settings.setBits), target: new Uint32Array(1 << settings.setBits) }));
+      this.tick = 0;
+      this.lfsrState = 0x3c3c;
+      this.history = [];
+    }
+    hashes(pc) {
+      const settings = this.settings, setMask = (1 << settings.setBits) - 1, tagMask = (1 << settings.tagBits) - 1;
+      return settings.lengths.map((length) => ({
+        set: (((pc >>> 1) & setMask) ^ foldHistory(this.history, length, Math.min(length, settings.setBits))) & setMask,
+        tag: (((pc >>> (1 + settings.setBits)) & tagMask) ^ foldHistory(this.history, length, Math.min(length, settings.tagBits)) ^ (foldHistory(this.history, length, Math.min(length, settings.tagBits - 1)) << 1)) & tagMask,
+      }));
+    }
+    predict(pc) {
+      const hashes = this.hashes(pc);
+      const hits = hashes.map((hash, t) => this.tables[t].valid[hash.set] && this.tables[t].tag[hash.set] === hash.tag);
+      let provider = -1, alternate = -1;
+      hits.forEach((hit, t) => { if (hit) { alternate = provider; provider = t; } });
+      const entryOf = (t) => ({ confidence: this.tables[t].confidence[hashes[t].set], target: this.tables[t].target[hashes[t].set], useful: this.tables[t].useful[hashes[t].set] });
+      const providerEntry = provider >= 0 ? entryOf(provider) : null;
+      const alternateEntry = alternate >= 0 ? entryOf(alternate) : null;
+      const isProviderNull = providerEntry && providerEntry.confidence === 0;
+      let target = null, source = "없음";
+      if (providerEntry && !(isProviderNull && alternateEntry)) { target = providerEntry.target; source = `T${provider}`; }
+      else if (isProviderNull && alternateEntry) { target = alternateEntry.target; source = `T${alternate}(alt)`; }
+      return { pc, hashes, hits, provider, alternate, providerEntry, alternateEntry, isProviderNull, target, source, isHit: provider >= 0 };
+    }
+    update(prediction, actualTarget, fallbackTarget) {
+      const p = prediction, events = [];
+      const predictedTarget = p.isHit ? p.target : fallbackTarget;
+      const isMispredict = predictedTarget !== actualTarget;
+      const updateEntry = (t, isAllocate) => {
+        const s = p.hashes[t].set, table = this.tables[t];
+        const correct = table.target[s] === actualTarget;
+        const oldConfidence = table.confidence[s];
+        if (isAllocate) {
+          table.valid[s] = 1; table.tag[s] = p.hashes[t].tag; table.confidence[s] = ITTAGE_CONFIDENCE_WEAK_POSITIVE; table.useful[s] = 0; table.target[s] = actualTarget;
+          events.push(`T${t}에 할당 (목적지 0x${actualTarget.toString(16)})`);
+          return;
+        }
+        // 확신도가 0일 때만 목적지를 바꾼다
+        if (oldConfidence === 0) { table.target[s] = actualTarget; events.push(`T${t} 목적지 교체`); }
+        table.confidence[s] = correct ? Math.min(ITTAGE_CONFIDENCE_MAX, oldConfidence + 1) : Math.max(0, oldConfidence - 1);
+        events.push(`T${t} 확신도 ${oldConfidence}→${table.confidence[s]}`);
+      };
+      if (p.provider >= 0) {
+        const usedAlternate = p.alternate >= 0 && p.isProviderNull;
+        if (usedAlternate && isMispredict) updateEntry(p.alternate, false);
+        const altDiffers = p.alternate >= 0 && p.alternateEntry.target !== p.providerEntry.target;
+        if (altDiffers) this.tables[p.provider].useful[p.hashes[p.provider].set] = p.providerEntry.target === actualTarget ? 1 : 0;
+        updateEntry(p.provider, false);
+      }
+      const providerCorrect = p.provider >= 0 && p.providerEntry.target === actualTarget;
+      const providerUnconfident = p.provider >= 0 && p.providerEntry.confidence === 0;
+      if (isMispredict && !(providerCorrect && providerUnconfident)) {
+        const slots = [];
+        for (let t = 0; t < this.settings.lengths.length; t++) {
+          const allowed = p.provider < 0 || t > p.provider;
+          slots.push(allowed && !p.hits[t] && this.tables[t].useful[p.hashes[t].set] === 0);
+        }
+        this.lfsrState = lfsr15(this.lfsrState);
+        const masked = slots.map((can, t) => can && ((this.lfsrState >> t) & 1) === 1);
+        let chosen = masked.indexOf(true);
+        if (chosen < 0) chosen = slots.indexOf(true);
+        if (chosen >= 0) updateEntry(chosen, true);
+        else {
+          this.tick++;
+          if (this.tick >= ITTAGE_TICK_MAX) { this.tick = 0; this.tables.forEach((table) => table.useful.fill(0)); events.push("쓸모 비트 전체 리셋"); }
+        }
+      }
+      pushPath(this.history, p.pc, actualTarget, this.settings.historyCapacity);
+      return { isMispredict, predictedTarget, events };
+    }
+  }
+
+  /* ------------------------------------------------ RAS: 연결 리스트 투기 큐 + 커밋 스택 */
+  const SPECULATIVE_QUEUE_SIZE = 32, COMMIT_STACK_SIZE = 16, STACK_COUNTER_MAX = 7;
+  class ReturnStack {
+    constructor() { this.reset(); }
+    reset() {
+      this.queue = Array.from({ length: SPECULATIVE_QUEUE_SIZE }, () => ({ address: 0, counter: 0, nextOfStack: 0 }));
+      this.commitStack = Array.from({ length: COMMIT_STACK_SIZE }, () => ({ address: 0, counter: 0 }));
+      this.topOfStackRead = -1;   // TOSR (논리 번호, 단조 증가)
+      this.topOfStackWrite = 0;   // TOSW
+      this.bottomOfStack = 0;     // BOS
+      this.specStackPointer = 0;  // ssp (커밋 스택 기준 깊이)
+      this.specCounter = 0;       // sctr
+      this.commitPointer = 0;     // nsp
+      this.pending = [];          // 아직 커밋되지 않은 연산과 그때의 메타
+      this.lostReturns = 0;
+    }
+    isInRange(pointer) { return pointer >= this.bottomOfStack && pointer < this.topOfStackWrite; }
+    commitTop(pointer) { return this.commitStack[((pointer % COMMIT_STACK_SIZE) + COMMIT_STACK_SIZE) % COMMIT_STACK_SIZE]; }
+    top() { return this.isInRange(this.topOfStackRead) ? this.queue[this.topOfStackRead % SPECULATIVE_QUEUE_SIZE] : this.commitTop(this.specStackPointer); }
+    meta() { return { topOfStackRead: this.topOfStackRead, topOfStackWrite: this.topOfStackWrite, specStackPointer: this.specStackPointer, specCounter: this.specCounter }; }
+    isFull() { return this.topOfStackWrite - this.bottomOfStack >= SPECULATIVE_QUEUE_SIZE; }
+    call(address, isWrongPath) {
+      if (this.isFull()) return false;
+      const meta = this.meta();
+      const top = this.top();
+      const isSameAddress = top.address === address && this.specCounter < STACK_COUNTER_MAX;
+      const slot = this.queue[this.topOfStackWrite % SPECULATIVE_QUEUE_SIZE];
+      slot.address = address;
+      slot.counter = isSameAddress ? this.specCounter + 1 : 0;
+      slot.nextOfStack = this.topOfStackRead;
+      this.topOfStackRead = this.topOfStackWrite;
+      this.topOfStackWrite++;
+      if (isSameAddress) this.specCounter++; else { this.specStackPointer++; this.specCounter = 0; }
+      this.pending.push({ kind: "call", address, meta, writePosition: meta.topOfStackWrite, isWrongPath: !!isWrongPath });
+      return true;
+    }
+    ret(isWrongPath) {
+      const meta = this.meta();
+      const predicted = this.top().address;
+      const wasInRange = this.isInRange(this.topOfStackRead);
+      const nextOfStack = wasInRange ? this.queue[this.topOfStackRead % SPECULATIVE_QUEUE_SIZE].nextOfStack : this.topOfStackRead;
+      if (wasInRange) this.topOfStackRead = nextOfStack;
+      if (this.specCounter > 0) this.specCounter--;
+      else {
+        this.specStackPointer--;
+        this.specCounter = this.isInRange(nextOfStack) ? this.queue[nextOfStack % SPECULATIVE_QUEUE_SIZE].counter : this.commitTop(this.specStackPointer).counter;
+      }
+      this.pending.push({ kind: "return", predicted, meta, isWrongPath: !!isWrongPath });
+      return predicted;
+    }
+    commitOldest() {
+      const operation = this.pending.find((entry) => !entry.isWrongPath);
+      if (!operation) return null;
+      if (this.pending[0] !== operation) return null; // 잘못된 경로가 앞에 있으면 먼저 리다이렉트해야 한다
+      this.pending.shift();
+      const top = this.commitTop(this.commitPointer);
+      if (operation.kind === "call") {
+        if (top.counter < STACK_COUNTER_MAX && top.address === operation.address && this.commitPointer > 0) top.counter++;
+        else {
+          if (this.commitPointer >= COMMIT_STACK_SIZE) this.lostReturns++;
+          this.commitPointer++;
+          const slot = this.commitTop(this.commitPointer);
+          slot.address = operation.address; slot.counter = 0;
+        }
+        this.bottomOfStack = operation.writePosition;
+      } else {
+        if (top.counter > 0) top.counter--; else this.commitPointer--;
+      }
+      return operation;
+    }
+    /** 잘못된 경로가 시작되기 직전의 메타로 포인터를 되돌린다. */
+    redirect() {
+      const index = this.pending.findIndex((entry) => entry.isWrongPath);
+      if (index < 0) return false;
+      const meta = this.pending[index].meta;
+      this.topOfStackRead = meta.topOfStackRead; this.topOfStackWrite = meta.topOfStackWrite;
+      this.specStackPointer = meta.specStackPointer; this.specCounter = meta.specCounter;
+      this.pending.length = index;
+      return true;
+    }
+  }
+
+  return { foldHistory, foldIncremental, pathHash, pushPath, tageAddressFields, tageLookupHashes, TAGE_HISTORY_LENGTHS, MiniTage, MiniIttage, ReturnStack, isWeak };
+})();
+
+</script>
+<script>
+(function () {
+  "use strict";
+  const Engine = PredictorEngines;
+  const hex = (value, digits) => "0x" + (value >>> 0).toString(16).padStart(digits || 1, "0");
+  const binary = (value, width) => (value >>> 0).toString(2).padStart(width, "0");
+
+  /* ---------------------------------------------------- 1. 네 히스토리 */
+  const LANE_COUNT = 4;
+  const GLOBAL_HISTORY_LENGTH = 16, BACKWARD_HISTORY_LENGTH = 8, LOOP_COUNTER_MAX = 255, PATH_VIEW_BITS = 32;
+  const historyState = { global: 0, backward: 0, loopCount: 0, path: [] };
+  const lanes = [
+    { isPresent: true, isTaken: false, isBackward: false, position: 3 },
+    { isPresent: true, isTaken: true, isBackward: true, position: 9 },
+    { isPresent: true, isTaken: false, isBackward: false, position: 17 },
+    { isPresent: false, isTaken: true, isBackward: false, position: 25 },
+  ];
+  let lastShift = null;
+  const laneGrid = document.getElementById("hz-lanes");
+  function renderLanes() {
+    laneGrid.innerHTML = lanes.map((lane, index) => `
+      <div class="lane-card" data-index="${index}" style="${lane.isPresent ? "" : "opacity:.45"}">
+        <h5>조건 분기 ${index} · 위치 ${lane.position}</h5>
+        <label class="check"><input type="checkbox" data-field="isPresent" ${lane.isPresent ? "checked" : ""}>블록에 있음</label>
+        <div class="seg" data-field="isTaken"><button data-value="1" class="${lane.isTaken ? "on" : ""}">taken</button><button data-value="0" class="${lane.isTaken ? "" : "on"}">not taken</button></div>
+        <label class="check"><input type="checkbox" data-field="isBackward" ${lane.isBackward ? "checked" : ""}>후방(루프 닫는) 분기</label>
+      </div>`).join("");
+  }
+  laneGrid.addEventListener("change", (event) => {
+    const card = event.target.closest(".lane-card");
+    if (!card) return;
+    lanes[+card.dataset.index][event.target.dataset.field] = event.target.checked;
+    renderLanes(); paintHistory();
+  });
+  laneGrid.addEventListener("click", (event) => {
+    const button = event.target.closest(".seg button");
+    const card = event.target.closest(".lane-card");
+    if (!button || !card) return;
+    lanes[+card.dataset.index].isTaken = button.dataset.value === "1";
+    renderLanes(); paintHistory();
+  });
+  function blockSummary() {
+    const present = lanes.filter((lane) => lane.isPresent);
+    const firstTaken = present.find((lane) => lane.isTaken);
+    const numberHit = present.length;
+    const numberLess = firstTaken ? present.indexOf(firstTaken) : numberHit;
+    return { present, firstTaken, numberHit, numberLess };
+  }
+  function getNewHistory(oldValue, numberLess, numberHit, isTaken, appendedBit, length) {
+    const mask = (1 << length) - 1;
+    const shift = isTaken ? numberLess : numberHit;
+    if (isTaken) return (((oldValue << shift) << 1) | (appendedBit ? 1 : 0)) & mask;
+    return (oldValue << shift) & mask;
+  }
+  function applyBlock() {
+    const summary = blockSummary();
+    const isTaken = !!summary.firstTaken;
+    historyState.global = getNewHistory(historyState.global, summary.numberLess, summary.numberHit, isTaken, true, GLOBAL_HISTORY_LENGTH);
+    historyState.backward = getNewHistory(historyState.backward, summary.numberLess, summary.numberHit, isTaken, isTaken && summary.firstTaken.isBackward, BACKWARD_HISTORY_LENGTH);
+    const isBackwardTaken = isTaken && summary.firstTaken.isBackward;
+    historyState.loopCount = isBackwardTaken ? Math.min(LOOP_COUNTER_MAX, historyState.loopCount + 1) : 0;
+    if (isTaken) {
+      const branchPc = 0x80001000 + summary.firstTaken.position * 2;
+      const target = summary.firstTaken.isBackward ? 0x80000f00 : 0x80001200 + summary.firstTaken.position * 16;
+      Engine.pushPath(historyState.path, branchPc, target, 128);
+    }
+    lastShift = { isTaken, shift: isTaken ? summary.numberLess + 1 : summary.numberHit };
+    paintHistory();
+  }
+  const historyView = MB.canvas("#cv-history", { aspect: 0.3, minHeight: 200, maxHeight: 250, draw(ctx, width, height) {
+    const left = 92, right = width - 12;
+    const rows = [
+      { name: "GHR 16", bits: binary(historyState.global, GLOBAL_HISTORY_LENGTH), color: "accent" },
+      { name: "BWHR 8", bits: binary(historyState.backward, BACKWARD_HISTORY_LENGTH), color: "warn" },
+      { name: "IMLI", bits: binary(historyState.loopCount, 8), color: "ok", note: `= ${historyState.loopCount}` },
+      { name: "PHR 최근 32", bits: historyState.path.slice(0, PATH_VIEW_BITS).concat(new Array(Math.max(0, PATH_VIEW_BITS - historyState.path.length)).fill(0)).reverse().join(""), color: "accent-2" },
+    ];
+    const rowHeight = (height - 20) / rows.length;
+    rows.forEach((row, index) => {
+      const y = 10 + index * rowHeight;
+      MB.text(ctx, row.name, left - 10, y + rowHeight / 2, { align: "right", size: 12, weight: 700, mono: true, color: MB.css(row.color) });
+      const cellWidth = Math.min(18, (right - left) / PATH_VIEW_BITS);
+      const bitCount = row.bits.length;
+      for (let k = 0; k < bitCount; k++) {
+        const x = left + (PATH_VIEW_BITS - bitCount + k) * cellWidth;
+        const isOne = row.bits[k] === "1";
+        ctx.fillStyle = isOne ? MB.css(row.color) : MB.css("surface-2");
+        MB.roundRect(ctx, x + 1, y + 4, cellWidth - 2, rowHeight - 8, 3); ctx.fill();
+        if (cellWidth >= 13) MB.text(ctx, row.bits[k], x + cellWidth / 2, y + rowHeight / 2, { align: "center", size: 10, mono: true, color: isOne ? "#fff" : MB.css("text-faint") });
+      }
+      if (row.note) MB.text(ctx, row.note, left + PATH_VIEW_BITS * cellWidth + 8, y + rowHeight / 2, { size: 12, mono: true, color: MB.css("text-dim") });
+    });
+    MB.text(ctx, "← 오래된 비트   최근 비트 →", right, height - 2, { align: "right", size: 10.5, color: MB.css("text-faint"), baseline: "bottom" });
+  } });
+  function paintHistory() {
+    const summary = blockSummary();
+    MB.set("hz-hit", String(summary.numberHit));
+    MB.set("hz-less", summary.firstTaken ? String(summary.numberLess) : "— <small>(taken 없음)</small>");
+    MB.set("hz-shift", lastShift ? (lastShift.isTaken ? `${lastShift.shift - 1}개 0 + 1` : `${lastShift.shift}개 0`) : "—");
+    MB.set("hz-imli", String(historyState.loopCount));
+    historyView.redraw();
+  }
+  document.getElementById("hz-apply").onclick = applyBlock;
+  document.getElementById("hz-reset").onclick = () => { Object.assign(historyState, { global: 0, backward: 0, loopCount: 0, path: [] }); lastShift = null; paintHistory(); };
+  renderLanes(); paintHistory();
+
+  /* ---------------------------------------------------- 2. TAGE 해시 계산기 */
+  const HASH_VIEW_BITS = 64;
+  const hashRandom = MB.rng(77);
+  let hashHistory = [], takenCount = 0, hashPc = 0x80001a40, hashPosition = 5;
+  const HASH_PREWARM_TAKEN_COUNT = 250;
+  for (let k = 0; k < HASH_PREWARM_TAKEN_COUNT; k++) { Engine.pushPath(hashHistory, 0x80000000 + Math.floor(hashRandom() * 0x10000) * 2, 0x80000000 + Math.floor(hashRandom() * 0x10000) * 4, 532); takenCount++; }
+  const hashInput = document.getElementById("hs-pc");
+  hashInput.addEventListener("input", () => {
+    const value = parseInt(hashInput.value, 16);
+    if (isFinite(value)) { hashPc = value >>> 0; paintHash(); }
+  });
+  MB.range("hs-pos", (value) => { hashPosition = value; paintHash(); });
+  document.getElementById("hs-taken").onclick = () => { Engine.pushPath(hashHistory, 0x80000000 + Math.floor(hashRandom() * 0x10000) * 2, 0x80000000 + Math.floor(hashRandom() * 0x10000) * 4, 532); takenCount++; paintHash(); };
+  document.getElementById("hs-clear").onclick = () => { hashHistory = []; takenCount = 0; paintHash(); };
+  const hashView = MB.canvas("#cv-hash", { aspect: 0.5, minHeight: 300, maxHeight: 400, draw(ctx, width, height) {
+    const results = Engine.tageLookupHashes(hashPc, hashHistory, hashPosition);
+    const left = 14, right = width - 14;
+    const cellWidth = (right - left) / HASH_VIEW_BITS;
+    MB.text(ctx, "PHR 최근 64비트 (왼쪽이 최근)", left, 10, { size: 11, color: MB.css("text-dim") });
+    for (let k = 0; k < HASH_VIEW_BITS; k++) {
+      ctx.fillStyle = hashHistory[k] ? MB.css("accent-2") : MB.css("surface-2");
+      ctx.fillRect(left + k * cellWidth + 0.5, 20, cellWidth - 1, 14);
+    }
+    // 테이블별로 보는 범위 표시
+    const isNarrow = width < 560;
+    const tableTop = 52, rowHeight = (height - tableTop - 6) / results.length;
+    const columns = isNarrow ? [left + 50, left + 120, width * 0.52, width * 0.77] : [left + 60, left + 150, width * 0.48, width * 0.72];
+    MB.text(ctx, "테이블", left, tableTop - 8, { size: 11, color: MB.css("text-faint") });
+    MB.text(ctx, "길이", columns[0], tableTop - 8, { size: 11, color: MB.css("text-faint") });
+    MB.text(ctx, "보는 범위", columns[1], tableTop - 8, { size: 11, color: MB.css("text-faint") });
+    MB.text(ctx, "집합(9비트)", columns[2], tableTop - 8, { size: 11, color: MB.css("text-faint") });
+    MB.text(ctx, "태그(13비트)", columns[3], tableTop - 8, { size: 11, color: MB.css("text-faint") });
+    results.forEach((result, index) => {
+      const y = tableTop + index * rowHeight + rowHeight / 2;
+      MB.text(ctx, `T${index}`, left, y, { size: 12, weight: 700, mono: true });
+      MB.text(ctx, String(result.length), columns[0], y, { size: 12, mono: true, color: MB.css("text-dim") });
+      const spanWidth = columns[2] - columns[1] - 16;
+      const ratio = Math.log2(result.length) / Math.log2(397);
+      ctx.fillStyle = MB.alpha(MB.css("accent-2"), 0.35);
+      MB.roundRect(ctx, columns[1], y - 6, Math.max(6, spanWidth * ratio), 12, 4); ctx.fill();
+      MB.text(ctx, isNarrow ? String(result.setIndex) : `${result.setIndex} (${hex(result.setIndex, 3)})`, columns[2], y, { size: 12, mono: true, weight: 700, color: MB.css("accent") });
+      MB.text(ctx, isNarrow ? hex(result.tag, 4) : `${hex(result.tag, 4)}`, columns[3], y, { size: 12, mono: true, weight: 700, color: MB.css("text") });
+    });
+  } });
+  function paintHash() {
+    const fields = Engine.tageAddressFields(hashPc);
+    MB.set("hs-bank", String(fields.bank));
+    MB.set("hs-set", `${fields.setIndex} <small>${hex(fields.setIndex, 3)}</small>`);
+    MB.set("hs-tag", hex(fields.tag, 4));
+    MB.set("hs-count", String(takenCount));
+    hashView.redraw();
+  }
+  paintHash();
+
+  /* ---------------------------------------------------- 3. 접힌 히스토리 */
+  let foldLength = 29, foldWidth = 9;
+  const foldRandom = MB.rng(12);
+  let foldBits = Array.from({ length: 64 }, () => (foldRandom() < 0.5 ? 1 : 0));
+  let incrementalValue = Engine.foldHistory(foldBits, foldLength, foldWidth);
+  let lastOutgoingPosition = null;
+  function resyncFold() { incrementalValue = Engine.foldHistory(foldBits, foldLength, foldWidth); lastOutgoingPosition = null; }
+  function pushFoldBit(bit) {
+    const outgoing = foldBits[foldLength - 1] || 0;
+    incrementalValue = Engine.foldIncremental(incrementalValue, foldWidth, foldLength, outgoing, bit);
+    lastOutgoingPosition = foldLength % foldWidth;
+    foldBits.unshift(bit); foldBits.length = 64;
+  }
+  const FOLD_CHUNK_COLORS = ["accent", "accent-2", "ok", "warn", "color-pink", "text-dim"];
+  const foldGeometry = { left: 0, cellWidth: 0, top: 0, height: 0 };
+  const foldView = MB.canvas("#cv-fold", { aspect: 0.3, minHeight: 230, maxHeight: 330, draw(ctx, width, height) {
+    const left = 14, right = width - 14;
+    const cellWidth = Math.min(22, (right - left) / foldLength);
+    Object.assign(foldGeometry, { left, cellWidth, top: 26, height: 22 });
+    MB.text(ctx, `히스토리 ${foldLength}비트 (왼쪽 = 최근, 칸을 누르면 뒤집힘)`, left, 12, { size: 11, color: MB.css("text-dim") });
+    for (let k = 0; k < foldLength; k++) {
+      const chunk = Math.floor(k / foldWidth);
+      const color = MB.css(FOLD_CHUNK_COLORS[chunk % FOLD_CHUNK_COLORS.length]);
+      ctx.fillStyle = foldBits[k] ? color : MB.alpha(color.startsWith("#") ? color : "#888888", 0.14);
+      MB.roundRect(ctx, left + k * cellWidth + 1, 26, cellWidth - 2, 22, 3); ctx.fill();
+      if (cellWidth >= 12) MB.text(ctx, String(foldBits[k]), left + k * cellWidth + cellWidth / 2, 37, { align: "center", size: 10, mono: true, color: foldBits[k] ? "#fff" : MB.css("text-faint") });
+    }
+    // 덩어리 쌓기
+    const chunkCount = Math.ceil(foldLength / foldWidth);
+    const stackTop = 70, stackCell = Math.min(24, (right - left) / foldWidth);
+    const stackRowHeight = Math.min(22, (height - stackTop - 60) / chunkCount);
+    for (let chunk = 0; chunk < chunkCount; chunk++) {
+      const color = MB.css(FOLD_CHUNK_COLORS[chunk % FOLD_CHUNK_COLORS.length]);
+      for (let position = 0; position < foldWidth; position++) {
+        const bitIndex = chunk * foldWidth + position;
+        if (bitIndex >= foldLength) continue;
+        const x = left + (foldWidth - 1 - position) * stackCell;
+        ctx.fillStyle = foldBits[bitIndex] ? color : MB.alpha(color.startsWith("#") ? color : "#888888", 0.14);
+        MB.roundRect(ctx, x + 1, stackTop + chunk * stackRowHeight + 1, stackCell - 2, stackRowHeight - 2, 3); ctx.fill();
+      }
+      MB.text(ctx, `덩어리 ${chunk}`, left + foldWidth * stackCell + 8, stackTop + chunk * stackRowHeight + stackRowHeight / 2, { size: 10.5, color: MB.css("text-faint") });
+    }
+    const resultTop = stackTop + chunkCount * stackRowHeight + 10;
+    MB.text(ctx, "XOR →", left, resultTop - 2, { size: 11, color: MB.css("text-dim"), baseline: "bottom" });
+    const fullValue = Engine.foldHistory(foldBits, foldLength, foldWidth);
+    for (let position = 0; position < foldWidth; position++) {
+      const x = left + (foldWidth - 1 - position) * stackCell;
+      const isOne = (fullValue >> position) & 1;
+      ctx.fillStyle = isOne ? MB.css("text") : MB.css("surface-2");
+      MB.roundRect(ctx, x + 1, resultTop + 2, stackCell - 2, 22, 3); ctx.fill();
+      if (lastOutgoingPosition === position) { ctx.strokeStyle = MB.css("bad"); ctx.lineWidth = 2; ctx.strokeRect(x, resultTop + 1, stackCell, 24); }
+      MB.text(ctx, String(isOne), x + stackCell / 2, resultTop + 13, { align: "center", size: 10.5, mono: true, color: isOne ? MB.css("bg") : MB.css("text-faint") });
+    }
+  } });
+  foldView.onPointer("click", (x, y) => {
+    if (y < foldGeometry.top || y > foldGeometry.top + foldGeometry.height) return;
+    const index = Math.floor((x - foldGeometry.left) / foldGeometry.cellWidth);
+    if (index < 0 || index >= foldLength) return;
+    foldBits[index] ^= 1; resyncFold(); paintFold();
+  });
+  function paintFold() {
+    const fullValue = Engine.foldHistory(foldBits, foldLength, foldWidth);
+    MB.set("fd-full", binary(fullValue, foldWidth));
+    MB.set("fd-incremental", binary(incrementalValue, foldWidth));
+    MB.set("fd-match", fullValue === incrementalValue ? "같음 ✓" : "다름 ✗", fullValue === incrementalValue ? "good" : "bad");
+    MB.set("fd-out", `${foldLength} mod ${foldWidth} = ${foldLength % foldWidth}`);
+    foldView.redraw();
+  }
+  MB.range("fd-length", (value) => { foldLength = value; resyncFold(); paintFold(); });
+  MB.range("fd-width", (value) => { foldWidth = value; resyncFold(); paintFold(); });
+  document.getElementById("fd-push1").onclick = () => { pushFoldBit(1); paintFold(); };
+  document.getElementById("fd-push0").onclick = () => { pushFoldBit(0); paintFold(); };
+  document.getElementById("fd-random").onclick = () => { for (let k = 0; k < 20; k++) pushFoldBit(foldRandom() < 0.5 ? 1 : 0); paintFold(); };
+  paintFold();
+
+  /* ---------------------------------------------------- 4. 축소 TAGE 시뮬레이터 */
+  const TRACE_LENGTH = 6000;
+  const RECENT_WINDOW = 200;
+  function makeTrace(kind) {
+    const random = MB.rng(3 + kind.length);
+    const trace = [];
+    if (kind === "loopOnly" || kind === "loopOuter") {
+      let iteration = 0;
+      while (trace.length < TRACE_LENGTH) {
+        const isExit = iteration % 5 === 4;
+        trace.push({ pc: 0x80001040, target: 0x80001000, taken: !isExit, isObserved: true });
+        if (isExit && kind === "loopOuter") trace.push({ pc: 0x80001080, target: 0x80000f00, taken: true, isObserved: false });
+        iteration++;
+      }
+    } else if (kind === "alternate") {
+      let iteration = 0;
+      while (trace.length < TRACE_LENGTH) {
+        trace.push({ pc: 0x80002010, target: 0x80002080, taken: iteration % 2 === 0, isObserved: true });
+        trace.push({ pc: 0x800020a0, target: 0x80002000, taken: true, isObserved: false });
+        iteration++;
+      }
+    } else if (kind === "correlated") {
+      while (trace.length < TRACE_LENGTH) {
+        const outcome = random() < 0.5;
+        trace.push({ pc: 0x80003010, target: 0x80003040, taken: outcome, isObserved: false });
+        trace.push({ pc: 0x80003050, target: 0x80003090, taken: outcome, isObserved: true });
+        trace.push({ pc: 0x800030a0, target: 0x80003000, taken: true, isObserved: false });
+      }
+    } else {
+      while (trace.length < TRACE_LENGTH) {
+        trace.push({ pc: 0x80004010, target: 0x80004040, taken: random() < 0.5, isObserved: true });
+        trace.push({ pc: 0x80004050, target: 0x80004000, taken: true, isObserved: false });
+      }
+    }
+    return trace;
+  }
+  let traceKind = "loopOnly", trace, tage, tracePosition, recent, allocationCount, allocationFailureCount, lastStep = null;
+  function resetTage() {
+    trace = makeTrace(traceKind);
+    tage = new Engine.MiniTage();
+    tracePosition = 0; recent = []; allocationCount = 0; allocationFailureCount = 0; lastStep = null;
+    document.getElementById("tg-log").innerHTML = "버튼을 눌러 시작하자.";
+    paintTage();
+  }
+  function stepTage(isQuiet) {
+    if (tracePosition >= trace.length) tracePosition = 0;
+    const record = trace[tracePosition++];
+    const prediction = tage.predict(record.pc);
+    const result = tage.update(prediction, record.taken, record.target);
+    if (result.needAllocate) { if (result.allocatedTable >= 0) allocationCount++; else allocationFailureCount++; }
+    if (record.isObserved) { recent.push(prediction.taken === record.taken ? 1 : 0); if (recent.length > RECENT_WINDOW) recent.shift(); }
+    lastStep = { record, prediction, result };
+    if (!isQuiet) {
+      const p = prediction;
+      const choice = p.hasProvider ? `provider T${p.provider}(카운터 ${p.providerCounter})${p.hasAlternate ? `, alt T${p.alternate}(${p.alternateCounter})` : ""}${p.useProvider ? "" : " → <b>alt/기본 사용</b>"}` : `적중 없음 → 기본 카운터 ${p.baseCounter}`;
+      document.getElementById("tg-log").innerHTML =
+        `<b>${hex(record.pc, 8)}</b> ${choice} · 예측 ${p.taken ? "T" : "N"} · 실제 ${record.taken ? "T" : "N"} ${p.taken === record.taken ? "✓" : "✗"}<br>` +
+        (result.events.length ? result.events.join(" · ") : "갱신할 것 없음");
+    }
+  }
+  const tageView = MB.canvas("#cv-tage", { aspect: 0.34, minHeight: 220, maxHeight: 300, draw(ctx, width, height) {
+    if (!tage) return;
+    const settings = tage.settings;
+    const setCount = 1 << settings.setBits;
+    const left = 64, right = width - 10, top = 8;
+    const rowHeight = (height - top - 8) / settings.lengths.length;
+    const cellWidth = (right - left) / (setCount * settings.ways);
+    tage.tables.forEach((table, t) => {
+      const y = top + t * rowHeight;
+      MB.text(ctx, `T${t} (${settings.lengths[t]})`, left - 6, y + rowHeight / 2, { align: "right", size: 11, mono: true, weight: 700 });
+      for (let set = 0; set < setCount; set++) {
+        for (let way = 0; way < settings.ways; way++) {
+          const slot = set * settings.ways + way;
+          const x = left + slot * cellWidth;
+          let fill = MB.css("surface-2");
+          if (table.valid[slot]) {
+            const counter = table.counter[slot];
+            const strength = Math.abs(counter - 3.5) / 3.5;
+            fill = MB.alpha(counter >= 4 ? MB.css("taken") : MB.css("nottaken"), 0.25 + 0.7 * strength);
+          }
+          ctx.fillStyle = fill;
+          ctx.fillRect(x + 0.5, y + 3, Math.max(1, cellWidth - 1), rowHeight - 6);
+          if (table.valid[slot] && table.useful[slot] > 0) { ctx.fillStyle = MB.css("text"); ctx.fillRect(x + 0.5, y + rowHeight - 6, Math.max(1, (cellWidth - 1) * table.useful[slot] / 3), 2); }
+        }
+        if (set % 2 === 1) { ctx.strokeStyle = MB.css("grid"); ctx.beginPath(); ctx.moveTo(left + (set + 1) * settings.ways * cellWidth, y + 2); ctx.lineTo(left + (set + 1) * settings.ways * cellWidth, y + rowHeight - 2); ctx.stroke(); }
+      }
+      if (lastStep) {
+        const p = lastStep.prediction;
+        const set = p.hashes[t].set;
+        const way = p.hits[t];
+        const x = left + (set * settings.ways + Math.max(0, way)) * cellWidth;
+        ctx.strokeStyle = way >= 0 ? (t === p.provider ? MB.css("accent") : MB.css("text")) : MB.css("text-faint");
+        ctx.lineWidth = way >= 0 ? 2.5 : 1;
+        ctx.setLineDash(way >= 0 ? [] : [2, 2]);
+        ctx.strokeRect(x, y + 1, way >= 0 ? cellWidth : cellWidth * settings.ways, rowHeight - 2);
+        ctx.setLineDash([]);
+      }
+    });
+  } });
+  function paintTage() {
+    const correct = recent.reduce((a, b) => a + b, 0);
+    MB.set("tg-accuracy", recent.length ? MB.pct(correct / recent.length) : "—");
+    MB.set("tg-alloc", `${allocationCount} / ${allocationFailureCount}`);
+    MB.set("tg-resetCounter", `${tage.usefulResetCounter} <small>/255 · 리셋 ${tage.usefulResets}회</small>`);
+    let valid = 0, total = 0;
+    tage.tables.forEach((table) => { total += table.valid.length; table.valid.forEach((bit) => (valid += bit)); });
+    MB.set("tg-occupancy", `${valid} <small>/ ${total}</small>`);
+    tageView.redraw();
+  }
+  MB.seg("#tg-trace", (value) => { traceKind = value; resetTage(); });
+  document.getElementById("tg-reset").onclick = resetTage;
+  document.getElementById("tg-step").onclick = () => { stepTage(false); paintTage(); };
+  document.getElementById("tg-fast").onclick = () => { for (let k = 0; k < 499; k++) stepTage(true); stepTage(false); paintTage(); };
+  let tageAccumulator = 0;
+  const TAGE_STEPS_PER_SECOND = 6;
+  const tageLoop = MB.loop(document.getElementById("sim-tage"), (dt) => {
+    tageAccumulator += dt * TAGE_STEPS_PER_SECOND;
+    let isChanged = false;
+    while (tageAccumulator >= 1) { stepTage(false); tageAccumulator--; isChanged = true; }
+    if (isChanged) paintTage();
+  });
+  tageLoop.running = false;
+  MB.playButton("tg-play", tageLoop, ["⏸ 멈춤", "▶ 자동"]);
+  resetTage();
+
+  /* ---------------------------------------------------- 5. SC 합과 문턱 */
+  const SC_TABLES = [
+    { name: "Path 8", color: "accent-2" }, { name: "Path 16", color: "accent-2" },
+    { name: "Global 8", color: "accent" }, { name: "Global 16", color: "accent" },
+    { name: "BW 4", color: "warn" }, { name: "BW 8", color: "warn" },
+    { name: "IMLI 8", color: "ok" }, { name: "Bias", color: "text-dim" },
+  ];
+  const SC_PRESETS = {
+    agree: [8, 11, 5, 13, 3, 6, 9, 7],
+    split: [10, -8, 6, -12, 2, -3, 5, -1],
+    bias: [2, 3, 1, 2, 0, 1, 2, -24],
+    zero: [0, 0, 0, 0, 0, 0, 0, 0],
+  };
+  const scCounters = SC_PRESETS.agree.slice();
+  let scTageCounter = 5, scThreshold = 1130;
+  const scCards = document.getElementById("sc-cards");
+  scCards.innerHTML = SC_TABLES.map((table, index) => `<div class="sc-card"><h5 style="color:var(--${table.color})">${table.name}</h5><input type="range" min="-32" max="31" value="${scCounters[index]}" data-index="${index}"><div class="mono small dim" id="sc-card-${index}"></div></div>`).join("");
+  scCards.addEventListener("input", (event) => { scCounters[+event.target.dataset.index] = +event.target.value; paintSc(); });
+  MB.seg("#sc-preset", (value) => { SC_PRESETS[value].forEach((counter, index) => { scCounters[index] = counter; scCards.querySelectorAll("input")[index].value = counter; }); paintSc(); });
+  MB.range("sc-tage", (value) => { scTageCounter = value; paintSc(); });
+  MB.range("sc-threshold", (value) => { scThreshold = value; paintSc(); });
+  function scResult() {
+    let sum = 0;
+    const segments = scCounters.map((counter, index) => { const value = 2 * counter + 1; const segment = { index, from: sum, value }; sum += value; return segment; });
+    const confidence = scTageCounter === 0 || scTageCounter === 7 ? "high" : scTageCounter === 3 || scTageCounter === 4 ? "weak" : "mid";
+    const shift = { high: 4, mid: 5, weak: 6 }[confidence];
+    const gate = scThreshold >> shift;
+    const isAbove = Math.abs(sum) > gate;
+    return { sum, segments, confidence, shift, gate, isAbove, scTaken: sum >= 0, tageTaken: scTageCounter >= 4 };
+  }
+  const scView = MB.canvas("#cv-sc", { aspect: 0.28, minHeight: 190, maxHeight: 250, draw(ctx, width, height) {
+    const r = scResult();
+    const left = 20, right = width - 20, middle = (left + right) / 2;
+    const extent = Math.max(240, Math.abs(r.sum) + 30, r.gate + 30, ...r.segments.map((segment) => Math.abs(segment.from) + Math.abs(segment.value)));
+    const sx = (value) => middle + (value / extent) * (right - left) / 2;
+    ctx.fillStyle = MB.alpha(MB.css("text-faint"), 0.16);
+    ctx.fillRect(sx(-r.gate), 14, sx(r.gate) - sx(-r.gate), height - 40);
+    MB.text(ctx, `−${r.gate}`, sx(-r.gate), height - 14, { align: "center", size: 11, mono: true, color: MB.css("text-dim") });
+    MB.text(ctx, `+${r.gate}`, sx(r.gate), height - 14, { align: "center", size: 11, mono: true, color: MB.css("text-dim") });
+    MB.text(ctx, "← not taken", left, 18, { size: 12, color: MB.css("nottaken"), weight: 700 });
+    MB.text(ctx, "taken →", right, 18, { size: 12, color: MB.css("taken"), weight: 700, align: "right" });
+    ctx.strokeStyle = MB.css("axis"); ctx.beginPath(); ctx.moveTo(sx(0), 14); ctx.lineTo(sx(0), height - 26); ctx.stroke();
+    const rowHeight = (height * 0.5) / r.segments.length, barTop = height * 0.2;
+    r.segments.forEach((segment, k) => {
+      const x0 = sx(Math.min(segment.from, segment.from + segment.value)), x1 = sx(Math.max(segment.from, segment.from + segment.value));
+      ctx.fillStyle = MB.css(SC_TABLES[segment.index].color);
+      MB.roundRect(ctx, x0, barTop + k * rowHeight + 1, Math.max(2, x1 - x0), Math.max(3, rowHeight - 2), 3); ctx.fill();
+    });
+    const dotY = barTop + r.segments.length * rowHeight + 10;
+    ctx.fillStyle = r.sum >= 0 ? MB.css("taken") : MB.css("nottaken");
+    ctx.beginPath(); ctx.arc(sx(r.sum), dotY, 8, 0, Math.PI * 2); ctx.fill();
+    if (r.isAbove) { ctx.strokeStyle = MB.css("text"); ctx.lineWidth = 2; ctx.stroke(); }
+    MB.text(ctx, `SUM ${r.sum}`, sx(r.sum), dotY + 18, { align: "center", size: 12, mono: true, weight: 700 });
+  } });
+  function paintSc() {
+    const r = scResult();
+    scCounters.forEach((counter, index) => { document.getElementById("sc-card-" + index).textContent = `c=${counter} → ${2 * counter + 1 > 0 ? "+" : ""}${2 * counter + 1}`; });
+    MB.set("sc-sum", (r.sum > 0 ? "+" : "") + r.sum);
+    const confidenceName = { high: "높음", mid: "중간", weak: "약함" }[r.confidence];
+    MB.set("sc-gate", `${confidenceName} → ±${r.gate} <small>T&gt;&gt;${r.shift}</small>`);
+    const finalTaken = r.isAbove ? r.scTaken : r.tageTaken;
+    const note = !r.isAbove ? "TAGE 유지" : r.scTaken === r.tageTaken ? "SC 사용(같은 답)" : "SC가 덮어씀";
+    MB.set("sc-final", `${finalTaken ? "taken" : "not taken"} <small>${note}</small>`, r.isAbove && r.scTaken !== r.tageTaken ? "good" : "");
+    MB.set("sc-train", r.isAbove ? "안 함 <small>(맞았고 문턱 위)</small>" : "함 <small>(문턱 아래)</small>");
+    scView.redraw();
+  }
+  paintSc();
+
+  /* ---------------------------------------------------- 6. ITTAGE 목적지 압축 */
+  const VIRTUAL_ADDRESS_BITS = 50;           // H 확장 + Sv48: GPAddrBitsSv48x4
+  const TARGET_OFFSET_WIDTH = 20;
+  const REGION_ENTRY_COUNT = 16;
+  const REGION_POINTER_BITS = 4;
+  const REGION_BITS = VIRTUAL_ADDRESS_BITS - TARGET_OFFSET_WIDTH;
+  const regionTable = { entries: Array.from({ length: REGION_ENTRY_COUNT }, () => ({ isValid: false, region: 0 })), recency: [], lastPointer: -1, lastEvicted: null };
+  let learnedRegionEntry = null; // 예측 때는 영역 검색 없이 저장된 포인터를 읽는다.
+  const regionHex = (value, digits = 1) => "0x" + value.toString(16).padStart(digits, "0");
+  const regionOf = (address) => Math.floor(address / (1 << TARGET_OFFSET_WIDTH));
+  const offsetOf = (address) => address % (1 << TARGET_OFFSET_WIDTH);
+  function touchRegion(pointer) { regionTable.recency = regionTable.recency.filter((value) => value !== pointer); regionTable.recency.push(pointer); }
+  function writeRegion(region) {
+    let pointer = regionTable.entries.findIndex((entry) => entry.isValid && entry.region === region);
+    regionTable.lastEvicted = null;
+    if (pointer < 0) {
+      pointer = regionTable.entries.findIndex((entry) => !entry.isValid);
+      if (pointer < 0) { pointer = regionTable.recency[0]; regionTable.lastEvicted = regionTable.entries[pointer].region; }
+      regionTable.entries[pointer] = { isValid: true, region };
+    }
+    touchRegion(pointer);
+    regionTable.lastPointer = pointer;
+    return pointer;
+  }
+  const regionPcInput = document.getElementById("rg-pc"), regionTargetInput = document.getElementById("rg-target");
+  const parseAddress = (text) => { const value = parseInt(text, 16); return isFinite(value) ? value : 0; };
+  function regionFacts() {
+    const pc = parseAddress(regionPcInput.value), target = parseAddress(regionTargetInput.value);
+    const isSameRegion = regionOf(pc) === regionOf(target);
+    const pointer = regionTable.entries.findIndex((entry) => entry.isValid && entry.region === regionOf(target));
+    return { pc, target, isSameRegion, pointer };
+  }
+  const regionView = MB.canvas("#cv-region", { aspect: 0.17, minHeight: 170, maxHeight: 210, draw(ctx, width, height) {
+    const facts = regionFacts();
+    const left = 14, right = width - 14;
+    // 목적지 비트 띠: 영역 30비트 + 오프셋 20비트
+    const barWidth = right - left, bitWidth = barWidth / VIRTUAL_ADDRESS_BITS;
+    MB.text(ctx, "목적지 50비트", left, 12, { size: 11, color: MB.css("text-dim") });
+    ctx.fillStyle = MB.alpha(MB.css("warn"), 0.35); ctx.fillRect(left, 22, REGION_BITS * bitWidth, 22);
+    ctx.fillStyle = MB.alpha(MB.css("accent"), 0.35); ctx.fillRect(left + REGION_BITS * bitWidth, 22, TARGET_OFFSET_WIDTH * bitWidth, 22);
+    MB.text(ctx, `영역 ${REGION_BITS}비트 = ${regionHex(regionOf(facts.target))}`, left + 6, 33, { size: 11.5, mono: true, weight: 700 });
+    MB.text(ctx, `오프셋 ${TARGET_OFFSET_WIDTH}비트 = ${regionHex(offsetOf(facts.target), 5)}`, right - 6, 33, { size: 11.5, mono: true, weight: 700, align: "right" });
+    // 영역 테이블 16칸
+    const tableTop = 70, cellWidth = barWidth / REGION_ENTRY_COUNT, cellHeight = Math.min(44, height - tableTop - 30);
+    MB.text(ctx, "영역 테이블 16칸 (PLRU 대신 LRU로 그림)", left, tableTop - 10, { size: 11, color: MB.css("text-dim") });
+    regionTable.entries.forEach((entry, index) => {
+      const x = left + index * cellWidth;
+      ctx.fillStyle = entry.isValid ? MB.alpha(MB.css("warn"), index === regionTable.lastPointer ? 0.8 : 0.3) : MB.css("surface-2");
+      MB.roundRect(ctx, x + 1, tableTop, cellWidth - 2, cellHeight, 4); ctx.fill();
+      MB.text(ctx, String(index), x + cellWidth / 2, tableTop + 10, { align: "center", size: 10, mono: true, color: MB.css("text-dim") });
+      if (entry.isValid && cellWidth > 34) MB.text(ctx, regionHex(entry.region).slice(-4), x + cellWidth / 2, tableTop + cellHeight - 10, { align: "center", size: 9.5, mono: true });
+    });
+    if (regionTable.lastEvicted !== null) MB.text(ctx, `밀려난 영역: ${regionHex(regionTable.lastEvicted)}`, left, tableTop + cellHeight + 16, { size: 11.5, color: MB.css("bad"), weight: 700 });
+  } });
+  function paintRegion() {
+    const facts = regionFacts();
+    MB.set("rg-region", regionHex(regionOf(facts.target)));
+    MB.set("rg-offset", regionHex(offsetOf(facts.target), 5));
+    if (facts.isSameRegion) MB.set("rg-entry", "오프셋 + '분기의 영역 사용'");
+    else MB.set("rg-entry", facts.pointer >= 0 ? `오프셋 + 영역 칸 ${facts.pointer}` : "오프셋 + (아직 영역 칸 없음)");
+    MB.set("rg-bits", `${TARGET_OFFSET_WIDTH + REGION_POINTER_BITS + 1} <small>(원래 ${VIRTUAL_ADDRESS_BITS})</small>`);
+    const prediction = document.getElementById("rg-prediction");
+    if (!learnedRegionEntry) { prediction.textContent = "목적지를 학습하면 저장된 엔트리의 예측을 표시한다."; prediction.style.color = ""; }
+    else {
+      const entry = learnedRegionEntry;
+      const slot = entry.usePcRegion ? null : regionTable.entries[entry.pointer];
+      const region = slot && slot.isValid ? slot.region : regionOf(entry.pc);
+      const predictedTarget = region * (1 << TARGET_OFFSET_WIDTH) + entry.offset;
+      const correct = predictedTarget === entry.target;
+      prediction.textContent = `저장된 엔트리의 예측: ${regionHex(predictedTarget)} · 학습한 목적지 ${regionHex(entry.target)} · ` +
+        (entry.usePcRegion ? "분기의 영역 사용" : `영역 칸 ${entry.pointer}, valid=${slot.isValid ? 1 : 0}`) +
+        (correct ? " · 일치" : " · 불일치: 교체된 영역을 읽음 (자동 미스 아님)");
+      prediction.style.color = MB.css(correct ? "ok" : "bad");
+    }
+    regionView.redraw();
+  }
+  [regionPcInput, regionTargetInput].forEach((input) => input.addEventListener("input", paintRegion));
+  document.getElementById("rg-write").onclick = () => {
+    const facts = regionFacts();
+    const pointer = facts.isSameRegion ? null : writeRegion(regionOf(facts.target));
+    learnedRegionEntry = { pc: facts.pc, target: facts.target, offset: offsetOf(facts.target), usePcRegion: facts.isSameRegion, pointer };
+    paintRegion();
+  };
+  const FAR_TARGET_COUNT = 20;
+  document.getElementById("rg-far").onclick = () => {
+    for (let k = 0; k < FAR_TARGET_COUNT; k++) writeRegion(0x20000 + k * 7);
+    paintRegion();
+  };
+  document.getElementById("rg-reset").onclick = () => { learnedRegionEntry = null; regionTable.entries.forEach((entry) => { entry.isValid = false; }); regionTable.recency = []; regionTable.lastPointer = -1; regionTable.lastEvicted = null; paintRegion(); };
+  paintRegion();
+
+  /* ---------------------------------------------------- 7. ITTAGE vs 마지막 목적지 */
+  const CALL_SITE_PC = 0x80005100;
+  const CALL_TARGETS = [0x80010000, 0x80020400, 0x80030800];
+  const TARGET_NAMES = ["A", "B", "C"];
+  const RECENT_CALLS = 200;
+  const ITTAGE_HISTORY_BARS = 60;
+  let callPattern = "cycle", callNoise = 0.1;
+  let ittage, callRandom, callStep, lastTarget, ittageRecent, btbRecent, lastSource, callHistory;
+  function nextTargetIndex() {
+    let index;
+    if (callPattern === "cycle") index = callStep % 3;
+    else if (callPattern === "pair") index = Math.floor(callStep / 2) % 2;
+    else index = Math.floor(callRandom() * 3);
+    if (callRandom() < callNoise) index = Math.floor(callRandom() * 3);
+    callStep++;
+    return index;
+  }
+  function resetIttage() {
+    ittage = new Engine.MiniIttage();
+    callRandom = MB.rng(9); callStep = 0; lastTarget = null;
+    ittageRecent = []; btbRecent = []; lastSource = "—"; callHistory = [];
+  }
+  function stepIttage() {
+    const index = nextTargetIndex();
+    const actual = CALL_TARGETS[index];
+    const prediction = ittage.predict(CALL_SITE_PC);
+    const result = ittage.update(prediction, actual, lastTarget === null ? 0 : lastTarget);
+    const isIttageRight = !result.isMispredict;
+    const isBtbRight = lastTarget === actual;
+    ittageRecent.push(isIttageRight ? 1 : 0); btbRecent.push(isBtbRight ? 1 : 0);
+    if (ittageRecent.length > RECENT_CALLS) { ittageRecent.shift(); btbRecent.shift(); }
+    callHistory.push({ index, isIttageRight, isBtbRight });
+    if (callHistory.length > ITTAGE_HISTORY_BARS) callHistory.shift();
+    lastSource = prediction.isHit ? prediction.source : "적중 없음(BTB 목적지)";
+    lastTarget = actual;
+  }
+  const ittageView = MB.canvas("#cv-ittage", { aspect: 0.26, minHeight: 170, maxHeight: 220, draw(ctx, width, height) {
+    if (!callHistory) return;
+    const left = 90, right = width - 12, barWidth = (right - left) / ITTAGE_HISTORY_BARS;
+    const rows = [["ITTAGE", "isIttageRight"], ["BTB 마지막", "isBtbRight"]];
+    rows.forEach(([name, field], rowIndex) => {
+      const y = 18 + rowIndex * ((height - 40) / 2);
+      const rowHeight = (height - 40) / 2 - 10;
+      MB.text(ctx, name, left - 8, y + rowHeight / 2, { align: "right", size: 12, weight: 700 });
+      callHistory.forEach((entry, k) => {
+        ctx.fillStyle = entry[field] ? MB.css("ok") : MB.css("bad");
+        ctx.fillRect(left + k * barWidth + 0.5, y, Math.max(1, barWidth - 1), rowHeight);
+        if (rowIndex === 0 && barWidth > 9) MB.text(ctx, TARGET_NAMES[entry.index], left + k * barWidth + barWidth / 2, y - 7, { align: "center", size: 9.5, mono: true, color: MB.css("text-faint") });
+      });
+    });
+    MB.text(ctx, "← 오래된 호출   최근 호출 →", right, height - 4, { align: "right", size: 10.5, color: MB.css("text-faint"), baseline: "bottom" });
+  } });
+  function paintIttage() {
+    const average = (list) => (list.length ? list.reduce((a, b) => a + b, 0) / list.length : NaN);
+    MB.set("it-ittage", MB.pct(average(ittageRecent)));
+    MB.set("it-btb", MB.pct(average(btbRecent)));
+    MB.set("it-source", lastSource);
+    ittageView.redraw();
+  }
+  const ITTAGE_PREWARM_CALLS = 2000;
+  function prewarmIttage() { resetIttage(); for (let k = 0; k < ITTAGE_PREWARM_CALLS; k++) stepIttage(); paintIttage(); }
+  MB.seg("#it-pattern", (value) => { callPattern = value; prewarmIttage(); });
+  MB.range("it-noise", (value) => { callNoise = value; prewarmIttage(); }, (value) => Math.round(value * 100) + "%");
+  document.getElementById("it-reset").onclick = () => { resetIttage(); paintIttage(); };
+  let ittageAccumulator = 0;
+  const ITTAGE_CALLS_PER_SECOND = 5;
+  const ittageLoop = MB.loop(document.getElementById("sim-ittage"), (dt) => {
+    ittageAccumulator += dt * ITTAGE_CALLS_PER_SECOND;
+    let isChanged = false;
+    while (ittageAccumulator >= 1) { stepIttage(); ittageAccumulator--; isChanged = true; }
+    if (isChanged) paintIttage();
+  });
+  ittageLoop.running = false;
+  MB.playButton("it-play", ittageLoop, ["⏸ 멈춤", "▶ 재생"]);
+  prewarmIttage();
+
+  /* ---------------------------------------------------- 8. RAS */
+  const SPECULATIVE_QUEUE_SIZE = 32, COMMIT_STACK_SIZE = 16;
+  const DEEP_CALL_COUNT = 20;
+  const returnStack = new Engine.ReturnStack();
+  let nextCallSite = 0x80002000;
+  const logLines = [];
+  function log(message) { logLines.unshift(message); logLines.length = Math.min(logLines.length, 6); document.getElementById("rs-log").innerHTML = logLines.join("<br>"); }
+  function newReturnAddress() { nextCallSite += 0x34; return nextCallSite; }
+  function liveChain() {
+    const chain = new Set();
+    let pointer = returnStack.topOfStackRead;
+    let guard = 0;
+    while (returnStack.isInRange(pointer) && guard < SPECULATIVE_QUEUE_SIZE) { chain.add(pointer); pointer = returnStack.queue[pointer % SPECULATIVE_QUEUE_SIZE].nextOfStack; guard++; }
+    return chain;
+  }
+  const rasView = MB.canvas("#cv-ras", { aspect: 0.48, minHeight: 300, maxHeight: 400, draw(ctx, width, height) {
+    const isNarrow = width < 560;
+    const queueLeft = 14, queueWidth = isNarrow ? width * 0.56 : width * 0.6;
+    const columns = 8, rows = SPECULATIVE_QUEUE_SIZE / columns;
+    const cellWidth = queueWidth / columns, cellHeight = Math.min(48, (height - 40) / rows);
+    const chain = liveChain();
+    MB.text(ctx, "투기 큐 32칸 (원형)", queueLeft, 12, { size: 11.5, weight: 700, color: MB.css("accent-2") });
+    const cellCenter = (pointer) => { const slot = pointer % SPECULATIVE_QUEUE_SIZE; return { x: queueLeft + (slot % columns) * cellWidth + cellWidth / 2, y: 24 + Math.floor(slot / columns) * cellHeight + cellHeight / 2 }; };
+    for (let pointer = returnStack.topOfStackWrite - SPECULATIVE_QUEUE_SIZE; pointer < returnStack.topOfStackWrite + SPECULATIVE_QUEUE_SIZE; pointer++) { /* no-op: 범위 안 칸만 아래에서 그림 */ }
+    for (let slot = 0; slot < SPECULATIVE_QUEUE_SIZE; slot++) {
+      const x = queueLeft + (slot % columns) * cellWidth, y = 24 + Math.floor(slot / columns) * cellHeight;
+      // 이 칸에 해당하는 논리 번호 중 범위 안의 것을 찾는다
+      let logical = -1;
+      for (let candidate = returnStack.bottomOfStack; candidate < returnStack.topOfStackWrite; candidate++) if (candidate % SPECULATIVE_QUEUE_SIZE === slot) logical = candidate;
+      const entry = returnStack.queue[slot];
+      let fill = MB.css("surface-2");
+      if (logical >= 0) fill = chain.has(logical) ? MB.alpha(MB.css("accent-2"), 0.75) : MB.alpha(MB.css("accent-2"), 0.22);
+      ctx.fillStyle = fill;
+      MB.roundRect(ctx, x + 2, y + 2, cellWidth - 4, cellHeight - 4, 5); ctx.fill();
+      if (logical >= 0 && cellWidth > 40) {
+        MB.text(ctx, hex(entry.address).slice(-4) + (entry.counter ? ` ×${entry.counter + 1}` : ""), x + cellWidth / 2, y + cellHeight / 2, { align: "center", size: isNarrow ? 9 : 10.5, mono: true, color: chain.has(logical) ? "#fff" : MB.css("text") });
+      }
+      const marks = [];
+      if (slot === ((returnStack.topOfStackRead % SPECULATIVE_QUEUE_SIZE) + SPECULATIVE_QUEUE_SIZE) % SPECULATIVE_QUEUE_SIZE && returnStack.isInRange(returnStack.topOfStackRead)) marks.push("R");
+      if (slot === returnStack.topOfStackWrite % SPECULATIVE_QUEUE_SIZE) marks.push("W");
+      if (slot === returnStack.bottomOfStack % SPECULATIVE_QUEUE_SIZE) marks.push("B");
+      if (marks.length) MB.text(ctx, marks.join(""), x + 6, y + 10, { size: 9.5, weight: 800, mono: true, color: MB.css("bad") });
+    }
+    // NOS 링크
+    chain.forEach((pointer) => {
+      const nextPointer = returnStack.queue[pointer % SPECULATIVE_QUEUE_SIZE].nextOfStack;
+      if (!returnStack.isInRange(nextPointer)) return;
+      const from = cellCenter(pointer), to = cellCenter(nextPointer);
+      ctx.strokeStyle = MB.css("text"); ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.moveTo(from.x, from.y + 8);
+      ctx.quadraticCurveTo((from.x + to.x) / 2, Math.max(from.y, to.y) + cellHeight * 0.6, to.x, to.y + 8); ctx.stroke();
+    });
+    // 커밋 스택
+    const stackLeft = queueLeft + queueWidth + 24, stackWidth = width - stackLeft - 14;
+    const stackCell = (height - 40) / COMMIT_STACK_SIZE;
+    MB.text(ctx, "커밋 스택 16칸", stackLeft, 12, { size: 11.5, weight: 700, color: MB.css("accent") });
+    for (let depth = 0; depth < COMMIT_STACK_SIZE; depth++) {
+      const y = height - 10 - (depth + 1) * stackCell;
+      const isLive = depth < Math.min(returnStack.commitPointer, COMMIT_STACK_SIZE);
+      const slotIndex = ((returnStack.commitPointer - (Math.min(returnStack.commitPointer, COMMIT_STACK_SIZE) - 1 - depth)) % COMMIT_STACK_SIZE + COMMIT_STACK_SIZE) % COMMIT_STACK_SIZE;
+      const entry = returnStack.commitStack[slotIndex];
+      ctx.fillStyle = isLive ? MB.alpha(MB.css("accent"), 0.35) : MB.css("surface-2");
+      MB.roundRect(ctx, stackLeft, y + 1, stackWidth, stackCell - 2, 3); ctx.fill();
+      if (isLive && stackCell > 10) MB.text(ctx, hex(entry.address).slice(-4) + (entry.counter ? ` ×${entry.counter + 1}` : ""), stackLeft + stackWidth / 2, y + stackCell / 2, { align: "center", size: Math.min(10.5, stackCell - 2), mono: true });
+    }
+  } });
+  function paintRas() {
+    MB.set("rs-pointers", `${returnStack.topOfStackRead} / ${returnStack.topOfStackWrite} / ${returnStack.bottomOfStack}`);
+    const top = returnStack.top();
+    MB.set("rs-top", top.address ? hex(top.address) : "없음");
+    MB.set("rs-depth", `${Math.max(0, returnStack.commitPointer)}${returnStack.commitPointer > COMMIT_STACK_SIZE ? " <small>(넘침)</small>" : ""}`);
+    MB.set("rs-pending", `${returnStack.pending.length} <small>(잘못된 경로 ${returnStack.pending.filter((entry) => entry.isWrongPath).length})</small>`);
+    rasView.redraw();
+  }
+  let recursiveAddress = null;
+  document.getElementById("rs-call").onclick = () => { const address = newReturnAddress(); log(returnStack.call(address) ? `call → 반환 주소 ${hex(address)} 푸시` : "투기 큐가 가득 찼다. 먼저 커밋하자."); recursiveAddress = address; paintRas(); };
+  document.getElementById("rs-recursive").onclick = () => { const address = recursiveAddress || newReturnAddress(); recursiveAddress = address; log(returnStack.call(address) ? `재귀 call → 같은 주소 ${hex(address)} (카운터 ${returnStack.specCounter})` : "투기 큐가 가득 찼다."); paintRas(); };
+  document.getElementById("rs-return").onclick = () => { const predicted = returnStack.ret(false); log(`return → 예측 ${predicted ? hex(predicted) : "없음"}`); paintRas(); };
+  document.getElementById("rs-wrongCall").onclick = () => { const address = newReturnAddress(); returnStack.call(address, true); log(`(잘못된 경로) call ${hex(address)}`); paintRas(); };
+  document.getElementById("rs-wrongReturn").onclick = () => { const predicted = returnStack.ret(true); log(`(잘못된 경로) return → ${predicted ? hex(predicted) : "없음"}`); paintRas(); };
+  document.getElementById("rs-redirect").onclick = () => { log(returnStack.redirect() ? "리다이렉트: TOSR·TOSW·ssp·sctr를 잘못된 경로 직전으로 되돌림" : "되돌릴 잘못된 경로가 없다"); paintRas(); };
+  document.getElementById("rs-commit").onclick = () => {
+    const operation = returnStack.commitOldest();
+    log(operation ? `커밋: ${operation.kind === "call" ? `call ${hex(operation.address)} → 커밋 스택` : "return → 커밋 스택에서 내림"}` : "커밋할 것이 없거나, 잘못된 경로를 먼저 리다이렉트해야 한다");
+    paintRas();
+  };
+  document.getElementById("rs-deep").onclick = () => {
+    returnStack.reset(); logLines.length = 0;
+    const addresses = [];
+    for (let depth = 0; depth < DEEP_CALL_COUNT; depth++) { const address = newReturnAddress(); addresses.push(address); returnStack.call(address); returnStack.commitOldest(); }
+    let correct = 0;
+    for (let depth = DEEP_CALL_COUNT - 1; depth >= 0; depth--) { if (returnStack.ret(false) === addresses[depth]) correct++; returnStack.commitOldest(); }
+    log(`20단 호출 후 반환 20번: ${correct}번 맞음 (커밋 스택이 16칸이라 가장 깊은 반환 주소가 덮어써짐)`);
+    paintRas();
+  };
+  document.getElementById("rs-reset").onclick = () => { returnStack.reset(); logLines.length = 0; document.getElementById("rs-log").innerHTML = "비웠다."; recursiveAddress = null; paintRas(); };
+  // 시작 상태: 커밋된 호출 둘, 투기 상태의 호출 하나
+  returnStack.call(newReturnAddress()); returnStack.call(newReturnAddress()); returnStack.commitOldest(); returnStack.commitOldest();
+  returnStack.call(newReturnAddress());
+  paintRas();
+})();
+</script>
+</body>
+</html>

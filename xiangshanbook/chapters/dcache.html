@@ -1,0 +1,814 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>L1 데이터 캐시와 프리페처 · XiangShanBook</title>
+<meta name="description" content="XiangShan 곤명호 v3의 L1 데이터 캐시. 64 KB 4-way, 2바이트 뱅크 32개, 해시 인덱스, set PLRU 교체, MSHR 16개의 병합 규칙, 그리고 스트라이드·스트림·SMS 프리페처.">
+<link rel="icon" type="image/svg+xml" href="../favicon.svg">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/common.js"></script>
+<style>
+  .address-inputs { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px 18px; padding: 14px 18px; border-bottom: 1px solid var(--border); }
+  .address-inputs label { display: grid; gap: 4px; font-size: 13.5px; color: var(--text-dim); }
+  .address-inputs input[type="text"] { font-family: var(--mono); font-size: 14px; padding: 7px 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); }
+  .address-inputs select { font: inherit; font-size: 13.5px; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg-elev); color: var(--text); }
+  .trace-box { width: 100%; min-height: 64px; font-family: var(--mono); font-size: 12.5px; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); resize: vertical; }
+</style>
+</head>
+<body data-chapter="dcache">
+<main class="chapter">
+  <header class="chapter-hero">
+    <div class="eyebrow">Chapter 10</div>
+    <h1>L1 데이터 캐시와 프리페처</h1>
+    <p class="lead">로드 유닛 세 개가 매 사이클 데이터를 달라고 하고, 스토어 버퍼는 커밋된 라인을 쓰겠다고 하고, 아래 L2에서는 리필 데이터와 일관성 프로브가 올라온다. L1 데이터 캐시<span class="en">(DCache)</span>는 이 모든 요청을 한두 사이클 안에 처리해야 한다. XiangShan 곤명호 v3는 이를 위해 캐시 라인을 2바이트짜리 뱅크 32개로 잘게 쪼갰다. 놓친 요청은 미스 처리 레지스터(MSHR)에 모은다. 앞으로 필요할 라인은 프리페처가 미리 불러온다. 이 장은 그 구조를 주소 비트 하나하나부터 뜯어본다.</p>
+    <ul class="objectives">
+      <li>DefaultConfig의 L1D(64 KB, 4-way, 256 set)에서 주소가 오프셋·뱅크·인덱스·태그로 나뉘는 방식과 해시 인덱스의 효과를 확인한다.</li>
+      <li>로드 두 개가 같은 사이클에 뱅크 충돌을 일으키는 조건을 직접 만들어 본다.</li>
+      <li>set PLRU 교체로 돌아가는 실제 기하의 캐시를 주소 흐름으로 시뮬레이션한다.</li>
+      <li>MSHR 16개가 미스를 할당·병합·거절하는 규칙과 프리페치 몫 6개를 관찰한다.</li>
+      <li>스트라이드 프리페처의 학습 표와 SMS의 공간 패턴 기억을 돌려 보고 적중률과 정확도를 잰다.</li>
+    </ul>
+  </header>
+
+  <!-- ============================================================ 1 -->
+  <section id="geometry">
+    <h2>64 KB를 쪼개는 방법</h2>
+    <p>DefaultConfig는 <code>WithNKBL1D(64, ways = 4, numMemChannels = 2)</code>로 L1D를 만든다. 크기 64 KB, 웨이 4개, 라인 64 B이므로 집합<span class="en">(set)</span>은 64 KB ÷ 4 ÷ 64 B = <b>256개</b>다. 태그와 데이터에는 SECDED ECC가 붙는다. 교체 정책은 집합마다 따로 두는 PLRU(<code>setplru</code>)다. 미스 엔트리 16개, 프로브 엔트리 8개, 내보내기<span class="en">(release)</span> 엔트리 18개를 둔다.</p>
+    <div class="callout code"><strong>L1D 구성</strong>
+<pre><code><span class="c">// src/main/scala/top/Configs.scala:296-316 (요약)</span>
+<span class="k">case class</span> WithNKBL1D(n: Int, ways: Int = 8, numMemChannels: Int = 1) ... {
+  <span class="k">val</span> sets = n * 1024 / ways / 64
+  dcacheParametersOpt = Some(DCacheParameters(
+    nSets = sets, nWays = ways,
+    tagECC = Some(<span class="s">"secded"</span>), dataECC = Some(<span class="s">"secded"</span>),
+    replacer = Some(<span class="s">"setplru"</span>),
+    nMissEntries = 16, nProbeEntries = 8, nReleaseEntries = 18,
+    nMaxPrefetchEntry = 6, ...
+<span class="c">// Configs.scala:585 — DefaultConfig: WithNKBL1D(64, ways = 4, numMemChannels = 2)</span></code></pre>
+    </div>
+    <p>특이한 점은 데이터 배열의 <b>뱅크</b>다. 64 B 라인을 2 B(16비트)씩 32개의 SRAM 뱅크에 나눠 담는다(<code>DCacheBanks = 32</code>, <code>DCacheSRAMRowBits = 16</code>). 8 B 로드 하나는 연속된 뱅크 4개를 읽고, 16 B 벡터 접근은 8개를 읽는다. 뱅크를 이렇게 잘게 쪼갠 이유는 로드 파이프 세 개가 같은 사이클에 서로 다른 뱅크를 읽을 확률을 높이기 위해서다.</p>
+    <div class="callout code"><strong>뱅크와 인덱스 비트</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/cache/dcache/DCacheWrapper.scala:165-192 (요약)</span>
+<span class="k">val</span> DCacheBanks = 32
+<span class="k">val</span> DCacheSRAMRowBits = 16
+<span class="k">val</span> DCacheBankOffset = log2Up(DCacheSRAMRowBytes)              <span class="c">// 1</span>
+<span class="k">val</span> DCacheSetOffset  = DCacheBankOffset + log2Up(DCacheBanks)    <span class="c">// 6</span>
+<span class="k">val</span> DCacheAboveIndexOffset = DCacheSetOffset + log2Up(DCacheSets) <span class="c">// 14</span>
+<span class="k">val</span> DCacheTagOffset = DCacheAboveIndexOffset min DCacheSameVPAddrLength <span class="c">// 12</span></code></pre>
+    </div>
+    <p>인덱스 8비트를 그냥 주소 [13:6]에서 가져오면 문제가 생긴다. 4 KB 페이지 안의 오프셋은 [11:0]뿐이므로 [13:12] 두 비트는 가상 주소와 물리 주소가 다를 수 있다. 이것이 <span class="term">별칭</span><span class="en">(alias)</span> 문제다(<code>aliasBitsOpt</code>). 곤명호 v3는 인덱스의 하위 6비트를 페이지 오프셋 [11:6]에서 가져온다. 상위 2비트는 가상 주소 [47:12]를 두 비트씩 묶어 모두 XOR한 값으로 만든다. 별칭 비트는 L2가 기록해 두었다가 일관성을 맞춘다. 이 해시에는 부수 효과도 있다. 2의 거듭제곱 보폭으로 메모리를 훑어도 한 집합에만 몰리지 않는다.</p>
+    <div class="callout code"><strong>해시 인덱스 (modeId = 1)</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/cache/L1Cache.scala:81-105 (요약)</span>
+<span class="k">def</span> modeId = 1 <span class="c">//DCache index & alias mode: 1 for hash vaddr, 2 for direct extract vaddr[13:6]</span>
+<span class="k">def</span> get_dcache_idx(addr: UInt, modeId: Int = modeId) = modeId <span class="k">match</span> {
+  <span class="k">case</span> 1 =&gt; Cat(
+             hashBitPairs(addr, PAddrBits - 1, pgIdxBits),               <span class="c">// hash vaddr[47:12]</span>
+             addr(untagBits - 1 - (untagBits-pgUntagBits), blockOffBits) <span class="c">// vaddr[11:6]</span>
+            )(idxBits - 1, 0)
+  <span class="k">case</span> 2 =&gt; addr(untagBits - 1, blockOffBits) <span class="c">// vaddr[13:6]</span>
+}</code></pre>
+    </div>
+
+    <div class="sim" id="sim-address">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>주소 해부와 뱅크 충돌 판정</h3></div>
+      <div class="address-inputs">
+        <label>로드 A 가상 주소 (16진수)<input type="text" id="addr-a" value="0x80001238"></label>
+        <label>로드 A 크기<select id="size-a"><option value="1">1 B</option><option value="2">2 B</option><option value="4">4 B</option><option value="8" selected>8 B</option><option value="16">16 B (벡터)</option></select></label>
+        <label>로드 B 가상 주소 (16진수)<input type="text" id="addr-b" value="0x80005238"></label>
+        <label>로드 B 크기<select id="size-b"><option value="1">1 B</option><option value="2">2 B</option><option value="4">4 B</option><option value="8" selected>8 B</option><option value="16">16 B (벡터)</option></select></label>
+      </div>
+      <div class="sim-view"><canvas id="cv-address"></canvas></div>
+      <div class="sim-controls">
+        <div class="ctrl"><span>예시</span><div class="seg" id="addr-preset"><button data-value="conflict" class="on">충돌</button><button data-value="sameset">같은 집합</button><button data-value="apart">다른 뱅크</button></div></div>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">A 집합 / 뱅크</span><span class="v" id="addr-a-out">—</span></div>
+        <div class="stat"><span class="k">B 집합 / 뱅크</span><span class="v" id="addr-b-out">—</span></div>
+        <div class="stat"><span class="k">판정</span><span class="v" id="addr-verdict">—</span></div>
+      </div>
+      <figcaption><span class="try">입력해 보기</span>위 막대는 48비트 가상 주소를 해부한 것이다. [0]은 뱅크 안 바이트, [5:1]은 뱅크 번호, [11:6]은 인덱스 하위 6비트, [47:12]는 인덱스 상위 2비트를 만드는 해시 재료이자 물리 태그 자리다. 아래 32칸 두 줄은 두 로드가 읽는 뱅크다. RTL의 판정 규칙(<code>BankedDataArray.scala:740-749</code>)은 두 가지를 본다. 읽는 뱅크가 하나라도 겹치는지, 그리고 <b>집합이 다른지</b>다. 둘 다 맞으면 충돌이다. 같은 집합이면 SRAM의 같은 줄을 읽으므로 겹쳐도 충돌이 아니다. 충돌하면 더 오래된 로드만 통과하고, 나머지는 뱅크 충돌(원인 8)로 빠른 재실행된다. 16 B 경계를 넘는 접근은 로드 유닛이 미리 두 번으로 쪼개므로 이 판정 전에 걸러진다.</figcaption>
+    </div>
+  </section>
+
+  <!-- ============================================================ 2 -->
+  <section id="cachesim">
+    <h2>집합 연관 캐시를 직접 돌리기</h2>
+    <p>집합마다 4개의 웨이가 있고, 새 라인이 들어올 때 누구를 내보낼지는 <span class="term">트리 PLRU</span><span class="en">(Tree pseudo-LRU)</span>가 정한다. 웨이 4개면 비트 3개짜리 이진 트리다. 루트 비트는 왼쪽 쌍(웨이 0·1)과 오른쪽 쌍(웨이 2·3) 중 최근에 덜 쓴 쪽을 가리킨다. 아래 비트 둘은 각 쌍 안에서 덜 쓴 쪽을 가리킨다. 접근할 때마다 지나간 비트를 반대쪽으로 돌려놓는 것이 전부다. 진짜 LRU보다 훨씬 싸면서 대부분의 경우 비슷한 결정을 내린다.</p>
+    <div class="sim" id="sim-cache">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>256 set × 4 way, set PLRU</h3>
+        <div class="seg" id="cache-index"><button data-value="1" class="on">해시 인덱스 (RTL)</button><button data-value="2">직접 [13:6]</button></div>
+      </div>
+      <div class="sim-view"><canvas id="cv-cache"></canvas></div>
+      <div class="sim-controls">
+        <div class="ctrl"><span>주소 흐름</span><div class="seg" id="cache-preset"><button data-value="array" class="on">배열 순회</button><button data-value="stride4k">4 KB 보폭</button><button data-value="stride16k">16 KB 보폭</button><button data-value="random">무작위 1 MB</button><button data-value="custom">직접 입력</button></div></div>
+        <label class="ctrl"><span>반복 횟수 <output id="cache-repeat-out"></output></span><input type="range" id="cache-repeat" min="1" max="8" step="1" value="3"></label>
+        <label class="ctrl"><span>살펴볼 집합 <output id="cache-set-out"></output></span><input type="range" id="cache-set" min="0" max="255" step="1" value="0"></label>
+      </div>
+      <div style="padding:0 18px 12px"><textarea class="trace-box" id="cache-trace" spellcheck="false">0x10000 0x10040 0x14000 0x18000 0x1c000 0x20000 0x10000 0x14000</textarea></div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">접근</span><span class="v" id="cache-access">—</span></div>
+        <div class="stat"><span class="k">적중률</span><span class="v" id="cache-hit">—</span></div>
+        <div class="stat"><span class="k">쫓겨난 라인</span><span class="v" id="cache-evict">—</span></div>
+        <div class="stat"><span class="k">사용된 집합</span><span class="v" id="cache-sets">—</span></div>
+      </div>
+      <figcaption><span class="try">비교해 보기</span>왼쪽 16×16 격자는 집합 256개다. 색이 진할수록 그 집합에서 미스가 많았다. 오른쪽은 고른 집합(슬라이더, 또는 격자 클릭)의 웨이 4개와 PLRU 비트 3개다. 주황 테두리 웨이가 다음 희생자다. 보폭이 16 KB인 주소 16개를 세 번 훑어 보자. '직접 [13:6]' 인덱스에서는 [13:6]이 모두 같아 16개가 한 집합에 몰린다. 웨이 4개를 두고 싸우므로 세 바퀴 내내 전부 미스다(적중률 0%). 해시 인덱스에서는 [15:14]와 [17:16]의 XOR가 주소를 4개 집합에 4개씩 고르게 흩어 놓는다. 16개가 모두 들어가므로 두 번째 바퀴부터 전부 적중한다(적중률 66.7%). 4 KB 보폭은 두 방식 모두 4개 집합에 퍼진다. 웹 모델은 가상 주소를 그대로 물리 주소로 쓰고 프리페치·병합은 생략했다.</figcaption>
+    </div>
+  </section>
+
+  <!-- ============================================================ 3 -->
+  <section id="pipes">
+    <h2>로드 파이프와 메인 파이프</h2>
+    <p>DCache 안에는 두 종류의 파이프라인이 있다. <b>로드 파이프</b>(<code>LoadPipe</code>)는 로드 유닛 하나에 하나씩, 모두 3개다. 태그와 데이터를 읽어 s2에서 적중 여부를 알려 주고, 놓치면 MSHR에 미스를 보낸다. <b>메인 파이프</b>(<code>MainPipe</code>)는 캐시 상태를 바꾸는 모든 일을 한 줄로 세워 처리한다. L2에서 온 프로브, 리필된 라인 쓰기, 프리페치, sbuffer의 스토어, 원자 연산이 여기에 해당한다. 상태를 바꾸는 요청을 한 파이프로 모으면, 같은 라인을 두 곳에서 동시에 고치는 경쟁을 원천적으로 막을 수 있다.</p>
+    <div class="callout code"><strong>메인 파이프 s0 중재 순서</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/cache/dcache/mainpipe/MainPipe.scala:279-291</span>
+<span class="c">// s0: read meta and tag</span>
+arbiter(
+  in = Seq(
+    io.probe_req,
+    io.refill_req,
+    prefetch_req, <span class="c">// Todo: what's the best priority</span>
+    store_req,
+    io.atomic_req,
+  ), ...</code></pre>
+      <p>프로브가 가장 먼저다. 다른 코어가 기다리는 일관성 요청을 늦추면 시스템 전체가 느려지기 때문이다. 메인 파이프는 s0 태그 읽기 → s1 데이터 읽기 → s2 데이터 선택 → s3 쓰기의 4단이다.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ 4 -->
+  <section id="mshr">
+    <h2>MSHR: 놓친 요청을 모으는 곳</h2>
+    <p>미스가 나면 L2에 라인을 달라고 요청(TileLink Acquire)하고 데이터가 올 때까지 기다려야 한다. 그동안 같은 라인을 원하는 다른 미스가 또 오면, 두 번 요청할 필요 없이 기존 요청에 <span class="term">병합</span><span class="en">(merge)</span>한다. 미스 상태 보관 레지스터<span class="en">(MSHR, Miss Status Holding Register)</span>가 이 일을 한다. 곤명호 v3의 L1D에는 16개가 있다. 미스 큐는 메인 파이프 1개와 로드 파이프 3개에서 동시에 요청을 받고, 2사이클에 걸쳐 할당·병합·거절을 정한다.</p>
+    <ul>
+      <li><b>할당</b>: 같은 블록을 가진 엔트리가 없고 빈 엔트리가 있으면 새로 잡는다.</li>
+      <li><b>병합</b>: 같은 블록(별칭 비트까지 같은)의 엔트리가 있을 때다. 새 요청이 <b>로드</b>면 데이터가 리필되기 전까지는 병합할 수 있다. 새 요청이 <b>스토어</b>면 그 엔트리를 처음 잡은 것도 스토어일 때만 병합한다.</li>
+      <li><b>거절</b>: 같은 블록인데 병합 조건이 안 맞으면 거절한다. 요청은 재실행되어 나중에 다시 온다. 별칭 비트가 다를 때도 거절한다.</li>
+      <li><b>프리페치 몫</b>: 프리페치는 16개 중 번호가 큰 6개(<code>nMaxPrefetchEntry</code>)만 쓸 수 있다. 수요 미스가 쓸 자리를 프리페치가 다 차지하지 못하게 막는 장치다. 예외로 memset 패턴이 감지되면 나머지 엔트리도 쓸 수 있다.</li>
+    </ul>
+    <div class="callout code"><strong>병합 조건과 프리페치 몫</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/cache/dcache/mainpipe/MissQueue.scala:868-916 (요약)</span>
+<span class="k">def</span> before_data_refill_can_merge(new_req: MissReqWoStoreData): Bool = {
+  data_not_refilled &amp;&amp; new_req.isFromLoad ||
+  !io.main_pipe_refill_resp &amp;&amp; !w_refill_resp &amp;&amp; new_req.isFromStore &amp;&amp; alloc_is_store
+}
+<span class="k">def</span> should_merge(signals: MatchSignals, new_req: MissReqWoStoreData): Bool =
+  signals.block_match &amp;&amp; signals.alias_match &amp;&amp;
+  (before_req_sent_can_merge(new_req) || before_data_refill_can_merge(new_req))
+<span class="c">...</span>
+when(GatedValidRegNext(io.id &gt;= ((cfg.nMissEntries).U - io.nMaxPrefetchEntry))) {
+  io.primary_ready := !req_valid &amp;&amp; !GatedValidRegNext(primary_fire) <span class="c">// can accept prefetch req</span>
+}.otherwise { <span class="c">/* prefetch rejected unless memset pattern */</span> }</code></pre>
+    </div>
+    <div class="sim" id="sim-mshr">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>MSHR 16개</h3>
+        <div class="seg" id="mshr-pattern"><button data-value="stream" class="on">순차 접근</button><button data-value="reuse">같은 라인 몰림</button><button data-value="scatter">흩어진 접근</button></div>
+      </div>
+      <div class="sim-view"><canvas id="cv-mshr"></canvas></div>
+      <div class="sim-controls">
+        <label class="ctrl"><span>사이클당 미스 요청 <output id="mshr-rate-out"></output></span><input type="range" id="mshr-rate" min="0.1" max="3" step="0.1" value="1"></label>
+        <label class="ctrl"><span>스토어 비율 <output id="mshr-store-out"></output></span><input type="range" id="mshr-store" min="0" max="0.6" step="0.05" value="0.2"></label>
+        <label class="ctrl"><span>프리페치 비율 <output id="mshr-prefetch-out"></output></span><input type="range" id="mshr-prefetch" min="0" max="0.6" step="0.05" value="0.25"></label>
+        <label class="ctrl"><span>L2 응답 지연 <output id="mshr-latency-out"></output></span><input type="range" id="mshr-latency" min="10" max="120" step="5" value="40"></label>
+        <div class="ctrl-row"><button class="btn sm" id="mshr-reset">⏮ 처음</button><button class="btn sm" id="mshr-play">▶ 재생</button><button class="btn sm" id="mshr-fast">+1000 사이클</button></div>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">할당</span><span class="v" id="mshr-alloc">0</span></div>
+        <div class="stat"><span class="k">병합</span><span class="v" id="mshr-merge">0</span></div>
+        <div class="stat"><span class="k">같은 블록 거절</span><span class="v" id="mshr-reject">0</span></div>
+        <div class="stat"><span class="k">가득 차서 거절</span><span class="v" id="mshr-full">0</span></div>
+        <div class="stat"><span class="k">버려진 프리페치</span><span class="v" id="mshr-dropped">0</span></div>
+      </div>
+      <figcaption><span class="try">돌려 보기</span>가로줄 하나가 MSHR 하나다. 막대는 그 엔트리가 잡혀 있던 기간이고, 색은 처음 잡은 요청의 종류(파랑=로드, 주황=스토어, 보라=프리페치)다. 막대 위 흰 점은 병합된 요청이다. 위쪽 10개(0~9)는 수요 미스 전용이고, 아래쪽 6개(10~15)만 프리페치를 받는다. '같은 라인 몰림'에서는 로드가 대부분 병합되고, 스토어가 로드 엔트리에 붙으려다 거절당한다. L2 지연을 늘리면 엔트리가 오래 묶여 '가득 차서 거절'이 늘어난다. 웹 모델은 별칭 비트와 리필 후 메인 파이프 처리 시간을 생략했다.</figcaption>
+    </div>
+  </section>
+
+  <!-- ============================================================ 5 -->
+  <section id="stride">
+    <h2>스트라이드 프리페처</h2>
+    <p>곤명호 v3의 L1 프리페처는 세 가지다(<code>Parameters.scala:163-164</code>). StreamStride, Berti, SMS가 있는데, 기본 모드(<code>modeStrideBerti = 0b01</code>)는 Stride를 켜고 Berti를 끈다. 스트림 프리페처는 1 KB 영역 안에서 연속으로 증가하거나 감소하는 접근을 잡는다. 스트라이드 프리페처는 <b>같은 PC</b>의 로드가 일정한 간격으로 주소를 바꾸는 패턴을 잡는다. 배열의 구조체 필드를 차례로 읽는 루프가 전형적인 예다.</p>
+    <p>스트라이드 표는 16칸이고 PC 해시로 찾으며, 교체는 PLRU다. 칸마다 직전 주소, 보폭, 증가/감소 방향, 3비트 신뢰도(0~7)를 담는다. 같은 PC가 다시 오면 새 보폭을 계산한다. 이전 보폭과 같으면 신뢰도를 1 올리고, 다르면 1 내린다. 신뢰도가 1 이하인 상태에서 다르면 보폭을 새 값으로 바꾼다. 보폭이 0이나 1 블록(64 B 미만 차이)이면 스트라이드로 치지 않는다. 그 정도의 연속 접근은 스트림 프리페처의 몫이기 때문이다. 신뢰도가 3 이상이고 보폭이 맞으면 프리페치를 낸다. L1에는 보폭의 4배 앞, L2에는 32배 앞의 주소를 보낸다.</p>
+    <div class="callout code"><strong>보폭 갱신과 프리페치 거리</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/mem/prefetch/L1StridePrefetcher.scala:108-111, 228-241 (요약)</span>
+<span class="k">val</span> stride_valid = new_stride_blk =/= 0.U &amp;&amp; new_stride_blk =/= 1.U
+<span class="k">val</span> stride_match = new_stride === stride &amp;&amp; isDecrMode === decr_mode
+<span class="k">val</span> can_send_pf = stride_valid &amp;&amp; stride_match &amp;&amp; confidence &gt;= CONF_THRESHOLD.U  <span class="c">// 3</span>
+<span class="c">...</span>
+<span class="k">val</span> l1_stride_ratio_const = Constantin.createRecord(..., initValue = 2)
+<span class="k">val</span> l2_stride_ratio_const = Constantin.createRecord(..., initValue = 5)
+<span class="k">val</span> s2_l1_depth = s2_stride &lt;&lt; l1_stride_ratio   <span class="c">// 보폭 × 4</span>
+<span class="k">val</span> s2_l2_depth = s2_stride &lt;&lt; l2_stride_ratio   <span class="c">// 보폭 × 32</span></code></pre>
+    </div>
+    <div class="sim" id="sim-stride">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>스트라이드 표 16칸</h3></div>
+      <div class="sim-view"><canvas id="cv-stride"></canvas></div>
+      <div class="sim-controls">
+        <label class="ctrl"><span>PC A 보폭 (B) <output id="st-a-out"></output></span><input type="range" id="st-a" min="-1024" max="1024" step="64" value="256"></label>
+        <label class="ctrl"><span>PC B 보폭 (B) <output id="st-b-out"></output></span><input type="range" id="st-b" min="-1024" max="1024" step="64" value="-512"></label>
+        <label class="ctrl"><span>PC C 보폭 (B) <output id="st-c-out"></output></span><input type="range" id="st-c" min="-1024" max="1024" step="64" value="64"></label>
+        <label class="ctrl"><span>PC D 무작위 접근 비율 <output id="st-noise-out"></output></span><input type="range" id="st-noise" min="0" max="0.6" step="0.05" value="0.25"></label>
+        <div class="ctrl-row"><button class="btn sm" id="st-reset">⏮ 처음</button><button class="btn sm primary" id="st-step">접근 1회 →</button><button class="btn sm" id="st-play">▶ 재생</button><button class="btn sm" id="st-fast">+200회</button></div>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">학습 접근</span><span class="v" id="st-count">0</span></div>
+        <div class="stat"><span class="k">L1 프리페치</span><span class="v" id="st-l1">0</span></div>
+        <div class="stat"><span class="k">PC A·B 적중 범위</span><span class="v" id="st-coverage">—</span></div>
+      </div>
+      <div class="info-panel" id="st-info">접근 1회를 눌러 시작하자.</div>
+      <figcaption><span class="try">따라가 보기</span>네 개의 PC가 섞여서 로드를 낸다. A·B·C는 슬라이더의 보폭으로 걷고, D는 무작위 주소를 읽는다. 표의 줄마다 신뢰도 막대가 있고, 3 이상(굵은 테두리)이면 프리페치를 낸다. C의 보폭을 64 B로 두면 블록 1개 차이라 스트라이드로 인정받지 못한다. '적중 범위'는 A와 B의 접근 중 L1 프리페치가 미리 요청해 둔 블록을 읽은 비율이다. 처음 몇 번은 학습하느라 놓친다. 웹 모델은 PC 해시 대신 PC를 그대로 쓰고, 프리페치는 요청한 즉시 도착한다고 가정했다.</figcaption>
+    </div>
+  </section>
+
+  <!-- ============================================================ 6 -->
+  <section id="sms">
+    <h2>SMS: 공간 패턴을 외우는 프리페처</h2>
+    <p>보폭으로 설명되지 않는 접근도 있다. 구조체 하나가 1 KB에 걸쳐 있고, 코드가 그중 0번, 2번, 3번, 8번, 9번 블록만 읽는다고 하자. 다음 구조체에서도 같은 모양으로 읽을 가능성이 높다. <span class="term">SMS</span><span class="en">(Spatial Memory Streaming, Somogyi et al.)</span>는 이 '모양'을 외운다. 곤명호 v3의 SMS는 L2로 프리페치를 보낸다(<code>Prefetch2L2SMS</code>).</p>
+    <ul>
+      <li><b>활성 세대 표</b><span class="en">(AGT, 16칸)</span>: 지금 접근 중인 1 KB 영역마다 어떤 블록(16개)을 읽었는지 비트로 모은다. 영역을 처음 건드린 접근을 <b>트리거</b>라 부르고, 그 PC와 블록 위치를 함께 기록한다.</li>
+      <li><b>패턴 기록 표</b><span class="en">(PHT, 64칸 2-way)</span>: AGT에서 밀려난 영역의 모양을 트리거 PC로 찾아 저장한다. 블록 위치는 트리거 기준 상대 위치(−15~+15, 30칸)로 바꾸고, 칸마다 2비트 카운터를 둔다. 읽혔으면 올리고 안 읽혔으면 내린다.</li>
+      <li><b>예측</b>: 새 영역에서 트리거가 나오면 PHT를 찾는다. 카운터 상위 비트가 1인 칸(2 이상)의 블록을 프리페치한다.</li>
+    </ul>
+    <div class="callout code"><strong>PHT 엔트리</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/mem/prefetch/SMSPrefetcher.scala:42-57, 584-588</span>
+<span class="k">case class</span> SMSParams(region_size: Int = 1024, ..., active_gen_table_size: Int = 16,
+  pht_size: Int = 64, pht_ways: Int = 2, pht_hist_bits: Int = 2, pht_tag_bits: Int = 13, ...)
+<span class="k">class</span> PhtEntry ... {
+  <span class="k">val</span> hist = Vec(2 * (REGION_BLKS - 1), UInt(PHT_HIST_BITS.W))  <span class="c">// 트리거 기준 −15..+15</span>
+  <span class="k">val</span> tag = UInt(PHT_TAG_BITS.W)
+  <span class="k">val</span> decr_mode = Bool()
+}</code></pre>
+    </div>
+    <div class="sim" id="sim-sms">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>공간 패턴 학습</h3>
+        <div class="seg" id="sms-shape"><button data-value="struct" class="on">구조체 필드</button><button data-value="dense">거의 전체</button><button data-value="sparse">드문드문</button></div>
+      </div>
+      <div class="sim-view"><canvas id="cv-sms"></canvas></div>
+      <div class="sim-controls">
+        <label class="ctrl"><span>패턴에서 벗어나는 확률 <output id="sms-noise-out"></output></span><input type="range" id="sms-noise" min="0" max="0.5" step="0.05" value="0.1"></label>
+        <label class="ctrl"><span>트리거 위치 흔들림 <output id="sms-shift-out"></output></span><input type="range" id="sms-shift" min="0" max="8" step="1" value="0"></label>
+        <div class="ctrl-row"><button class="btn sm" id="sms-reset">⏮ 처음</button><button class="btn sm primary" id="sms-step">영역 1개 →</button><button class="btn sm" id="sms-fast">+100 영역</button></div>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">지나간 영역</span><span class="v" id="sms-regions">0</span></div>
+        <div class="stat"><span class="k">적중 범위 (coverage)</span><span class="v" id="sms-coverage">—</span></div>
+        <div class="stat"><span class="k">정확도 (accuracy)</span><span class="v" id="sms-accuracy">—</span></div>
+      </div>
+      <figcaption><span class="try">학습시키기</span>위 줄은 PHT가 기억하는 트리거 기준 30칸의 2비트 카운터다(진할수록 큼, 굵은 칸=프리페치 대상). 아래 줄은 방금 지나간 1 KB 영역의 16블록이다. 초록은 프리페치가 맞힌 블록, 빨강은 놓친 블록, 회색 테두리는 쓸모없었던 프리페치다. 적중 범위는 트리거가 아닌 수요 접근 중 미리 불러와 있던 비율이고, 정확도는 프리페치 중 실제로 쓰인 비율이다. '트리거 위치 흔들림'을 키우면 구조체가 영역 안 다른 위치에서 시작한다. 패턴을 트리거 기준 상대 위치로 저장하므로 흔들려도 대체로 맞힌다. '구조체 필드'에 벗어남 10%로 300개 영역을 지나면 웹 모델의 적중 범위는 약 95%, 정확도는 약 90%다. 벗어남을 30%로 올리면 각각 약 79%, 70%로 떨어진다. 웹 모델은 AGT가 영역 하나를 끝까지 본 뒤 PHT에 넘기는 것으로 단순화했고, PC는 하나만 쓴다.</figcaption>
+    </div>
+    <div class="callout tip"><strong>프리페처의 성적표 읽는 법</strong>
+      <p>프리페처는 두 숫자로 평가한다. <b>적중 범위</b>는 원래 미스였을 접근을 얼마나 없앴는가이고, <b>정확도</b>는 보낸 프리페치 중 몇 개가 실제로 쓰였는가다. 적중 범위만 높고 정확도가 낮으면 쓸모없는 라인이 캐시를 밀어내고 대역폭을 낭비한다. XiangShan이 MSHR에서 프리페치 몫을 6개로 묶어 두고, 프리페처마다 신뢰도와 피드백(<code>fdbkDegree</code>)으로 공격성을 조절하는 것도 이 때문이다.</p>
+    </div>
+  </section>
+
+  <section class="keypoints">
+    <h2>핵심 정리</h2>
+    <ol>
+      <li>DefaultConfig L1D는 64 KB 4-way, 256 set, 64 B 라인이며 태그·데이터에 SECDED ECC, 교체는 set PLRU다.</li>
+      <li>데이터 배열은 2 B 뱅크 32개로 나뉜다. 두 로드가 겹치는 뱅크를 서로 다른 집합에서 읽으면 뱅크 충돌이고, 더 오래된 쪽만 통과한다.</li>
+      <li>인덱스 8비트는 페이지 오프셋 [11:6]과 가상 주소 [47:12]를 두 비트씩 XOR한 2비트로 만든다. 별칭을 다루면서 2의 거듭제곱 보폭의 집합 몰림도 줄인다.</li>
+      <li>MSHR 16개는 같은 블록의 로드를 리필 전까지 병합하고, 스토어는 스토어가 잡은 엔트리에만 병합한다. 프리페치는 상위 6개 엔트리만 쓴다.</li>
+      <li>상태를 바꾸는 요청은 모두 메인 파이프를 지나며, 우선순위는 프로브 > 리필 > 프리페치 > 스토어 > 원자 연산이다.</li>
+      <li>스트라이드 프리페처는 PC별 16칸 표로 2블록 이상의 일정한 보폭을 학습해 L1에 4배, L2에 32배 앞을 요청한다. SMS는 1 KB 영역의 접근 모양을 트리거 PC로 기억해 L2로 프리페치한다.</li>
+    </ol>
+  </section>
+
+  <section id="quiz">
+    <h2>확인 퀴즈</h2>
+    <div class="quiz">
+      <div class="quiz-q" data-answer="1"><p>Q1. DefaultConfig L1D의 집합 수는?</p><div class="opts">
+        <button class="opt">128</button><button class="opt">256</button><button class="opt">512</button><button class="opt">1024</button></div>
+        <div class="quiz-exp">64 KB ÷ 4 way ÷ 64 B = 256 set. 인덱스는 8비트다.</div></div>
+      <div class="quiz-q" data-answer="3"><p>Q2. 두 로드가 같은 사이클에 들어왔다. 뱅크 충돌이 아닌 경우는?</p><div class="opts">
+        <button class="opt">다른 집합, 겹치는 뱅크</button><button class="opt">다른 집합, 뱅크 하나만 겹침</button><button class="opt">다른 집합, 16 B 벡터 로드와 8 B 로드가 겹침</button><button class="opt">같은 집합, 겹치는 뱅크</button></div>
+        <div class="quiz-exp">충돌 조건은 '뱅크가 겹치고 집합이 다를 때'다. 같은 집합이면 SRAM의 같은 줄을 읽으므로 데이터를 함께 나눠 쓸 수 있다.</div></div>
+      <div class="quiz-q" data-answer="0"><p>Q3. 스토어 미스가 잡은 MSHR에 같은 블록의 로드 미스가 왔다. 리필 데이터는 아직 오지 않았다. 결과는?</p><div class="opts">
+        <button class="opt">병합</button><button class="opt">거절 후 재실행</button><button class="opt">새 MSHR 할당</button></div>
+        <div class="quiz-exp">새 요청이 로드면 데이터가 리필되기 전까지는 처음 잡은 요청의 종류와 상관없이 병합할 수 있다. 반대로 로드가 잡은 엔트리에 스토어가 오면 거절된다.</div></div>
+      <div class="quiz-q" data-answer="2"><p>Q4. 같은 PC의 로드가 주소를 64 B씩 늘려 가며 읽는다. 스트라이드 프리페처는?</p><div class="opts">
+        <button class="opt">신뢰도가 3에 닿으면 4블록 앞을 프리페치한다</button><button class="opt">L2에만 32블록 앞을 프리페치한다</button><button class="opt">보폭이 1블록이라 스트라이드로 인정하지 않는다</button><button class="opt">표를 비운다</button></div>
+        <div class="quiz-exp">보폭이 0 또는 1블록이면 <code>stride_valid</code>가 거짓이다. 이런 연속 접근은 스트림 프리페처가 맡는다.</div></div>
+      <div class="quiz-q" data-answer="1"><p>Q5. SMS가 패턴을 트리거 기준 상대 위치로 저장하는 이유는?</p><div class="opts">
+        <button class="opt">PHT 크기를 64칸으로 줄이기 위해</button><button class="opt">같은 모양의 접근이 영역 안 다른 위치에서 시작해도 맞히기 위해</button><button class="opt">L1 대신 L2로 보내기 위해</button></div>
+        <div class="quiz-exp">구조체가 1 KB 영역 경계와 맞지 않게 놓여도 트리거(처음 읽은 블록) 기준으로 보면 모양이 같다. 그래서 −15~+15의 30칸으로 저장한다.</div></div>
+    </div>
+  </section>
+</main>
+
+<script>
+/* ENGINE START: DOM에 의존하지 않는 모델. 노드에서 따로 검증한다. */
+var DataCacheEngine = (function () {
+  "use strict";
+  const LINE_BYTES = 64, SETS = 256, WAYS = 4, BANKS = 32, BANK_BYTES = 2;
+  const PAGE_OFFSET_BITS = 12, PHYSICAL_ADDRESS_BITS = 48;
+
+  /** 가상 주소 [47:12]를 두 비트씩 XOR (L1Cache.scala hashBitPairs). address는 BigInt. */
+  function hashBitPairs(address) {
+    let folded = 0n;
+    for (let bit = PAGE_OFFSET_BITS; bit + 1 <= PHYSICAL_ADDRESS_BITS - 1; bit += 2) folded ^= (address >> BigInt(bit)) & 3n;
+    return Number(folded);
+  }
+  function setIndex(address, mode) {
+    const value = BigInt(address);
+    if (mode === 2) return Number((value >> 6n) & 0xffn);
+    return ((hashBitPairs(value) << 6) | Number((value >> 6n) & 0x3fn)) & (SETS - 1);
+  }
+  function bankMask(address, size) {
+    const offset = Number(BigInt(address) & 63n);
+    const banks = new Set();
+    for (let byte = offset; byte < Math.min(LINE_BYTES, offset + size); byte++) banks.add(Math.floor(byte / BANK_BYTES));
+    return banks;
+  }
+  function bankConflict(addressA, sizeA, addressB, sizeB) {
+    const banksA = bankMask(addressA, sizeA), banksB = bankMask(addressB, sizeB);
+    const isOverlap = [...banksA].some((bank) => banksB.has(bank));
+    const isDifferentSet = setIndex(addressA, 1) !== setIndex(addressB, 1);
+    return { banksA, banksB, isOverlap, isDifferentSet, isConflict: isOverlap && isDifferentSet };
+  }
+
+  /** 4-way 트리 PLRU. bits[0]=루트(0이면 왼쪽 쌍이 희생 후보), bits[1]=웨이0/1, bits[2]=웨이2/3 */
+  class TreePseudoLeastRecentlyUsed {
+    constructor() { this.bits = [0, 0, 0]; }
+    victim() { return this.bits[0] === 0 ? (this.bits[1] === 0 ? 0 : 1) : (this.bits[2] === 0 ? 2 : 3); }
+    access(way) {
+      if (way < 2) { this.bits[0] = 1; this.bits[1] = way === 0 ? 1 : 0; }
+      else { this.bits[0] = 0; this.bits[2] = way === 2 ? 1 : 0; }
+    }
+  }
+  class SetAssociativeCache {
+    constructor(mode) {
+      this.mode = mode;
+      this.sets = Array.from({ length: SETS }, () => ({ tags: new Array(WAYS).fill(null), replacement: new TreePseudoLeastRecentlyUsed(), misses: 0, accesses: 0 }));
+      this.accesses = 0; this.hits = 0; this.evictions = 0;
+    }
+    access(address) {
+      const line = BigInt(address) >> 6n;
+      const set = this.sets[setIndex(address, this.mode)];
+      this.accesses++; set.accesses++;
+      let way = set.tags.findIndex((tag) => tag === line);
+      if (way >= 0) { this.hits++; set.replacement.access(way); return { isHit: true }; }
+      set.misses++;
+      way = set.tags.findIndex((tag) => tag === null);
+      if (way < 0) { way = set.replacement.victim(); this.evictions++; }
+      set.tags[way] = line; set.replacement.access(way);
+      return { isHit: false };
+    }
+  }
+
+  /** MSHR 모델: 16개, 상위 6개만 프리페치. 같은 블록: 로드는 리필 전 병합, 스토어는 스토어가 잡은 엔트리에만 병합. */
+  class MissQueueModel {
+    constructor(options) {
+      this.settings = Object.assign({ entries: 16, prefetchEntries: 6, rate: 1, storeFraction: 0.2, prefetchFraction: 0.25, latency: 40, pattern: "stream", seed: 9 }, options);
+      this.entries = Array.from({ length: this.settings.entries }, () => null);
+      this.history = []; this.cycle = 0; this.credit = 0; this.cursor = 0;
+      this.stats = { allocated: 0, merged: 0, rejected: 0, full: 0, dropped: 0 };
+      let state = this.settings.seed >>> 0 || 1;
+      this.random = () => { state ^= state << 13; state >>>= 0; state ^= state >>> 17; state ^= state << 5; state >>>= 0; return state / 4294967296; };
+    }
+    nextBlock() {
+      const pattern = this.settings.pattern;
+      if (pattern === "stream") { this.cursor += this.random() < 0.6 ? 0 : 1; return this.cursor; }
+      if (pattern === "reuse") return 1000 + Math.floor(this.random() * 6);
+      return Math.floor(this.random() * 100000);
+    }
+    step() {
+      const settings = this.settings;
+      this.cycle++;
+      this.entries.forEach((entry, index) => {
+        if (entry && entry.refillAt <= this.cycle) { this.history.push({ index, kind: entry.kind, start: entry.start, end: this.cycle, merges: entry.merges }); this.entries[index] = null; }
+      });
+      if (this.history.length > 400) this.history.splice(0, this.history.length - 400);
+      this.credit += settings.rate;
+      let issued = 0;
+      while (this.credit >= 1 && issued < 4) {
+        this.credit -= 1; issued++;
+        const roll = this.random();
+        const kind = roll < settings.prefetchFraction ? "prefetch" : roll < settings.prefetchFraction + settings.storeFraction ? "store" : "load";
+        const block = kind === "prefetch" ? this.nextBlock() + 4 : this.nextBlock();
+        const matchIndex = this.entries.findIndex((entry) => entry && entry.block === block);
+        if (matchIndex >= 0) {
+          const entry = this.entries[matchIndex];
+          const canMerge = kind === "load" || (kind === "store" && entry.kind === "store");
+          if (canMerge) { entry.merges.push(this.cycle); this.stats.merged++; }
+          else if (kind === "prefetch") this.stats.dropped++;
+          else this.stats.rejected++;
+          continue;
+        }
+        const firstAllowed = kind === "prefetch" ? settings.entries - settings.prefetchEntries : 0;
+        let freeIndex = -1;
+        for (let index = firstAllowed; index < settings.entries; index++) if (!this.entries[index]) { freeIndex = index; break; }
+        if (freeIndex < 0) { if (kind === "prefetch") this.stats.dropped++; else this.stats.full++; continue; }
+        this.entries[freeIndex] = { block, kind, start: this.cycle, refillAt: this.cycle + settings.latency, merges: [] };
+        this.stats.allocated++;
+      }
+      if (this.credit > 4) this.credit = 4;
+    }
+  }
+
+  /** 스트라이드 표: 16칸 PC별, 3비트 신뢰도, 문턱 3, 보폭 0·1블록 제외, L1 거리 = 보폭 × 4 */
+  class StrideTable {
+    constructor() { this.entries = []; this.clock = 0; }
+    train(pc, address) {
+      this.clock++;
+      const MAX_CONFIDENCE = 7, THRESHOLD = 3, L1_RATIO = 2, L2_RATIO = 5;
+      let entry = this.entries.find((candidate) => candidate.pc === pc);
+      const result = { pc, address, kind: "alloc", prefetchL1: null, prefetchL2: null };
+      if (!entry) {
+        if (this.entries.length >= 16) this.entries.splice(this.entries.indexOf(this.entries.reduce((a, b) => (a.lastUse < b.lastUse ? a : b))), 1);
+        this.entries.push({ pc, previous: address, stride: 0, confidence: 0, lastUse: this.clock });
+        return result;
+      }
+      entry.lastUse = this.clock;
+      const newStride = address - entry.previous;
+      const strideBlocks = Math.abs(Math.trunc(newStride / 64));
+      const isStrideValid = strideBlocks !== 0 && strideBlocks !== 1;
+      const isMatch = newStride === entry.stride;
+      result.kind = !isStrideValid ? "invalid" : isMatch ? "match" : "mismatch";
+      if (isStrideValid) {
+        if (isMatch) entry.confidence = Math.min(MAX_CONFIDENCE, entry.confidence + 1);
+        else { const isLowConfidence = entry.confidence <= 1; entry.confidence = Math.max(0, entry.confidence - 1); if (isLowConfidence) entry.stride = newStride; }
+        if (isMatch && entry.confidence >= THRESHOLD) {
+          result.prefetchL1 = address + entry.stride * (1 << L1_RATIO);
+          result.prefetchL2 = address + entry.stride * (1 << L2_RATIO);
+        }
+      }
+      entry.previous = address;
+      return result;
+    }
+  }
+
+  /** SMS 단순 모델: 트리거 기준 30칸 2비트 카운터, 상위 비트(≥2)면 프리페치 */
+  class SpatialPatternModel {
+    constructor() { this.history = new Array(30).fill(0); this.stats = { demand: 0, covered: 0, issued: 0, useful: 0, regions: 0 }; }
+    /** accessed: 영역 안 16블록 중 읽힌 블록 번호 목록(순서대로, 첫 번째가 트리거) */
+    runRegion(accessed) {
+      const trigger = accessed[0];
+      const predicted = new Set();
+      this.history.forEach((counter, slot) => {
+        const block = trigger + (slot < 15 ? slot - 15 : slot - 14);
+        if (counter >= 2 && block >= 0 && block < 16) predicted.add(block);
+      });
+      const accessedSet = new Set(accessed);
+      accessed.slice(1).forEach((block) => { this.stats.demand++; if (predicted.has(block)) this.stats.covered++; });
+      predicted.forEach((block) => { this.stats.issued++; if (accessedSet.has(block)) this.stats.useful++; });
+      // 학습: 읽힌 상대 위치는 +1, 안 읽힌 위치는 −1 (2비트 포화)
+      for (let slot = 0; slot < 30; slot++) {
+        const block = trigger + (slot < 15 ? slot - 15 : slot - 14);
+        if (block < 0 || block >= 16) continue;
+        this.history[slot] = accessedSet.has(block) ? Math.min(3, this.history[slot] + 1) : Math.max(0, this.history[slot] - 1);
+      }
+      this.stats.regions++;
+      return { trigger, predicted, accessedSet };
+    }
+  }
+  return { LINE_BYTES, SETS, WAYS, BANKS, setIndex, bankMask, bankConflict, hashBitPairs, SetAssociativeCache, MissQueueModel, StrideTable, SpatialPatternModel };
+})();
+/* ENGINE END */
+
+(function () {
+  "use strict";
+  const parseAddress = (text) => { try { return BigInt(text.trim()); } catch (error) { return null; } };
+  const hex = (value) => "0x" + BigInt(value).toString(16);
+
+  /* ---------------------------------------------------- 그림 10-1: 주소 해부와 뱅크 충돌 */
+  const PRESETS = { conflict: [["0x80001238", 8], ["0x80005238", 8]], sameset: [["0x80001230", 16], ["0x80001238", 8]], apart: [["0x80001200", 8], ["0x80005230", 8]] };
+  const addressView = MB.canvas("#cv-address", { aspect: 0.2, minHeight: 205, maxHeight: 215, draw: drawAddress });
+  function readInputs() {
+    return {
+      addressA: parseAddress(document.getElementById("addr-a").value), sizeA: +document.getElementById("size-a").value,
+      addressB: parseAddress(document.getElementById("addr-b").value), sizeB: +document.getElementById("size-b").value,
+    };
+  }
+  function drawAddress(ctx, width, height) {
+    const input = readInputs();
+    if (input.addressA === null || input.addressB === null) { MB.text(ctx, "주소를 16진수로 입력하세요 (예: 0x80001238)", width / 2, height / 2, { align: "center", color: MB.css("bad") }); return; }
+    const fields = [["태그 · 해시 재료 [47:12]", 36, "accent-2"], ["인덱스 하위 [11:6]", 6, "accent"], ["뱅크 [5:1]", 5, "warn"], ["[0]", 1, "text-faint"]];
+    const left = 12, right = width - 12, total = 48, unit = (right - left) / total;
+    let x = left;
+    fields.forEach(([label, bits, color]) => {
+      const w = bits * unit;
+      ctx.fillStyle = MB.alpha(MB.css(color), 0.2); MB.roundRect(ctx, x + 1, 8, w - 2, 26, 5); ctx.fill();
+      ctx.strokeStyle = MB.css(color); ctx.lineWidth = 1.2; ctx.stroke();
+      MB.text(ctx, w > 70 ? label : label.split(" ")[0], x + w / 2, 21, { align: "center", size: width < 520 ? 9 : 11, weight: 700 });
+      x += w;
+    });
+    const result = DataCacheEngine.bankConflict(input.addressA, input.sizeA, input.addressB, input.sizeB);
+    const bankLeft = 70, bankWidth = (right - bankLeft) / 32;
+    [["A", result.banksA, input.addressA, "t-tage"], ["B", result.banksB, input.addressB, "color-pink"]].forEach(([name, banks, address, color], row) => {
+      const y = 58 + row * 52;
+      MB.text(ctx, `로드 ${name}`, 12, y + 12, { size: 12, weight: 700, color: MB.css(color) });
+      MB.text(ctx, `set ${DataCacheEngine.setIndex(address, 1)}`, 12, y + 30, { size: 10.5, mono: true, color: MB.css("text-dim") });
+      for (let bank = 0; bank < 32; bank++) {
+        const isUsed = banks.has(bank);
+        const isShared = result.banksA.has(bank) && result.banksB.has(bank);
+        ctx.fillStyle = isUsed ? (isShared && result.isDifferentSet ? MB.css("bad") : MB.css(color)) : MB.css("surface");
+        MB.roundRect(ctx, bankLeft + bank * bankWidth + 1, y, bankWidth - 2, 26, 3); ctx.fill();
+      }
+    });
+    for (let bank = 0; bank < 32; bank += 4) MB.text(ctx, String(bank), bankLeft + bank * bankWidth + bankWidth / 2, 172, { align: "center", size: 10, mono: true, color: MB.css("text-faint") });
+    MB.text(ctx, "← 뱅크 번호 (2 B씩, 라인 하나 = 32뱅크)", bankLeft, 190, { size: 10.5, color: MB.css("text-dim") });
+  }
+  function paintAddress() {
+    const input = readInputs();
+    if (input.addressA !== null && input.addressB !== null) {
+      const result = DataCacheEngine.bankConflict(input.addressA, input.sizeA, input.addressB, input.sizeB);
+      const describe = (address, banks) => `${DataCacheEngine.setIndex(address, 1)} <small>/ ${Math.min(...banks)}~${Math.max(...banks)}</small>`;
+      MB.set("addr-a-out", describe(input.addressA, result.banksA));
+      MB.set("addr-b-out", describe(input.addressB, result.banksB));
+      const crossesBank = (address, size) => (Number(address & 15n) + size) > 16;
+      if (crossesBank(input.addressA, input.sizeA) || crossesBank(input.addressB, input.sizeB)) MB.set("addr-verdict", "16 B 경계 넘음 <small>두 번에 나눠 접근</small>", "");
+      else if (result.isConflict) MB.set("addr-verdict", "뱅크 충돌 <small>젊은 쪽 재실행</small>", "bad");
+      else if (result.isOverlap) MB.set("addr-verdict", "통과 <small>같은 집합</small>", "good");
+      else MB.set("addr-verdict", "통과 <small>뱅크 안 겹침</small>", "good");
+    } else MB.set("addr-verdict", "입력 오류", "bad");
+    addressView.redraw();
+  }
+  ["addr-a", "addr-b", "size-a", "size-b"].forEach((id) => document.getElementById(id).addEventListener("input", paintAddress));
+  MB.seg("#addr-preset", (v) => {
+    document.getElementById("addr-a").value = PRESETS[v][0][0]; document.getElementById("size-a").value = PRESETS[v][0][1];
+    document.getElementById("addr-b").value = PRESETS[v][1][0]; document.getElementById("size-b").value = PRESETS[v][1][1];
+    paintAddress();
+  });
+  paintAddress();
+
+  /* ---------------------------------------------------- 그림 10-2: 캐시 시뮬레이터 */
+  let indexMode = 1, tracePreset = "array", repeatCount = 3, selectedSet = 0, cacheModel = null;
+  function buildTrace() {
+    const base = 0x40000000;
+    let one = [];
+    if (tracePreset === "array") for (let k = 0; k < 512; k++) one.push(base + k * 64);
+    else if (tracePreset === "stride4k") for (let k = 0; k < 16; k++) one.push(base + k * 4096);
+    else if (tracePreset === "stride16k") for (let k = 0; k < 16; k++) one.push(base + k * 16384);
+    else if (tracePreset === "random") { const random = MB.rng(21); for (let k = 0; k < 2048; k++) one.push(base + Math.floor(random() * 16384) * 64); }
+    else one = document.getElementById("cache-trace").value.split(/[\s,]+/).filter(Boolean).map((text) => Number(parseAddress(text) ?? 0n));
+    const trace = [];
+    for (let r = 0; r < repeatCount; r++) trace.push(...one);
+    return trace;
+  }
+  function runCache() {
+    cacheModel = new DataCacheEngine.SetAssociativeCache(indexMode);
+    const trace = buildTrace();
+    trace.forEach((address) => cacheModel.access(address));
+    if (tracePreset !== "custom") document.getElementById("cache-trace").value = trace.slice(0, 12).map(hex).join(" ") + (trace.length > 12 ? " …" : "");
+    if (cacheModel.accesses && !cacheModel.sets[selectedSet].accesses) {
+      const busiest = cacheModel.sets.reduce((best, set, index) => (set.accesses > cacheModel.sets[best].accesses ? index : best), 0);
+      selectedSet = busiest; setSlider.element.value = busiest; document.getElementById("cache-set-out").textContent = busiest;
+    }
+    MB.set("cache-access", cacheModel.accesses.toLocaleString("en-US"));
+    MB.set("cache-hit", MB.pct(cacheModel.hits / Math.max(1, cacheModel.accesses)));
+    MB.set("cache-evict", cacheModel.evictions.toLocaleString("en-US"));
+    MB.set("cache-sets", cacheModel.sets.filter((set) => set.accesses).length);
+    cacheView.redraw();
+  }
+  const cacheView = MB.canvas("#cv-cache", { aspect: 0.42, minHeight: 280, maxHeight: 380, draw(ctx, width, height) {
+    if (!cacheModel) return;
+    const gridSize = Math.min(height - 30, width * (width < 600 ? 0.5 : 0.42));
+    const cell = gridSize / 16, left = 12, top = 22;
+    const maxMisses = Math.max(1, ...cacheModel.sets.map((set) => set.misses));
+    MB.text(ctx, "집합 256개 (진할수록 미스 多)", left, 10, { size: 11, color: MB.css("text-dim"), weight: 700 });
+    cacheModel.sets.forEach((set, index) => {
+      const x = left + (index % 16) * cell, y = top + Math.floor(index / 16) * cell;
+      ctx.fillStyle = set.accesses ? MB.alpha(MB.css("accent"), 0.15 + 0.85 * (set.misses / maxMisses)) : MB.css("surface");
+      ctx.fillRect(x + 0.5, y + 0.5, cell - 1, cell - 1);
+      if (index === selectedSet) { ctx.strokeStyle = MB.css("text"); ctx.lineWidth = 2; ctx.strokeRect(x + 0.5, y + 0.5, cell - 1, cell - 1); }
+    });
+    const detailLeft = left + gridSize + 24, detailWidth = width - detailLeft - 12;
+    const set = cacheModel.sets[selectedSet];
+    MB.text(ctx, detailWidth < 230 ? `set ${selectedSet} · 미스 ${set.misses}/${set.accesses}` : `set ${selectedSet} · 접근 ${set.accesses} · 미스 ${set.misses}`, detailLeft, 10, { size: detailWidth < 230 ? 10 : 11.5, weight: 700 });
+    const wayHeight = Math.min(34, (height - 120) / 4);
+    set.tags.forEach((tag, way) => {
+      const y = top + way * (wayHeight + 6);
+      const isVictim = set.replacement.victim() === way;
+      ctx.fillStyle = tag === null ? MB.css("surface") : MB.alpha(MB.css("accent-2"), 0.18);
+      MB.roundRect(ctx, detailLeft, y, detailWidth, wayHeight, 6); ctx.fill();
+      ctx.strokeStyle = isVictim ? MB.css("warn") : MB.css("border"); ctx.lineWidth = isVictim ? 2 : 1; ctx.stroke();
+      const isNarrow = detailWidth < 230;
+      MB.text(ctx, isNarrow ? `w${way}` : `way ${way}`, detailLeft + 6, y + wayHeight / 2, { size: isNarrow ? 9.5 : 11, weight: 700, color: MB.css("text-dim") });
+      MB.text(ctx, tag === null ? "비어 있음" : (isNarrow ? "" : "line ") + hex(tag << 6n), detailLeft + (isNarrow ? 24 : 58), y + wayHeight / 2, { size: isNarrow ? 9 : 11, mono: true });
+      if (isVictim && !isNarrow) MB.text(ctx, "다음 희생", detailLeft + detailWidth - 8, y + wayHeight / 2, { align: "right", size: 10.5, color: MB.css("warn"), weight: 700 });
+    });
+    // PLRU 트리
+    const treeTop = top + 4 * (wayHeight + 6) + 10, treeCenter = detailLeft + detailWidth / 2;
+    const bits = set.replacement.bits;
+    const node = (x, y, label, value) => {
+      ctx.fillStyle = MB.css("bg-elev"); ctx.strokeStyle = MB.css("accent"); ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(x, y, 13, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+      MB.text(ctx, String(value), x, y, { align: "center", size: 12, mono: true, weight: 800 });
+      MB.text(ctx, label, x + 17, y, { size: 10, color: MB.css("text-faint") });
+    };
+    const childY = treeTop + 44, spread = Math.min(80, detailWidth / 4);
+    ctx.strokeStyle = MB.css("border"); ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.moveTo(treeCenter, treeTop + 13); ctx.lineTo(treeCenter - spread, childY - 13); ctx.moveTo(treeCenter, treeTop + 13); ctx.lineTo(treeCenter + spread, childY - 13); ctx.stroke();
+    node(treeCenter, treeTop, "루트", bits[0]); node(treeCenter - spread, childY, "0|1", bits[1]); node(treeCenter + spread, childY, "2|3", bits[2]);
+  } });
+  cacheView.onPointer("click", (x, y) => {
+    const gridSize = Math.min(cacheView.height - 30, cacheView.width * (cacheView.width < 600 ? 0.5 : 0.42));
+    const cell = gridSize / 16, column = Math.floor((x - 12) / cell), row = Math.floor((y - 22) / cell);
+    if (column >= 0 && column < 16 && row >= 0 && row < 16) { selectedSet = row * 16 + column; setSlider.element.value = selectedSet; document.getElementById("cache-set-out").textContent = selectedSet; cacheView.redraw(); }
+  });
+  MB.seg("#cache-index", (v) => { indexMode = +v; runCache(); });
+  MB.seg("#cache-preset", (v) => { tracePreset = v; selectedSet = 0; runCache(); });
+  MB.range("cache-repeat", (v) => { repeatCount = v; runCache(); });
+  const setSlider = MB.range("cache-set", (v) => { selectedSet = v; cacheView.redraw(); });
+  document.getElementById("cache-trace").addEventListener("change", () => { if (tracePreset !== "custom") document.querySelector('#cache-preset button[data-value="custom"]').click(); else runCache(); });
+  runCache();
+
+  /* ---------------------------------------------------- 그림 10-3: MSHR */
+  const missSettings = { pattern: "stream", rate: 1, storeFraction: 0.2, prefetchFraction: 0.25, latency: 40 };
+  let missModel;
+  function resetMiss() { missModel = new DataCacheEngine.MissQueueModel(Object.assign({}, missSettings)); paintMiss(); }
+  const KIND_COLOR = { load: "t-tage", store: "taken", prefetch: "color-purple" };
+  const missView = MB.canvas("#cv-mshr", { aspect: 0.36, minHeight: 260, maxHeight: 340, draw(ctx, width, height) {
+    if (!missModel) return;
+    const windowCycles = 160, now = missModel.cycle, start = now - windowCycles;
+    const left = 46, right = width - 10, top = 8, rowHeight = (height - top - 18) / 16;
+    const sx = (cycle) => left + ((cycle - start) / windowCycles) * (right - left);
+    for (let index = 0; index < 16; index++) {
+      const y = top + index * rowHeight;
+      const isPrefetchSlot = index >= 10;
+      ctx.fillStyle = isPrefetchSlot ? MB.alpha(MB.css("color-purple"), 0.07) : "transparent";
+      ctx.fillRect(left, y, right - left, rowHeight);
+      MB.text(ctx, `#${index}`, left - 6, y + rowHeight / 2, { align: "right", size: 10, mono: true, color: MB.css(isPrefetchSlot ? "color-purple" : "text-faint") });
+    }
+    const draw = (record, end) => {
+      if (end < start) return;
+      const y = top + record.index * rowHeight;
+      const x0 = Math.max(left, sx(record.start)), x1 = sx(end);
+      ctx.fillStyle = MB.css(KIND_COLOR[record.kind]);
+      MB.roundRect(ctx, x0, y + 2, Math.max(2, x1 - x0), rowHeight - 4, 3); ctx.fill();
+      record.merges.forEach((cycle) => { if (cycle >= start) { ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(sx(cycle), y + rowHeight / 2, Math.min(3, rowHeight / 4), 0, Math.PI * 2); ctx.fill(); } });
+    };
+    missModel.history.forEach((record) => draw(record, record.end));
+    missModel.entries.forEach((entry, index) => { if (entry) draw(Object.assign({ index }, entry), now); });
+    MB.text(ctx, `← ${windowCycles} 사이클 전 · 지금 →`, right, height - 6, { align: "right", size: 10.5, color: MB.css("text-dim") });
+  } });
+  function paintMiss() {
+    MB.set("mshr-alloc", missModel.stats.allocated);
+    MB.set("mshr-merge", missModel.stats.merged);
+    MB.set("mshr-reject", missModel.stats.rejected);
+    MB.set("mshr-full", missModel.stats.full, missModel.stats.full ? "bad" : "");
+    MB.set("mshr-dropped", missModel.stats.dropped);
+    missView.redraw();
+  }
+  MB.seg("#mshr-pattern", (v) => { missSettings.pattern = v; resetMiss(); });
+  const bindMiss = (id, key, format) => MB.range(id, (v) => { missSettings[key] = v; if (missModel) missModel.settings[key] = v; }, format);
+  bindMiss("mshr-rate", "rate", (v) => v.toFixed(1));
+  bindMiss("mshr-store", "storeFraction", (v) => MB.pct(v, 0));
+  bindMiss("mshr-prefetch", "prefetchFraction", (v) => MB.pct(v, 0));
+  bindMiss("mshr-latency", "latency", (v) => v + " cyc");
+  document.getElementById("mshr-reset").onclick = resetMiss;
+  document.getElementById("mshr-fast").onclick = () => { for (let k = 0; k < 1000; k++) missModel.step(); paintMiss(); };
+  let missAccumulator = 0;
+  const missLoop = MB.loop(document.getElementById("sim-mshr"), (dt) => {
+    missAccumulator += dt;
+    while (missAccumulator > 0.05) { missAccumulator -= 0.05; missModel.step(); }
+    paintMiss();
+  });
+  missLoop.running = false;
+  MB.playButton("mshr-play", missLoop, ["⏸ 멈춤", "▶ 재생"]);
+  resetMiss();
+  for (let k = 0; k < 200; k++) missModel.step();
+  paintMiss();
+
+  /* ---------------------------------------------------- 그림 10-4: 스트라이드 표 */
+  const strideSettings = { strideA: 256, strideB: -512, strideC: 64, noise: 0.25 };
+  const PROGRAM_COUNTERS = { A: 0x80002010, B: 0x80002044, C: 0x80002080, D: 0x800020c0 };
+  let strideTable, strideCursor, strideRandom, strideStats, lastStride = null, prefetchedBlocks;
+  function resetStride() {
+    strideTable = new DataCacheEngine.StrideTable();
+    strideCursor = { A: 0x100000, B: 0x900000, C: 0x500000 };
+    strideRandom = MB.rng(17);
+    strideStats = { count: 0, l1: 0, demand: 0, covered: 0 };
+    prefetchedBlocks = new Set(); lastStride = null;
+    paintStride();
+  }
+  function stepStride() {
+    const roll = strideRandom();
+    let name;
+    if (roll < strideSettings.noise) name = "D";
+    else name = ["A", "B", "C"][Math.floor(strideRandom() * 3)];
+    let address;
+    if (name === "D") address = 0x700000 + Math.floor(strideRandom() * 65536) * 8;
+    else { const stride = strideSettings["stride" + name]; strideCursor[name] += stride; address = strideCursor[name]; }
+    const block = Math.floor(address / 64);
+    if (name === "A" || name === "B") { strideStats.demand++; if (prefetchedBlocks.has(block)) strideStats.covered++; }
+    const result = strideTable.train(PROGRAM_COUNTERS[name], address);
+    result.name = name;
+    if (result.prefetchL1 !== null) { strideStats.l1++; prefetchedBlocks.add(Math.floor(result.prefetchL1 / 64)); }
+    strideStats.count++;
+    lastStride = result;
+  }
+  const strideView = MB.canvas("#cv-stride", { aspect: 0.17, minHeight: 150, maxHeight: 170, draw(ctx, width, height) {
+    if (!strideTable) return;
+    const rows = strideTable.entries;
+    const left = 12, top = 22, rowHeight = Math.min(30, (height - top - 6) / 4);
+    const columns = width < 560 ? [["PC", 0], ["보폭", 0.3], ["신뢰도", 0.55]] : [["PC", 0], ["직전 주소", 0.2], ["보폭", 0.45], ["신뢰도", 0.62]];
+    columns.forEach(([label, ratio]) => MB.text(ctx, label, left + ratio * (width - 24), 10, { size: 11, weight: 700, color: MB.css("text-dim") }));
+    const nameOf = (pc) => Object.keys(PROGRAM_COUNTERS).find((key) => PROGRAM_COUNTERS[key] === pc);
+    rows.forEach((entry, index) => {
+      const y = top + index * rowHeight;
+      const isActive = entry.confidence >= 3;
+      const isLast = lastStride && lastStride.pc === entry.pc;
+      ctx.fillStyle = isLast ? MB.alpha(MB.css("accent"), 0.1) : MB.css("surface");
+      MB.roundRect(ctx, left, y + 2, width - 24, rowHeight - 4, 6); ctx.fill();
+      if (isActive) { ctx.strokeStyle = MB.css("ok"); ctx.lineWidth = 2; ctx.stroke(); }
+      const at = (ratio) => left + ratio * (width - 24);
+      MB.text(ctx, `${nameOf(entry.pc)} ${hex(entry.pc)}`, at(0) + 8, y + rowHeight / 2, { size: 11, mono: true, weight: 700 });
+      if (width >= 560) MB.text(ctx, hex(entry.previous), at(0.2), y + rowHeight / 2, { size: 11, mono: true, color: MB.css("text-dim") });
+      MB.text(ctx, `${entry.stride >= 0 ? "+" : ""}${entry.stride} B`, at(width < 560 ? 0.3 : 0.45), y + rowHeight / 2, { size: 11, mono: true });
+      const barLeft = at(width < 560 ? 0.55 : 0.62), barWidth = (width - 24) * 0.3;
+      for (let level = 0; level < 7; level++) {
+        ctx.fillStyle = level < entry.confidence ? (level < 3 ? MB.css("warn") : MB.css("ok")) : MB.css("surface-2");
+        ctx.fillRect(barLeft + level * (barWidth / 7), y + rowHeight / 2 - 5, barWidth / 7 - 2, 10);
+      }
+    });
+    if (!rows.length) MB.text(ctx, "표가 비어 있다", width / 2, height / 2, { align: "center", color: MB.css("text-faint") });
+  } });
+  function paintStride() {
+    MB.set("st-count", strideStats.count);
+    MB.set("st-l1", strideStats.l1);
+    MB.set("st-coverage", strideStats.demand ? MB.pct(strideStats.covered / strideStats.demand) : "—");
+    if (lastStride) {
+      const kindText = { alloc: "새 칸 할당", invalid: "보폭 0~1블록 → 무시", match: "보폭 일치 → 신뢰도 +1", mismatch: "보폭 불일치 → 신뢰도 −1" }[lastStride.kind];
+      document.getElementById("st-info").innerHTML = `PC <b>${lastStride.name}</b> 주소 <span class="mono">${hex(lastStride.address)}</span> · ${kindText}` +
+        (lastStride.prefetchL1 !== null ? ` · <b style="color:var(--ok)">L1 프리페치 ${hex(lastStride.prefetchL1)}, L2 프리페치 ${hex(lastStride.prefetchL2)}</b>` : "");
+    }
+    strideView.redraw();
+  }
+  MB.range("st-a", (v) => { strideSettings.strideA = v; }, (v) => (v > 0 ? "+" : "") + v);
+  MB.range("st-b", (v) => { strideSettings.strideB = v; }, (v) => (v > 0 ? "+" : "") + v);
+  MB.range("st-c", (v) => { strideSettings.strideC = v; }, (v) => (v > 0 ? "+" : "") + v);
+  MB.range("st-noise", (v) => { strideSettings.noise = v; }, (v) => MB.pct(v, 0));
+  document.getElementById("st-reset").onclick = resetStride;
+  document.getElementById("st-step").onclick = () => { stepStride(); paintStride(); };
+  document.getElementById("st-fast").onclick = () => { for (let k = 0; k < 200; k++) stepStride(); paintStride(); };
+  let strideAccumulator = 0;
+  const strideLoop = MB.loop(document.getElementById("sim-stride"), (dt) => {
+    strideAccumulator += dt;
+    if (strideAccumulator > 0.25) { strideAccumulator = 0; stepStride(); paintStride(); }
+  });
+  strideLoop.running = false;
+  MB.playButton("st-play", strideLoop, ["⏸ 멈춤", "▶ 재생"]);
+  resetStride();
+
+  /* ---------------------------------------------------- 그림 10-5: SMS */
+  const SHAPES = { struct: [0, 2, 3, 8, 9], dense: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], sparse: [0, 5, 13] };
+  let shapeName = "struct", shapeNoise = 0.1, triggerShift = 0, spatialModel, spatialRandom, lastRegion = null;
+  function resetSpatial() { spatialModel = new DataCacheEngine.SpatialPatternModel(); spatialRandom = MB.rng(31); lastRegion = null; paintSpatial(); }
+  function nextRegion() {
+    const shape = SHAPES[shapeName];
+    const shift = Math.floor(spatialRandom() * (triggerShift + 1));
+    const blocks = [];
+    shape.forEach((block) => { const shifted = block + shift; if (shifted < 16 && (blocks.length === 0 || spatialRandom() >= shapeNoise)) blocks.push(shifted); });
+    if (spatialRandom() < shapeNoise) { const extra = Math.floor(spatialRandom() * 16); if (!blocks.includes(extra)) blocks.push(extra); }
+    lastRegion = spatialModel.runRegion(blocks);
+  }
+  const spatialView = MB.canvas("#cv-sms", { aspect: 0.2, minHeight: 160, maxHeight: 180, draw(ctx, width, height) {
+    if (!spatialModel) return;
+    const left = 12, right = width - 12;
+    const historyWidth = (right - left) / 31;
+    MB.text(ctx, "PHT 패턴 (트리거 기준 −15 … +15)", left, 10, { size: 11, weight: 700, color: MB.css("text-dim") });
+    for (let slot = 0; slot < 30; slot++) {
+      const relative = slot < 15 ? slot - 15 : slot - 14;
+      const position = relative + 15;
+      const counter = spatialModel.history[slot];
+      const x = left + position * historyWidth;
+      ctx.fillStyle = MB.alpha(MB.css("accent-2"), 0.08 + 0.28 * counter);
+      MB.roundRect(ctx, x + 1, 22, historyWidth - 2, 26, 4); ctx.fill();
+      if (counter >= 2) { ctx.strokeStyle = MB.css("accent-2"); ctx.lineWidth = 2; ctx.stroke(); }
+      if (historyWidth > 16) MB.text(ctx, String(counter), x + historyWidth / 2, 35, { align: "center", size: 10, mono: true });
+    }
+    const triggerX = left + 15 * historyWidth;
+    ctx.fillStyle = MB.css("warn"); MB.roundRect(ctx, triggerX + 1, 22, historyWidth - 2, 26, 4); ctx.fill();
+    MB.text(ctx, "T", triggerX + historyWidth / 2, 35, { align: "center", size: 10, weight: 800, color: "#fff" });
+    if (!lastRegion) { MB.text(ctx, "영역 1개 → 를 눌러 시작", width / 2, height * 0.72, { align: "center", color: MB.css("text-faint") }); return; }
+    const blockWidth = (right - left) / 16, y = height * 0.58;
+    MB.text(ctx, `방금 지나간 1 KB 영역 (트리거 = 블록 ${lastRegion.trigger})`, left, y - 12, { size: 11, weight: 700, color: MB.css("text-dim") });
+    for (let block = 0; block < 16; block++) {
+      const x = left + block * blockWidth;
+      const isAccessed = lastRegion.accessedSet.has(block), isPredicted = lastRegion.predicted.has(block), isTrigger = block === lastRegion.trigger;
+      let fill = MB.css("surface");
+      if (isTrigger) fill = MB.css("warn");
+      else if (isAccessed && isPredicted) fill = MB.css("ok");
+      else if (isAccessed) fill = MB.css("bad");
+      ctx.fillStyle = fill; MB.roundRect(ctx, x + 2, y, blockWidth - 4, 30, 5); ctx.fill();
+      if (isPredicted && !isAccessed) { ctx.strokeStyle = MB.css("text-faint"); ctx.lineWidth = 2; ctx.setLineDash([3, 2]); ctx.stroke(); ctx.setLineDash([]); }
+      MB.text(ctx, String(block), x + blockWidth / 2, y + 15, { align: "center", size: 10.5, mono: true, color: isAccessed || isTrigger ? "#fff" : MB.css("text-faint") });
+    }
+  } });
+  function paintSpatial() {
+    const stats = spatialModel.stats;
+    MB.set("sms-regions", stats.regions);
+    MB.set("sms-coverage", stats.demand ? MB.pct(stats.covered / stats.demand) : "—");
+    MB.set("sms-accuracy", stats.issued ? MB.pct(stats.useful / stats.issued) : "—");
+    spatialView.redraw();
+  }
+  MB.seg("#sms-shape", (v) => { shapeName = v; resetSpatial(); });
+  MB.range("sms-noise", (v) => { shapeNoise = v; }, (v) => MB.pct(v, 0));
+  MB.range("sms-shift", (v) => { triggerShift = v; }, (v) => (v ? "0~" + v + " 블록" : "없음"));
+  document.getElementById("sms-reset").onclick = resetSpatial;
+  document.getElementById("sms-step").onclick = () => { nextRegion(); paintSpatial(); };
+  document.getElementById("sms-fast").onclick = () => { for (let k = 0; k < 100; k++) nextRegion(); paintSpatial(); };
+  resetSpatial();
+})();
+</script>
+</body>
+</html>

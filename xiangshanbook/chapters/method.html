@@ -1,0 +1,966 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>검증과 시뮬레이션 · XiangShanBook</title>
+<meta name="description" content="Chisel에서 SystemVerilog, Verilator emu까지 XiangShan을 시뮬레이터로 만드는 흐름과, DiffTest로 NEMU와 한 걸음씩 맞추며 코어가 맞게 도는지 확인하는 방법. LightSSS, 체크포인트, ChiselDB, Constantin, CI.">
+<link rel="icon" type="image/svg+xml" href="../favicon.svg">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/common.js"></script>
+<style>
+  .lockstep { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--border); font-family: var(--mono); font-size: 12.5px; }
+  .lockstep > div { background: var(--bg-elev); padding: 10px 12px; min-width: 0; }
+  .lockstep h5 { margin: 0 0 6px; font-size: 12px; letter-spacing: .08em; color: var(--text-dim); font-family: var(--font); }
+  .lockstep ol { list-style: none; margin: 0; padding: 0; max-height: 260px; overflow-y: auto; }
+  .lockstep li { display: flex; gap: 8px; padding: 2px 4px; border-radius: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .lockstep li .pc { color: var(--text-faint); }
+  .lockstep li.match .mark { color: var(--ok); }
+  .lockstep li.mismatch { background: color-mix(in srgb, var(--bad) 16%, transparent); }
+  .lockstep li.mismatch .mark { color: var(--bad); }
+  .lockstep li.trap { background: color-mix(in srgb, var(--ok) 14%, transparent); }
+  .diff-table { width: 100%; font-family: var(--mono); font-size: 13px; }
+  .diff-table td.bad { color: var(--bad); font-weight: 700; }
+  .diff-table td.good { color: var(--ok); }
+  .diff-table td.probe { color: var(--accent-2); font-size: 12px; }
+  .register-strip { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 18px; border-top: 1px solid var(--border); font-family: var(--mono); font-size: 12px; }
+  .register-strip span { padding: 2px 8px; border-radius: 6px; background: var(--surface); }
+  .register-strip span.changed { background: var(--accent-soft); color: var(--accent); font-weight: 700; }
+  .builder { display: grid; gap: 12px; padding: 14px 18px; border-top: 1px solid var(--border); grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+  .builder { align-items: start; }
+  .builder .group { display: grid; gap: 6px; font-size: 14px; align-content: start; }
+  .builder .group > span { color: var(--text-dim); font-size: 13px; }
+  .builder select, .builder input[type="text"], .builder input[type="number"] { font: inherit; font-size: 14px; padding: 6px 9px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg-elev); color: var(--text); width: 100%; }
+  .command-out { margin: 0; border: 0; border-top: 1px solid var(--border); border-radius: 0; white-space: pre-wrap; word-break: break-all; }
+  .notes { padding: 10px 18px 14px; border-top: 1px solid var(--border); font-size: 14px; display: grid; gap: 6px; }
+  .notes .note { padding: 6px 10px; border-radius: 8px; background: var(--surface); }
+  .notes .note.warn { background: color-mix(in srgb, var(--warn) 16%, transparent); }
+  .notes .note.added { background: var(--accent-2-soft); }
+  .ci-list { display: flex; flex-wrap: wrap; gap: 6px; padding: 12px 18px; border-top: 1px solid var(--border); }
+  .ci-list span { font-family: var(--mono); font-size: 12.5px; padding: 2px 9px; border-radius: 999px; background: var(--surface); border: 1px solid var(--border); }
+</style>
+</head>
+<body data-chapter="method">
+<main class="chapter">
+  <header class="chapter-hero">
+    <div class="eyebrow">Chapter 15</div>
+    <h1>검증과 시뮬레이션</h1>
+    <p class="lead">XiangShan은 Chisel 코드다. 코드를 고친 뒤 칩이 여전히 맞게 도는지 확인하려면 그 코드를 먼저 <b>돌릴 수 있는 무언가</b>로 바꿔야 한다. Chisel을 SystemVerilog로 내리고, Verilator가 그것을 C++ 시뮬레이터 <code>emu</code>로 만든다. emu가 명령을 하나 끝낼 때마다 참조 모델 NEMU도 같은 명령을 실행한다. 둘의 결과가 처음 어긋나는 순간이 바로 버그가 드러나는 지점이다. 이 장은 kunminghu-v3 저장소에 들어 있는 그 도구들, 즉 빌드 흐름, DiffTest, LightSSS, 체크포인트, 관찰 도구, CI를 차례로 연다.</p>
+    <ul class="objectives">
+      <li><code>make verilog</code>·<code>sim-verilog</code>·<code>emu</code>가 Chisel을 어떤 단계를 거쳐 실행 파일로 만드는지, 단계마다 무엇이 나오는지 따라간다.</li>
+      <li>DiffTest가 커밋마다 참조 모델과 무엇을 비교하는지, 어떤 프로브(DiffXXX)가 어떤 아키텍처 상태를 지키는지 짚어 본다.</li>
+      <li>emu 실행 옵션을 조립하고, 함께 쓰면 안 되는 옵션 조합을 확인한다.</li>
+      <li>LightSSS가 fork로 스냅숏을 남겨, 실패 직전 구간만 파형과 함께 다시 돌리는 원리를 시간축 위에서 본다.</li>
+      <li>체크포인트와 SimPoint 가중 평균으로 긴 프로그램의 CPI를 몇 구간만 돌려 추정하는 방법을 실험한다.</li>
+    </ul>
+  </header>
+
+  <!-- ============================================================ 1 -->
+  <section id="build">
+    <h2>Chisel에서 emu까지</h2>
+    <p>XiangShan 저장소의 최상위 <code>Makefile</code>에는 세 가지 핵심 목표가 있다. <code>make verilog</code>는 실제 칩용 최상위 <code>XSTop</code>의 RTL을, <code>make sim-verilog</code>는 시뮬레이션용 최상위 <code>SimTop</code>의 RTL을 만든다. <code>make emu</code>는 <code>sim-verilog</code> 결과를 <code>difftest</code> 서브모듈의 Makefile에 넘겨 Verilator로 컴파일한다. 빌드 도구는 <span class="term">mill</span>이고, Chisel 코드를 엘라보레이션해 FIRRTL을 얻은 뒤 CIRCT의 <span class="term">firtool</span>이 그것을 SystemVerilog로 내린다.</p>
+    <div class="sim" id="sim-flow">
+      <div class="sim-head"><span class="sim-tag">FLOW</span><h3>빌드 흐름 따라가기</h3>
+        <div class="seg" id="flow-backend"><button data-value="verilator" class="on">Verilator emu</button><button data-value="gsim">GSIM</button><button data-value="vcs">VCS simv</button><button data-value="pldm">Palladium</button><button data-value="chip">칩용 verilog</button></div>
+      </div>
+      <div class="sim-view"><canvas id="cv-flow"></canvas></div>
+      <div class="info-panel" id="flow-info">단계를 눌러 보자.</div>
+      <figcaption><span class="try">눌러 보기</span>상자를 누르면 그 단계의 명령, 입력과 출력, Makefile 위치가 아래에 나온다. 위의 버튼으로 시뮬레이터를 바꾸면 길이 달라진다. GSIM은 firtool을 건너뛰고 CHIRRTL(<code>SimTop.fir</code>)을 바로 읽는다. VCS와 Palladium은 같은 <code>sim-verilog</code> 결과를 다른 시뮬레이터에 넣는다. 칩용 <code>make verilog</code>는 DiffTest 프로브가 없는 <code>XSTop</code>을 만든다.</figcaption>
+    </div>
+    <div class="callout code"><strong>Makefile · sim-verilog와 emu</strong>
+      <p><code>sim-verilog</code>는 mill로 <code>top.XiangShanSim</code>을 실행한다. 끝나면 현재 <code>git log</code>와 <code>git diff</code>를 주석으로 바꿔 생성된 .sv 맨 앞에 붙인다. 그래서 RTL 파일만 보고도 어떤 소스 상태에서 나왔는지 알 수 있다.</p>
+<pre><code><span class="c"># Makefile:317-326 (요약)</span>
+$(SIM_TOP_OUT): $(SCALA_FILE) $(TEST_FILE)
+	mill -i $(MILL_BUILD_ARGS) xiangshan.test.runMain $(SIMTOP) \
+		--target-dir $(@D) --config $(CONFIG) --issue $(ISSUE) \
+		--num-cores $(NUM_CORES) $(SIM_ARGS) --full-stacktrace
+	@{ git log -n 1; git diff; } | sed 's/^/\/\// ' > $(dir $@).__diff__
+
+<span class="c"># Makefile:382-386</span>
+emu-mk: sim-verilog
+	$(MAKE) -C ./difftest emu-mk NUM_CORES=$(NUM_CORES) ...
+emu: $(call docker-deps,emu-mk)
+	$(MAKE) -C ./difftest emu NUM_CORES=$(NUM_CORES) ...</code></pre>
+    </div>
+    <p>make 변수가 Chisel 쪽 인자(<code>SIM_ARGS</code>)와 Verilator 쪽 옵션을 정한다. 예를 들어 <code>WITH_CHISELDB=1</code>은 <code>--with-chiseldb</code>를, <code>WITH_CONSTANTIN=1</code>은 <code>--with-constantin</code>을 붙인다. <code>RELEASE=1</code>을 주지 않으면 디버그 인자(<code>--enable-difftest</code>)가 들어가 DiffTest 프로브가 RTL에 남는다. <code>EMU_THREADS</code>는 difftest의 <code>verilator.mk</code>에서 <code>--threads</code>로 바뀌어, Verilator가 설계를 여러 스레드로 나눠 시뮬레이션하게 한다. 아래에서 변수를 골라 명령을 조립해 보자.</p>
+    <div class="sim" id="sim-make">
+      <div class="sim-head"><span class="sim-tag">BUILDER</span><h3>make 명령 조립대</h3></div>
+      <div class="builder">
+        <label class="group"><span>목표</span><select id="make-target"><option value="emu" selected>emu</option><option value="sim-verilog">sim-verilog</option><option value="verilog">verilog</option></select></label>
+        <label class="group"><span>CONFIG</span><select id="make-config"><option>DefaultConfig</option><option selected>MinimalConfig</option><option>XSNoCTopConfig</option><option>FpgaDefaultConfig</option></select></label>
+        <label class="group"><span>NUM_CORES</span><select id="make-cores"><option selected>1</option><option>2</option></select></label>
+        <label class="group"><span>EMU_THREADS</span><select id="make-threads"><option>0</option><option>2</option><option>4</option><option selected>8</option><option>16</option></select></label>
+        <label class="group"><span>EMU_TRACE (파형)</span><select id="make-trace"><option value="" selected>끔</option><option value="1">vcd</option><option value="fst">fst</option></select></label>
+        <div class="group"><span>옵션</span>
+          <label class="check"><input type="checkbox" id="make-dramsim"> WITH_DRAMSIM3=1</label>
+          <label class="check"><input type="checkbox" id="make-chiseldb"> WITH_CHISELDB=1</label>
+          <label class="check"><input type="checkbox" id="make-constantin"> WITH_CONSTANTIN=1</label>
+          <label class="check"><input type="checkbox" id="make-noperf"> DISABLE_PERF=1</label>
+          <label class="check"><input type="checkbox" id="make-release"> RELEASE=1</label>
+        </div>
+      </div>
+      <pre class="command-out"><code id="make-command"></code></pre>
+      <div class="notes" id="make-notes"></div>
+      <figcaption><span class="try">조립해 보기</span>선택한 변수가 Makefile에서 어떤 Chisel 인자로 바뀌는지(<code>Makefile:192-254</code>), Verilator 쪽에는 무엇이 붙는지(<code>difftest/verilator.mk:50-64</code>)를 아래에 보여 준다. 목표를 <code>verilog</code>로 바꾸면 시뮬레이션 전용 변수들은 의미가 없어진다는 표시가 뜬다. 저장소 README의 예시는 <code>make emu CONFIG=MinimalConfig EMU_THREADS=2 -j10</code>이다.</figcaption>
+    </div>
+  </section>
+
+  <!-- ============================================================ 2 -->
+  <section id="difftest">
+    <h2>한 걸음씩 맞추기: DiffTest</h2>
+    <p>비순차 코어는 수백 개의 명령을 동시에 들고 있다. 버그가 있으면 잘못된 값이 레지스터 몇 개를 거쳐 한참 뒤에야 엉뚱한 곳에서 드러난다. 그래서 XiangShan은 <span class="term">DiffTest</span><span class="en">(differential testing)</span>로 검증한다. emu가 명령을 하나 <b>커밋</b>할 때마다, 참조 모델<span class="en">(REF)</span>도 같은 명령을 한 걸음 실행한다. 그다음 두 쪽의 아키텍처 상태를 비교한다. 이를 <span class="term">lock-step</span> 공동 시뮬레이션이라 한다. 기본 REF는 <span class="term">NEMU</span>다. <code>NEMU_HOME/build/riscv64-nemu-interpreter-so</code>를 공유 라이브러리로 열고, Spike를 쓰도록 바꿀 수도 있다(<code>difftest/src/test/csrc/difftest/refproxy.cpp:342-348</code>). 경로는 <code>--diff</code>로 직접 줄 수도 있다.</p>
+    <p>RTL 안에서 비교할 값을 내보내는 장치를 <span class="term">프로브</span>라 한다. 프로브는 <code>DifftestModule(new DiffInstrCommit ...)</code>처럼 설계 곳곳에 심는다. ROB는 커밋한 명령을, CSR 모듈은 CSR 상태와 예외를, 스토어 버퍼는 메모리에 쓴 값을 내보낸다. 처음 어긋나는 순간 시뮬레이션은 멈추고, 어긋난 명령의 PC와 값을 보고한다. 프로그램이 끝까지 어긋나지 않고 종료 명령에 닿으면 <code>HIT GOOD TRAP</code>이 찍힌다. 아래에서 작은 프로그램에 버그를 하나 심어 보자.</p>
+
+    <div class="sim" id="sim-difftest">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>DUT와 REF의 lock-step 비교</h3>
+        <div class="seg" id="difftest-bug"><button data-value="none" class="on">버그 없음</button><button data-value="add">add 결과 +1</button><button data-value="branch">분기 방향 오류</button><button data-value="store">store 데이터 오류</button><button data-value="csr">CSR 쓰기 누락</button></div>
+      </div>
+      <div class="lockstep">
+        <div><h5>DUT · emu 커밋 (DiffInstrCommit)</h5><ol id="difftest-dut"></ol></div>
+        <div><h5>REF · NEMU 한 걸음</h5><ol id="difftest-ref"></ol></div>
+      </div>
+      <div class="register-strip" id="difftest-registers"></div>
+      <div class="sim-controls" style="grid-template-columns:1fr">
+        <div class="ctrl-row">
+          <button class="btn sm" id="difftest-reset">⏮ 처음</button>
+          <button class="btn sm primary" id="difftest-step">커밋 1개 →</button>
+          <button class="btn sm" id="difftest-play">▶ 자동</button>
+          <button class="btn sm" id="difftest-run">끝까지 ⏭</button>
+        </div>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">커밋한 명령</span><span class="v" id="difftest-count">0</span></div>
+        <div class="stat"><span class="k">상태</span><span class="v" id="difftest-state">실행 중</span></div>
+        <div class="stat"><span class="k">버그가 심긴 명령</span><span class="v" id="difftest-planted">—</span></div>
+        <div class="stat"><span class="k">발견한 명령</span><span class="v" id="difftest-caught">—</span></div>
+      </div>
+      <div class="info-panel" id="difftest-diff">커밋 1개 → 를 눌러 두 모델을 한 걸음씩 움직여 보자.</div>
+      <figcaption><span class="try">버그 심기</span>프로그램은 a1 = 5, 4, …, 1을 a0에 더한 뒤 그 합을 메모리와 <code>mscratch</code> CSR에 쓴다. 마지막에는 a0 = 0으로 종료 명령(trap)을 실행한다. 버그를 고르고 '끝까지'를 누르면 DiffTest가 멈춘 커밋과 어긋난 항목, 그 항목을 지키는 프로브 이름이 표로 나온다. '분기 방향 오류'를 고르면 버그가 심긴 명령(bnez)과 발견된 명령이 다르다. bnez 자체는 레지스터를 바꾸지 않으므로 다음 커밋의 PC가 달라지는 순간에야 잡힌다. 이 웹 모델은 개념만 보여 주는 축소판이다. 실제 DiffTest는 레지스터 파일 전체, 훨씬 많은 CSR, 예외·인터럽트, 캐시 리필, TLB 변환까지 비교한다.</figcaption>
+    </div>
+
+    <h3>어떤 프로브가 무엇을 지키는가</h3>
+    <p>difftest 서브모듈 README의 API 표에서 필수로 표시된 프로브는 다섯 가지다. <code>DiffArchEvent</code>(예외·인터럽트), <code>DiffInstrCommit</code>(커밋한 명령), <code>DiffTrapEvent</code>(시뮬레이션 종료 호출), <code>DiffCSRState</code>(CSR), <code>DiffPhyIntRegState</code>(정수 레지스터)다. 나머지는 선택이다. kunminghu-v3는 물리 레지스터가 32개보다 많다. 그래서 물리 레지스터 파일 전체(<code>DiffPhyIntRegState</code>)와 리네임 테이블(<code>DiffArchIntRenameTable</code>)을 함께 보내고, C++ 쪽이 둘을 맞춰 아키텍처 레지스터 값을 복원한다. 아래 표에서 행이나 칸을 눌러 각 프로브가 kunminghu-v3의 어느 모듈에 심겨 있는지 확인하자.</p>
+    <figure class="play" id="fig-probes">
+      <div class="play-ctrl" style="border-top:0;border-bottom:1px solid var(--border)">
+        <div class="seg" id="probe-bug"><button data-value="none" class="on">버그 고르기: 없음</button><button data-value="regfile">리네임 매핑 오류</button><button data-value="csr">CSR 쓰기 누락</button><button data-value="store">스토어 데이터 오류</button><button data-value="refill">캐시 리필 데이터 오류</button><button data-value="tlb">TLB 변환 오류</button><button data-value="interrupt">인터럽트 놓침</button></div>
+      </div>
+      <div class="play-view"><canvas id="cv-probes"></canvas></div>
+      <div class="info-panel" id="probe-info">행이나 칸을 눌러 보자.</div>
+      <figcaption><span class="try">눌러 보기</span>행은 kunminghu-v3 RTL이 실제로 만드는 프로브, 열은 비교 대상인 아키텍처 상태다. 칠한 칸은 그 프로브가 그 상태를 비교한다는 뜻이고, 굵은 테두리 행은 필수 프로브다. 위에서 버그 종류를 고르면 그 버그를 가장 먼저 잡을 프로브가 강조된다. 프로브 위치는 <code>grep "DifftestModule(new Diff"</code>로 찾은 것이다. NewCSR과 예전 CSR 두 곳에 같은 프로브가 있는 경우는 NewCSR 위치를 적었다.</figcaption>
+    </figure>
+    <div class="callout code"><strong>ROB가 커밋을 알리는 곳</strong>
+      <p>커밋 폭만큼 <code>DiffInstrCommit</code>을 만든다. <code>index</code>는 그 사이클의 몇 번째 커밋인지를 뜻한다. MMIO처럼 REF가 흉내 낼 수 없는 명령은 <code>skip</code>으로 표시해 REF가 결과를 DUT에서 복사하게 한다. 이동 제거된 명령(<code>eliminatedMove</code>)은 건너뛰지 않는다.</p>
+<pre><code><span class="c">// src/main/scala/xiangshan/backend/rob/Rob.scala:1743-1755</span>
+<span class="k">val</span> difftest = DifftestModule(<span class="k">new</span> DiffInstrCommit(diffMaxPhyRegs), delay = 3, dontCare = <span class="k">true</span>)
+<span class="k">val</span> dt_skip = Mux(eliminatedMove, false.B, exuOut.isSkipDiff)
+difftest.coreid := io.hartId
+difftest.index  := i.U
+difftest.valid  := io.commits.commitValid(i) &amp;&amp; io.commits.isCommit
+difftest.skip   := dt_skip
+difftest.isRVC  := commitInfo.isRVC
+difftest.rfwen  := io.commits.commitValid(i) &amp;&amp; commitInfo.rfWen &amp;&amp; basicDebug.ldest =/= 0.U
+difftest.wpdest := basicDebug.pdest
+difftest.wdest  := Mux(isVLoad, basicDebug.vd, basicDebug.ldest)</code></pre>
+    </div>
+    <div class="callout deep"><strong>스쿼시: 여러 커밋을 한 번에 비교하기</strong>
+      <p>커밋마다 C++로 건너가 비교하면 시뮬레이션이 느려진다. difftest는 연속한 커밋 여러 개를 하드웨어 쪽에서 하나로 합쳐(<span class="term">squash</span>) 보내고, REF는 그만큼 한꺼번에 실행한 뒤 비교한다. 합칠 수 있는 최대 명령 수는 기본 255이고 <code>--squash-size</code>로 바꾼다. 문제를 좁힐 때는 <code>--no-squash</code>로 끄거나, <code>--no-squash-after-instr=N</code>으로 N번째 명령 이후부터만 끈다(<code>difftest/src/test/csrc/common/args.cpp:122-125</code>).</p>
+    </div>
+    <div class="callout warn"><strong>DiffTest가 증명하지 않는 것</strong>
+      <p>DiffTest는 <b>기능 정확성</b>을 지킨다. 통과했다고 성능이 좋아졌다는 뜻도, 타이밍이 맞는다는 뜻도 아니다. 그리고 비교는 커밋된 아키텍처 상태만 본다. 그러니 투기적으로 실행했다가 버린 명령이 마이크로아키텍처 상태를 어떻게 바꿨는지는 직접 보지 못한다. 그런 변화가 언젠가 커밋 결과를 틀리게 만들 때 비로소 드러난다.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ 3 -->
+  <section id="run">
+    <h2>emu 실행하기</h2>
+    <p>빌드한 <code>build/emu</code>는 메모리 이미지(<code>-i</code>)를 0x8000_0000부터 올려 실행한다. 이미지는 바이너리, gz·zstd 압축본, ELF를 모두 받는다. 실행 길이는 사이클 수(<code>-C</code>)나 명령 수(<code>-I</code>)로 자를 수 있다. 성능을 잴 때는 <code>-W</code>로 워밍업 명령 수를 주어, 그 구간이 끝난 뒤의 성능 카운터만 남긴다. 로그와 파형은 <code>-b</code>, <code>-e</code>로 정한 사이클 구간에서만 찍는다. 수십억 사이클 전체를 기록하면 파일이 감당할 수 없이 커지기 때문이다.</p>
+    <div class="sim" id="sim-emu">
+      <div class="sim-head"><span class="sim-tag">BUILDER</span><h3>emu 명령 조립대</h3>
+        <div class="seg" id="emu-preset"><button data-value="readme" class="on">README 예시</button><button data-value="perf">성능 측정</button><button data-value="debug">파형 디버깅</button><button data-value="lightsss">LightSSS</button></div>
+      </div>
+      <div class="builder">
+        <label class="group"><span>-i 이미지</span><input type="text" id="emu-image" value="./ready-to-run/coremark-2-iteration.bin"></label>
+        <label class="group"><span>REF (--diff / --no-diff)</span><select id="emu-ref"><option value="nemu" selected>--diff NEMU .so</option><option value="none">--no-diff</option></select></label>
+        <label class="group"><span>-b / -e 로그 구간 (사이클)</span><input type="text" id="emu-window" value="0,0"></label>
+        <label class="group"><span>-I 최대 명령 수 (0=끝까지)</span><input type="number" id="emu-max" value="0" min="0" step="1000000"></label>
+        <label class="group"><span>-W 워밍업 명령 수</span><input type="number" id="emu-warmup" value="0" min="0" step="1000000"></label>
+        <div class="group"><span>디버깅</span>
+          <label class="check"><input type="checkbox" id="emu-wave"> --dump-wave</label>
+          <label class="check"><input type="checkbox" id="emu-fork"> --enable-fork (LightSSS)</label>
+          <label class="check"><input type="checkbox" id="emu-db"> --dump-db (ChiselDB)</label>
+          <label class="check"><input type="checkbox" id="emu-nosquash"> --no-squash</label>
+        </div>
+      </div>
+      <pre class="command-out"><code id="emu-command"></code></pre>
+      <div class="notes" id="emu-notes"></div>
+      <figcaption><span class="try">조립해 보기</span>옵션 이름과 뜻은 <code>difftest/src/test/csrc/common/args.cpp:83-145</code>의 도움말을 따른다. 함께 쓰면 안 되는 조합을 고르면 경고가 뜬다. difftest README에 따르면 <code>--enable-fork</code>를 <code>-b</code>·<code>-e</code>·<code>--dump-wave</code> 같은 디버깅 옵션과 함께 쓸 때의 동작은 정의되어 있지 않다. 파형이나 DB는 빌드할 때 켜야 기록할 것이 생긴다(<code>EMU_TRACE</code>, <code>WITH_CHISELDB=1</code>).</figcaption>
+    </div>
+  </section>
+
+  <!-- ============================================================ 4 -->
+  <section id="lightsss">
+    <h2>LightSSS: 실패 직전만 다시 돌리기</h2>
+    <p>몇 시간 돌던 시뮬레이션이 DiffTest 불일치로 멈췄다고 하자. 원인을 보려면 실패 직전의 파형이 필요하다. 그러나 처음부터 파형을 켜고 다시 돌리면 몇 시간이 또 걸리고, 파형 파일도 감당할 수 없이 커진다. <span class="term">LightSSS</span><span class="en">(Light-weight Simulation SnapShot)</span>는 운영체제의 <code>fork()</code>로 이 문제를 푼다. 시뮬레이션 프로세스가 일정 시간마다 자기 자신을 fork한다. 자식 프로세스는 그 순간의 시뮬레이션 상태를 통째로 품은 채 잠들어 있고, fork의 copy-on-write 덕분에 메모리를 거의 쓰지 않는다. 부모가 실패하면 가장 오래된 자식을 깨운다. 깨어난 자식은 파형과 로그를 켜고 실패 지점까지 다시 달린다.</p>
+    <figure class="play" id="fig-lightsss">
+      <div class="play-view"><canvas id="cv-lightsss"></canvas></div>
+      <div class="play-ctrl">
+        <label class="ctrl"><span>--fork-interval (초) <output id="fork-interval-out"></output></span><input type="range" id="fork-interval" min="1" max="30" step="1" value="10"></label>
+        <label class="ctrl"><span>실패 시각 (초) <output id="abort-time-out"></output></span><input type="range" id="abort-time" min="5" max="120" step="1" value="73"></label>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">남긴 스냅숏</span><span class="v" id="lightsss-count">—</span></div>
+        <div class="stat"><span class="k">살아 있는 자식</span><span class="v" id="lightsss-alive">—</span></div>
+        <div class="stat"><span class="k">깨울 자식의 시각</span><span class="v" id="lightsss-oldest">—</span></div>
+        <div class="stat"><span class="k">다시 돌릴 구간</span><span class="v" id="lightsss-window">—</span></div>
+      </div>
+      <figcaption><span class="try">움직여 보기</span>위의 굵은 선은 부모 시뮬레이션이다. 아래의 작은 점은 fork한 스냅숏이고, 회색 점은 자리가 없어 지워진 스냅숏이다. 동시에 살려 두는 자식은 <code>SLOT_SIZE = 2</code>개(<code>difftest/config/config.h:88</code>)다. 그래서 새로 fork할 때 자리가 차 있으면 가장 오래된 자식을 죽인다. 처음 한 번은 시작하자마자 fork하고, 이후에는 마지막 fork 뒤 <code>--fork-interval</code>(기본 10초, <code>args.h:26</code>)이 지날 때마다 fork한다. 실패하면 남은 둘 중 오래된 쪽을 깨운다. 깨어난 자식은 실패 사이클보다 <code>STEP_FORWARD_CYCLES = 100</code>사이클 더 달린 뒤 멈춘다. 그래서 다시 돌리는 구간은 대략 간격 하나에서 둘 사이의 길이가 된다. 간격을 줄이면 재실행이 짧아지지만, fork가 잦아진다.</figcaption>
+    </figure>
+    <div class="callout code"><strong>가장 오래된 자식만 깨운다</strong>
+<pre><code><span class="c">// difftest/src/test/csrc/common/lightsss.cpp:83-104 (요약)</span>
+<span class="k">int</span> LightSSS::wakeup_child(uint64_t cycles) {
+  forkshm.info-&gt;endCycles = cycles;
+  forkshm.info-&gt;oldest = pidSlot.back();
+  <span class="c">// only the oldest is wantted, so kill others by parent process.</span>
+  <span class="k">for</span> (<span class="k">auto</span> pid: pidSlot)
+    <span class="k">if</span> (pid != forkshm.info-&gt;oldest) { kill(pid, SIGKILL); waitpid(pid, NULL, 0); }
+  forkshm.info-&gt;notgood = <span class="k">true</span>;
+  forkshm.info-&gt;flag = <span class="k">true</span>;   <span class="c">// 잠든 자식이 이 깃발을 보고 깨어난다</span>
+  waitpid(pidSlot.back(), &amp;status, 0);
+}</code></pre>
+    </div>
+    <div class="predict"><strong>왜 가장 최근 자식이 아니라 오래된 자식인가</strong>
+      <p>실패에 가장 가까운 스냅숏을 깨우면 다시 돌릴 구간이 더 짧다. 그런데도 오래된 쪽을 깨우는 이유는 무엇일까?</p>
+      <details><summary>답 보기</summary><p>가장 최근 스냅숏은 실패 직전 몇 초 전일 수도, 거의 실패 순간일 수도 있다. 버그의 원인은 보통 증상보다 앞선다. 잘못된 값이 레지스터와 메모리를 거쳐 늦게 드러나기 때문이다. 그래서 너무 가까운 스냅숏에서 시작하면 원인이 파형 밖에 남을 수 있다. 오래된 쪽을 깨우면 늘 간격 하나 이상의 여유를 확보한다.</p></details>
+    </div>
+  </section>
+
+  <!-- ============================================================ 5 -->
+  <section id="checkpoint">
+    <h2>체크포인트와 SimPoint</h2>
+    <p>RTL 시뮬레이터는 느리다. SPEC CPU 같은 벤치마크 하나를 처음부터 끝까지 돌리려면 수천억 개의 명령을 실행해야 하는데, RTL 시뮬레이터로는 사실상 불가능하다. 그래서 프로그램을 일정 길이의 <b>구간</b>으로 나누고, 구간마다 어떤 기본 블록을 얼마나 실행했는지를 벡터로 기록한다. 비슷한 구간끼리 묶은 뒤 묶음마다 대표 구간 하나만 고른다. 이것이 <span class="term">SimPoint</span> 기법이다. 대표 구간 시작 시점의 아키텍처 상태를 저장한 것이 <span class="term">체크포인트</span>이고, emu는 이를 이미지처럼 불러와 그 지점부터 실행한다. 이때 체크포인트 복원 코드는 <code>--gcpt-restore</code>로 바꿀 수 있다. 각 대표 구간의 CPI에 그 묶음의 크기 비율(가중치)을 곱해 더하면 전체 CPI를 추정할 수 있다.</p>
+    <div class="formula">$$\widehat{\text{CPI}} = \sum_{j=1}^{k} w_j \cdot \text{CPI}(r_j), \qquad w_j = \frac{|C_j|}{N}$$
+      <div class="where">\(N\): 전체 구간 수, \(C_j\): \(j\)번째 묶음, \(r_j\): 그 묶음의 중심에 가장 가까운 대표 구간. kunminghu-v3 CI의 성능 테스트는 체크포인트 목록 JSON에서 벤치마크마다 점(point)과 가중치(weight)를 읽어 골라 쓴다(<code>.github/workflows/ckpt_select.py:13-55</code>).</div></div>
+    <figure class="play" id="fig-simpoint">
+      <div class="play-view"><canvas id="cv-simpoint"></canvas></div>
+      <div class="play-ctrl">
+        <label class="ctrl"><span>묶음 수 k (돌릴 구간 수) <output id="simpoint-k-out"></output></span><input type="range" id="simpoint-k" min="1" max="10" step="1" value="4"></label>
+        <div class="seg" id="simpoint-method"><button data-value="cluster" class="on">SimPoint (묶음 대표)</button><button data-value="uniform">균등 간격 표본</button></div>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">전체 CPI (참값)</span><span class="v" id="simpoint-truth">—</span></div>
+        <div class="stat"><span class="k">추정 CPI</span><span class="v" id="simpoint-estimate">—</span></div>
+        <div class="stat"><span class="k">오차</span><span class="v" id="simpoint-error">—</span></div>
+        <div class="stat"><span class="k">돌린 구간</span><span class="v" id="simpoint-cost">—</span></div>
+      </div>
+      <figcaption><span class="try">움직여 보기</span>가로축은 200개 구간으로 나눈 가상의 프로그램이고, 막대 높이는 각 구간의 CPI다. 막대 색은 그 구간이 속한 묶음이며, 테두리를 친 막대가 실제로 돌릴 대표 구간이다. 이 프로그램에는 성질이 다른 네 국면(초기화, 정수 루프, 포인터 추적, 부동소수)이 섞여 있다. 묶음 수를 4로 두면 추정 오차가 약 0.7%다. 같은 개수를 균등 간격으로 뽑으면 k에 따라 오차가 −22%에서 +33%까지 흔들린다. 구간 특징은 기본 블록 벡터를 6차원으로 줄인 축소 모델이다.</figcaption>
+    </figure>
+    <p>체크포인트에서 시작하면 캐시와 분기 예측기가 비어 있다. 그래서 측정 전에 워밍업 구간을 두고(<code>-W</code>), 측정 구간 길이를 정한다(<code>-I</code>). kunminghu-v3의 성능 CI는 체크포인트마다 <code>--max-instr 5000000</code>으로 500만 명령을 돌리고, 출력의 <code>IPC = </code> 줄을 모아 보고서를 만든다(<code>.github/workflows/emu-performance.yml:130-144</code>).</p>
+  </section>
+
+  <!-- ============================================================ 6 -->
+  <section id="observe">
+    <h2>안을 들여다보는 도구</h2>
+    <p>DiffTest가 "어디서 틀렸는가"를 알려 준다면, 다음 도구들은 "안에서 무슨 일이 일어나고 있는가"를 보여 준다. 모두 <code>utility</code> 서브모듈에 있고, 설계 코드 곳곳에서 한 줄로 부른다.</p>
+    <div class="table-wrap"><table>
+      <tr><th>도구</th><th>무엇을 하나</th><th>켜는 법</th><th>정의 위치</th></tr>
+      <tr><td><code>XSDebug</code> · <code>XSInfo</code> · <code>XSWarn</code> · <code>XSError</code></td><td>사이클마다 조건부 printf 로그</td><td>emu <code>-b</code>/<code>-e</code> 구간에서 출력</td><td class="mono">utility/LogUtils.scala:190-196</td></tr>
+      <tr><td><code>XSPerfAccumulate</code> · <code>Histogram</code> · <code>Max</code> · <code>Rolling</code></td><td>사건 횟수 누적, 분포, 최댓값, 구간별 추이</td><td>기본으로 켜짐, <code>DISABLE_PERF=1</code>로 끔</td><td class="mono">utility/PerfCounterUtils.scala:59-349</td></tr>
+      <tr><td><code>ChiselDB</code></td><td>번들 하나를 표의 한 행으로 SQLite DB에 기록</td><td>빌드 <code>WITH_CHISELDB=1</code>, 실행 <code>--dump-db</code></td><td class="mono">utility/ChiselDB.scala:226-237</td></tr>
+      <tr><td><code>Constantin</code></td><td>상수를 실행 중에 파일에서 읽어 바꿀 수 있는 레지스터로</td><td>빌드 <code>WITH_CONSTANTIN=1</code>, 실행 <code>--cst-file</code></td><td class="mono">utility/Constantin.scala:77-91</td></tr>
+    </table></div>
+    <div class="callout code"><strong>kunminghu-v3 안의 실제 사용 예</strong>
+      <p>메모리 의존 예측을 켜고 끄는 스위치가 Constantin 레코드로 들어 있다. 기본값은 <code>true</code>이고, Constantin으로 빌드하면 다시 빌드하지 않고도 실행할 때 끌 수 있다. ROB의 커밋 기록과 store set 학습 기록은 ChiselDB 표로 남는다.</p>
+<pre><code><span class="c">// src/main/scala/xiangshan/backend/Backend.scala:574-576</span>
+<span class="k">val</span> enableMdp = Constantin.createRecord(<span class="s">"EnableMdp"</span>, <span class="k">true</span>)
+sink.bits.loadWaitBit.foreach(_ := Mux(enableMdp, source.bits.loadWaitBit.get, false.B))
+
+<span class="c">// src/main/scala/xiangshan/backend/rob/Rob.scala:1481</span>
+<span class="k">val</span> debug_instTable = ChiselDB.createTable(instTableName, <span class="k">new</span> InstInfoEntry, basicDB = <span class="k">true</span>)
+<span class="c">// src/main/scala/xiangshan/backend/CtrlBlock.scala:266</span>
+<span class="k">val</span> storeSetTrainTable = ChiselDB.createTable(<span class="s">s"StoreSetTrainDB$storeSetTrainHartId"</span>, <span class="k">new</span> StoreSetTrainDBEntry, basicDB = <span class="k">false</span>)</code></pre>
+    </div>
+  </section>
+
+  <!-- ============================================================ 7 -->
+  <section id="ci">
+    <h2>매일 도는 검사: CI</h2>
+    <p>kunminghu-v3 저장소의 <code>.github/workflows</code>에는 풀 리퀘스트마다, 그리고 매일·매주 도는 검사가 정의되어 있다. 모두 <code>scripts/xiangshan.py</code>로 emu를 짓고 작업 부하를 돌린다. 아래 지도에서 워크플로를 눌러 무엇을 검사하는지 보자.</p>
+    <figure class="play" id="fig-ci">
+      <div class="play-view"><canvas id="cv-ci"></canvas></div>
+      <div class="info-panel" id="ci-info">워크플로를 눌러 보자.</div>
+      <div class="ci-list" id="ci-tests"></div>
+      <figcaption><span class="try">눌러 보기</span>왼쪽은 언제 도는지(트리거), 가운데는 워크플로 파일, 오른쪽은 그 안에서 하는 일이다. 'EMU Basics'는 Verilator 8스레드 emu 하나를 지어(<code>emu-basics.yml:54-60</code>) 13개 작업 부하에 나눠 돌린다. 'EMU Performance'는 GSIM으로 지은 emu로 SPEC06 체크포인트를 돌린다. 이때 LightSSS는 끈다(<code>--disable-fork</code>). GSIM이 아직 LightSSS를 지원하지 않기 때문이라는 주석이 붙어 있다. 정기 검사의 cron 시각은 UTC 기준이다.</figcaption>
+    </figure>
+  </section>
+
+  <section class="keypoints">
+    <h2>핵심 정리</h2>
+    <ol>
+      <li><code>make sim-verilog</code>는 mill로 Chisel을 엘라보레이션하고 firtool로 SystemVerilog를 만든다. <code>make emu</code>는 그 결과를 difftest의 Verilator 흐름에 넘겨 C++ 시뮬레이터를 짓는다. 생성된 .sv에는 소스의 git 상태가 주석으로 붙는다.</li>
+      <li>DiffTest는 커밋마다 DUT와 REF(기본 NEMU)의 아키텍처 상태를 비교해 처음 어긋난 지점에서 멈춘다. 비교 항목은 설계 곳곳에 심은 DiffXXX 프로브가 정하며, 필수 프로브는 ArchEvent, InstrCommit, TrapEvent, CSRState, PhyIntRegState다.</li>
+      <li>LightSSS는 fork로 스냅숏을 남기고(동시에 최대 2개), 실패하면 오래된 쪽을 깨워 파형과 함께 실패 지점까지 다시 돌린다.</li>
+      <li>SimPoint는 비슷한 구간을 묶어 대표 구간만 체크포인트로 돌리고, 묶음 크기로 가중 평균해 전체 CPI를 추정한다.</li>
+      <li>XSDebug·XSPerf·ChiselDB·Constantin은 로그, 카운터, DB 기록, 재빌드 없는 상수 변경을 맡는다. CI는 PR마다 기본 작업 부하와 SPEC06 체크포인트를 돌린다.</li>
+    </ol>
+  </section>
+
+  <section id="quiz">
+    <h2>확인 퀴즈</h2>
+    <div class="quiz">
+      <div class="quiz-q" data-answer="2"><p>Q1. DiffTest가 DUT와 REF를 비교하는 시점은?</p><div class="opts">
+        <button class="opt">매 사이클</button><button class="opt">명령이 인출될 때</button><button class="opt">명령이 커밋될 때</button><button class="opt">프로그램이 끝났을 때 한 번</button></div>
+        <div class="quiz-exp">ROB가 커밋한 명령을 DiffInstrCommit으로 알리면 REF가 같은 수만큼 실행하고 아키텍처 상태를 비교한다. 투기적 상태는 비교 대상이 아니다.</div></div>
+      <div class="quiz-q" data-answer="1"><p>Q2. GSIM으로 emu를 지을 때 Makefile이 기본으로 만드는 RTL 형식은?</p><div class="opts">
+        <button class="opt">SystemVerilog (SimTop.sv)</button><button class="opt">CHIRRTL (SimTop.fir)</button><button class="opt">VCD 파형</button><button class="opt">C++ 소스만</button></div>
+        <div class="quiz-exp">Makefile은 sim-chirrtl·gsim 목표에서 CHISEL_TARGET을 chirrtl로 두고, 엘라보레이션 직후의 SimTop.fir에서 멈춘다. GSIM이 CHIRRTL을 직접 읽기 때문이다.</div></div>
+      <div class="quiz-q" data-answer="3"><p>Q3. LightSSS에서 실패가 일어나면 어떤 자식 프로세스를 깨우는가?</p><div class="opts">
+        <button class="opt">가장 최근에 fork한 자식</button><button class="opt">모든 자식을 동시에</button><button class="opt">새로 fork한 자식</button><button class="opt">살아 있는 자식 중 가장 오래된 것</button></div>
+        <div class="quiz-exp">wakeup_child는 pidSlot.back(), 즉 가장 오래된 자식만 남기고 나머지를 죽인 뒤 깨운다. 원인이 증상보다 앞서는 경우가 많아, 여유 있는 구간을 다시 보기 위해서다.</div></div>
+      <div class="quiz-q" data-answer="0"><p>Q4. 묶음 3개의 크기가 100, 60, 40개 구간이고 대표 구간 CPI가 각각 0.5, 1.0, 2.5라면 SimPoint 추정 CPI는?</p><div class="opts">
+        <button class="opt">1.05</button><button class="opt">1.33</button><button class="opt">1.00</button><button class="opt">0.90</button></div>
+        <div class="quiz-exp">가중치는 100/200, 60/200, 40/200 = 0.5, 0.3, 0.2. 0.5×0.5 + 0.3×1.0 + 0.2×2.5 = 0.25 + 0.3 + 0.5 = 1.05.</div></div>
+      <div class="quiz-q" data-answer="2"><p>Q5. kunminghu-v3의 메모리 의존 예측을 다시 빌드하지 않고 실행 중에 끄려면?</p><div class="opts">
+        <button class="opt">-b/-e 구간을 바꾼다</button><button class="opt">DISABLE_PERF=1로 빌드한다</button><button class="opt">WITH_CONSTANTIN=1로 빌드하고 EnableMdp 레코드 값을 --cst-file로 준다</button><button class="opt">--no-diff로 실행한다</button></div>
+        <div class="quiz-exp">Backend.scala:574의 EnableMdp는 Constantin 레코드다. Constantin으로 빌드한 emu는 실행 때 상수 파일에서 값을 읽는다.</div></div>
+    </div>
+  </section>
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ======================================================== 그림 15-1: 빌드 흐름 */
+  const FLOW_STAGES = {
+    chisel:    { title: "Chisel 소스", output: "src/main/scala/**, 서브모듈(XSCache, utility, yunsuan, difftest …)", detail: "설계는 Scala 위의 하드웨어 생성 언어 Chisel로 쓴다. 파라미터(Config)에 따라 같은 코드에서 다른 크기의 코어가 나온다.", where: "README.md · Sub-directories Overview" },
+    elaborate: { title: "mill 엘라보레이션", output: "CHIRRTL(FIRRTL) 회로", detail: "mill -i xiangshan.test.runMain top.XiangShanSim --config $(CONFIG) --num-cores $(NUM_CORES) $(SIM_ARGS). Scala 프로그램을 실행해 회로 그래프를 만든다. JVM 메모리는 JVM_XMX(기본 40G)로 정한다.", where: "Makefile:95-99, 317-323" },
+    firtool:   { title: "CIRCT firtool", output: "build/rtl/SimTop.sv 외 여러 .sv (--split-verilog)", detail: "FIRRTL을 최적화하고 SystemVerilog로 내린다. -O=release, lowering 옵션은 MFC_ARGS에 고정되어 있다. 끝나면 git log와 git diff가 주석으로 .sv 맨 앞에 붙는다.", where: "Makefile:108-114, 324-326" },
+    verilator: { title: "Verilator", output: "C++ 모델 + difftest C++ (emu.cpp, difftest.cpp, refproxy.cpp …)", detail: "difftest/verilator.mk가 Verilator를 부른다. EMU_THREADS가 0이 아니면 --threads N --threads-dpi all, EMU_TRACE=1/fst면 --trace/--trace-fst가 붙는다.", where: "difftest/verilator.mk:22, 50-64" },
+    emu:       { title: "build/emu", output: "실행 파일 emu", detail: "C++ 컴파일러가 Verilator 출력과 difftest 런타임을 링크한다. 실행할 때 -i 이미지와 --diff REF를 받는다.", where: "Makefile:382-386 · README.md:128-136" },
+    run:       { title: "emu 실행 + DiffTest", output: "HIT GOOD TRAP / ABORT, IPC, 성능 카운터, (선택) 파형·DB", detail: "커밋마다 REF(NEMU .so)를 한 걸음 실행해 비교한다.", where: "difftest/src/test/csrc/emu/emu.cpp" },
+    chirrtl:   { title: "CHIRRTL 출력", output: "build/rtl/SimTop.fir", detail: "GOALS가 sim-chirrtl·gsim이면 CHISEL_TARGET이 chirrtl이 되어 엘라보레이션 직후 멈춘다. firtool을 거치지 않는다.", where: "Makefile:80-92" },
+    gsim:      { title: "GSIM 컴파일", output: "GSIM이 만든 C++ emu", detail: "GSIM은 CHIRRTL을 직접 읽어 C++ 시뮬레이터를 만든다. make gsim은 difftest emu GSIM=1을 부른다. CI 성능 테스트가 이 길을 쓴다.", where: "Makefile:388-390" },
+    vcs:       { title: "VCS simv", output: "simv", detail: "make simv는 같은 sim-verilog 결과를 Synopsys VCS로 컴파일한다. CI의 SIMV - Basics가 원격 서버에서 이 길을 쓴다.", where: "Makefile:392-397 · emu.yml:271-303" },
+    pldm:      { title: "Palladium", output: "에뮬레이터 빌드", detail: "PLDM=1이면 디버그 인자를 쓰고, make pldm-build·pldm-run·pldm-debug가 difftest의 palladium.mk를 부른다.", where: "Makefile:264-281, 406-413" },
+    xstop:     { title: "make verilog", output: "build/rtl/XSTop.sv (칩용)", detail: "mill로 top.TopMain을 실행해 DiffTest 프로브가 없는 칩용 최상위 XSTop을 만든다. 기본은 RELEASE_ARGS(--fpga-platform --reset-gen …)를 쓴다.", where: "Makefile:244-268, 305-315" },
+  };
+  const FLOW_PATHS = {
+    verilator: ["chisel", "elaborate", "firtool", "verilator", "emu", "run"],
+    gsim: ["chisel", "elaborate", "chirrtl", "gsim", "run"],
+    vcs: ["chisel", "elaborate", "firtool", "vcs", "run"],
+    pldm: ["chisel", "elaborate", "firtool", "pldm", "run"],
+    chip: ["chisel", "elaborate", "firtool", "xstop"],
+  };
+  let flowBackend = "verilator", flowSelected = "chisel", flowPulse = 0, flowBoxes = [];
+  const flowView = MB.canvas("#cv-flow", { aspect: 0.3, minHeight: 210, maxHeight: 260, draw: drawFlow });
+  function drawFlow(ctx, width, height) {
+    const path = FLOW_PATHS[flowBackend];
+    const isNarrow = width < 620;
+    const columns = isNarrow ? 3 : path.length;
+    const rows = Math.ceil(path.length / columns);
+    const gap = isNarrow ? 16 : 22;
+    const boxWidth = (width - 24 - gap * (columns - 1)) / columns;
+    const boxHeight = Math.min(64, (height - 30 - (rows - 1) * 28) / rows);
+    flowBoxes = [];
+    path.forEach((id, index) => {
+      const column = index % columns, row = Math.floor(index / columns);
+      flowBoxes.push({ id, x: 12 + column * (boxWidth + gap), y: 18 + row * (boxHeight + 28), w: boxWidth, h: boxHeight });
+    });
+    // 화살표
+    for (let i = 0; i < flowBoxes.length - 1; i++) {
+      const a = flowBoxes[i], b = flowBoxes[i + 1];
+      if (Math.abs(a.y - b.y) < 1) MB.arrow(ctx, a.x + a.w + 2, a.y + a.h / 2, b.x - 2, b.y + b.h / 2, MB.css("text-faint"), 1.4, 6);
+      else MB.arrow(ctx, a.x + a.w / 2, a.y + a.h + 2, b.x + b.w / 2, b.y - 2, MB.css("text-faint"), 1.4, 6);
+    }
+    flowBoxes.forEach((box, index) => {
+      const isSelected = box.id === flowSelected;
+      ctx.fillStyle = isSelected ? MB.css("accent-soft") : MB.css("surface");
+      MB.roundRect(ctx, box.x, box.y, box.w, box.h, 10); ctx.fill();
+      ctx.strokeStyle = isSelected ? MB.css("accent") : MB.css("border"); ctx.lineWidth = isSelected ? 2 : 1; ctx.stroke();
+      MB.text(ctx, String(index + 1).padStart(2, "0"), box.x + 8, box.y + 12, { size: 10, mono: true, color: MB.css("text-faint") });
+      MB.text(ctx, FLOW_STAGES[box.id].title, box.x + box.w / 2, box.y + box.h / 2 + 4, { align: "center", size: isNarrow ? 11 : 12.5, weight: 700, color: isSelected ? MB.css("accent") : MB.css("text") });
+    });
+    // 흐르는 점
+    if (flowBoxes.length > 1) {
+      const total = flowBoxes.length - 1;
+      const position = (flowPulse % 1) * total;
+      const k = Math.floor(position), t = position - k;
+      const a = flowBoxes[k], b = flowBoxes[Math.min(k + 1, total)];
+      const x = a.x + a.w / 2 + (b.x + b.w / 2 - a.x - a.w / 2) * t, y = a.y + a.h / 2 + (b.y + b.h / 2 - a.y - a.h / 2) * t;
+      ctx.fillStyle = MB.css("accent-2"); ctx.beginPath(); ctx.arc(x, y + a.h / 2 - 6, 4, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+  function paintFlowInfo() {
+    const stage = FLOW_STAGES[flowSelected];
+    document.getElementById("flow-info").innerHTML = `<b>${stage.title}</b> — ${stage.detail}<br><span class="dim small">출력: <code>${stage.output}</code> · 위치: <code>${stage.where}</code></span>`;
+  }
+  flowView.onPointer("click", (x, y) => {
+    const hit = flowBoxes.find((box) => x >= box.x && x <= box.x + box.w && y >= box.y && y <= box.y + box.h);
+    if (hit) { flowSelected = hit.id; paintFlowInfo(); flowView.redraw(); }
+  });
+  MB.seg("#flow-backend", (value) => {
+    flowBackend = value;
+    if (!FLOW_PATHS[value].includes(flowSelected)) flowSelected = FLOW_PATHS[value][FLOW_PATHS[value].length - 1];
+    paintFlowInfo(); flowView.redraw();
+  });
+  MB.loop(document.getElementById("sim-flow"), (dt) => { flowPulse += dt * 0.18; flowView.redraw(); });
+  paintFlowInfo();
+
+  /* ======================================================== 그림 15-2: make 명령 조립대 */
+  const makeInputs = ["make-target", "make-config", "make-cores", "make-threads", "make-trace", "make-dramsim", "make-chiseldb", "make-constantin", "make-noperf", "make-release"].map((id) => document.getElementById(id));
+  function paintMake() {
+    const value = (id) => document.getElementById(id).value;
+    const isChecked = (id) => document.getElementById(id).checked;
+    const target = value("make-target");
+    const isSimulation = target !== "verilog";
+    const parts = ["make", target, `CONFIG=${value("make-config")}`];
+    if (value("make-cores") !== "1") parts.push(`NUM_CORES=${value("make-cores")}`);
+    if (target === "emu") parts.push(`EMU_THREADS=${value("make-threads")}`);
+    if (target === "emu" && value("make-trace")) parts.push(`EMU_TRACE=${value("make-trace")}`);
+    const flags = [["make-dramsim", "WITH_DRAMSIM3=1", "--with-dramsim3", "Makefile:192-197 · DRAMSIM3_HOME이 있어야 한다"], ["make-chiseldb", "WITH_CHISELDB=1", "--with-chiseldb", "Makefile:205-207"], ["make-constantin", "WITH_CONSTANTIN=1", "--with-constantin", "Makefile:230-232"], ["make-noperf", "DISABLE_PERF=1", "--disable-perf", "Makefile:220-222 · XSPerf 카운터를 모두 뺀다"], ["make-release", "RELEASE=1", "--fpga-platform --reset-gen …", "Makefile:244-252 · DiffTest 프로브가 빠진다"]];
+    const notes = [];
+    flags.forEach(([id, variable, argument, where]) => {
+      if (!isChecked(id)) return;
+      parts.push(variable);
+      if (isSimulation) notes.push(`<div class="note added"><code>${variable}</code> → Chisel 인자 <code>${argument}</code> <span class="dim">(${where})</span></div>`);
+    });
+    if (isSimulation && !isChecked("make-release")) notes.push(`<div class="note added">RELEASE가 아니므로 DEBUG_ARGS의 <code>--enable-difftest</code>가 붙어 DiffTest 프로브가 RTL에 남는다 <span class="dim">(Makefile:247-252)</span></div>`);
+    if (target === "emu") {
+      const threads = +value("make-threads");
+      notes.push(threads === 0 ? `<div class="note">EMU_THREADS=0이면 Verilator가 단일 스레드 모델을 만든다</div>` : `<div class="note added">Verilator 옵션 <code>--threads ${threads} --threads-dpi all</code> <span class="dim">(difftest/verilator.mk:63-64)</span></div>`);
+      if (value("make-trace")) notes.push(`<div class="note added">Verilator 옵션 <code>${value("make-trace") === "fst" ? "--trace-fst" : "--trace"}</code>. 실행 때 <code>--dump-wave</code>와 <code>-b</code>/<code>-e</code>로 구간을 정해야 실제로 기록된다 <span class="dim">(difftest/verilator.mk:50-55)</span></div>`);
+      if (isChecked("make-release")) notes.push(`<div class="note warn">RELEASE=1로 지은 emu에는 DiffTest 프로브가 없다. 실행할 때 REF와 비교할 수 없다</div>`);
+    }
+    if (target === "verilog") {
+      notes.push(`<div class="note">verilog 목표는 top.TopMain으로 칩용 XSTop을 만든다. 기본 RELEASE_ARGS가 쓰이므로 DiffTest 프로브가 없다 <span class="dim">(Makefile:264-268, 305-315)</span></div>`);
+      if (flags.some(([id]) => isChecked(id) && id !== "make-release")) notes.push(`<div class="note warn">WITH_* · DISABLE_PERF는 SIM_ARGS에만 붙으므로 verilog 목표에는 영향이 없다</div>`);
+    }
+    if (value("make-config") === "DefaultConfig" && target !== "verilog") notes.push(`<div class="note">DefaultConfig는 L2 2MB, L3(OpenLLC) 32MB 구성이라(Configs.scala:581-586) 빌드와 시뮬레이션이 무겁다. README 예시는 MinimalConfig를 쓴다</div>`);
+    document.getElementById("make-command").textContent = parts.join(" ");
+    document.getElementById("make-notes").innerHTML = notes.join("");
+  }
+  makeInputs.forEach((element) => element.addEventListener("change", paintMake));
+  paintMake();
+
+  /* ======================================================== 그림 15-3: DiffTest lock-step */
+  const PROGRAM_BASE = 0x80000000;
+  const INSTRUCTION_BYTES = 4;
+  const STORE_ADDRESS = 0x80001000;
+  const GOOD_TRAP_CODE = 0;
+  const PROGRAM = [
+    { op: "li", rd: "a0", immediate: 0, text: "li   a0, 0" },
+    { op: "li", rd: "a1", immediate: 5, text: "li   a1, 5" },
+    { op: "li", rd: "t0", immediate: STORE_ADDRESS, text: "li   t0, 0x80001000" },
+    { op: "add", rd: "a0", source1: "a0", source2: "a1", text: "add  a0, a0, a1" },
+    { op: "addi", rd: "a1", source1: "a1", immediate: -1, text: "addi a1, a1, -1" },
+    { op: "bnez", source1: "a1", target: 3, text: "bnez a1, loop" },
+    { op: "sw", source: "a0", base: "t0", text: "sw   a0, 0(t0)" },
+    { op: "csrw", csr: "mscratch", source: "a0", text: "csrw mscratch, a0" },
+    { op: "li", rd: "a0", immediate: GOOD_TRAP_CODE, text: "li   a0, 0" },
+    { op: "trap", text: "trap (a0 = 0이면 GOOD)" },
+  ];
+  const REGISTER_NAMES = ["a0", "a1", "t0"];
+  /** 비교 항목마다 그것을 지키는 실제 프로브 이름 */
+  const PROBE_OF_FIELD = { PC: "DiffInstrCommit", a0: "DiffPhyIntRegState + DiffArchIntRenameTable", a1: "DiffPhyIntRegState + DiffArchIntRenameTable", t0: "DiffPhyIntRegState + DiffArchIntRenameTable", mscratch: "DiffCSRState", store: "DiffStoreEvent" };
+  /** 버그마다 '어느 명령을 몇 번째로 실행할 때' 망가뜨리는지 정한다. */
+  const BUGS = {
+    none: null,
+    add: { index: 3, when: (state) => state.registers.a1 === 3, label: "add (a1 = 3 반복)" },
+    branch: { index: 5, when: (state) => state.registers.a1 === 2, label: "bnez (a1 = 2 반복)" },
+    store: { index: 6, when: () => true, label: "sw" },
+    csr: { index: 7, when: () => true, label: "csrw mscratch" },
+  };
+  const hex = (value) => "0x" + (value >>> 0).toString(16);
+  const formatRegister = (name, value) => (name === "t0" ? hex(value) : String(value));
+
+  function createMachine() {
+    return { pc: 0, registers: { a0: 0, a1: 0, t0: 0 }, csr: { mscratch: 0 }, memory: {}, isHalted: false };
+  }
+  /** 명령 하나를 실행하고 커밋 기록을 돌려준다. bug가 있으면 그 명령에서 결과를 망가뜨린다. */
+  function executeOne(machine, bug) {
+    const index = machine.pc;
+    const instruction = PROGRAM[index];
+    const isBuggy = bug && bug.index === index && bug.when(machine);
+    const record = { pc: PROGRAM_BASE + index * INSTRUCTION_BYTES, text: instruction.text, write: null, store: null, csr: null, isTrap: false, isBuggy };
+    let nextPc = index + 1;
+    if (instruction.op === "li") {
+      machine.registers[instruction.rd] = instruction.immediate;
+      record.write = [instruction.rd, instruction.immediate];
+    } else if (instruction.op === "add") {
+      let value = machine.registers[instruction.source1] + machine.registers[instruction.source2];
+      if (isBuggy) value += 1;
+      machine.registers[instruction.rd] = value;
+      record.write = [instruction.rd, value];
+    } else if (instruction.op === "addi") {
+      const value = machine.registers[instruction.source1] + instruction.immediate;
+      machine.registers[instruction.rd] = value;
+      record.write = [instruction.rd, value];
+    } else if (instruction.op === "bnez") {
+      let isTaken = machine.registers[instruction.source1] !== 0;
+      if (isBuggy) isTaken = !isTaken;
+      if (isTaken) nextPc = instruction.target;
+    } else if (instruction.op === "sw") {
+      let value = machine.registers[instruction.source];
+      if (isBuggy) value ^= 0x10;
+      const address = machine.registers[instruction.base];
+      machine.memory[address] = value;
+      record.store = [address, value];
+    } else if (instruction.op === "csrw") {
+      if (!isBuggy) machine.csr[instruction.csr] = machine.registers[instruction.source];
+      record.csr = [instruction.csr, machine.csr[instruction.csr]];
+    } else if (instruction.op === "trap") {
+      record.isTrap = true;
+      machine.isHalted = true;
+      nextPc = index;
+    }
+    machine.pc = nextPc;
+    return record;
+  }
+
+  let bugName = "none", device, reference, deviceLog, referenceLog, status, caughtAt, plantedAt;
+  function resetDifftest() {
+    device = createMachine(); reference = createMachine();
+    deviceLog = []; referenceLog = []; status = "running"; caughtAt = null; plantedAt = null;
+    paintDifftest(null);
+  }
+  /** 두 모델을 한 걸음씩 움직이고 비교한다. 비교 항목 목록을 돌려준다. */
+  function stepDifftest() {
+    if (status !== "running") return null;
+    const deviceRecord = executeOne(device, BUGS[bugName]);
+    const referenceRecord = executeOne(reference, null);
+    if (deviceRecord.isBuggy && plantedAt === null) plantedAt = deviceLog.length + 1;
+    deviceLog.push(deviceRecord); referenceLog.push(referenceRecord);
+    const rows = [{ field: "PC", device: hex(deviceRecord.pc), reference: hex(referenceRecord.pc) }];
+    REGISTER_NAMES.forEach((name) => rows.push({ field: name, device: formatRegister(name, device.registers[name]), reference: formatRegister(name, reference.registers[name]) }));
+    rows.push({ field: "mscratch", device: String(device.csr.mscratch), reference: String(reference.csr.mscratch) });
+    const deviceStore = deviceRecord.store ? `[${hex(deviceRecord.store[0])}] ← ${deviceRecord.store[1]}` : "—";
+    const referenceStore = referenceRecord.store ? `[${hex(referenceRecord.store[0])}] ← ${referenceRecord.store[1]}` : "—";
+    rows.push({ field: "store", device: deviceStore, reference: referenceStore });
+    rows.forEach((row) => (row.isDifferent = row.device !== row.reference));
+    const isMismatch = rows.some((row) => row.isDifferent);
+    deviceRecord.isMismatch = isMismatch; referenceRecord.isMismatch = isMismatch;
+    if (isMismatch) { status = "aborted"; caughtAt = deviceLog.length; }
+    else if (deviceRecord.isTrap) status = device.registers.a0 === GOOD_TRAP_CODE ? "good" : "bad";
+    return rows;
+  }
+  function logHtml(log) {
+    return log.map((record, index) => {
+      const className = record.isMismatch ? "mismatch" : record.isTrap ? "trap" : "match";
+      const mark = record.isMismatch ? "✗" : "✓";
+      let effect = "";
+      if (record.write) effect = `${record.write[0]}=${formatRegister(record.write[0], record.write[1])}`;
+      if (record.store) effect = `mem[${hex(record.store[0])}]=${record.store[1]}`;
+      if (record.csr) effect = `${record.csr[0]}=${record.csr[1]}`;
+      return `<li class="${className}"><span class="mark">${mark}</span><span>${index + 1}</span><span class="pc">${hex(record.pc).slice(-4)}</span><span>${record.text}</span><span class="dim">${effect}</span></li>`;
+    }).join("");
+  }
+  function paintDifftest(rows) {
+    const deviceList = document.getElementById("difftest-dut"), referenceList = document.getElementById("difftest-ref");
+    deviceList.innerHTML = logHtml(deviceLog); referenceList.innerHTML = logHtml(referenceLog);
+    deviceList.scrollTop = deviceList.scrollHeight; referenceList.scrollTop = referenceList.scrollHeight;
+    const last = deviceLog[deviceLog.length - 1];
+    document.getElementById("difftest-registers").innerHTML = REGISTER_NAMES.map((name) =>
+      `<span class="${last && last.write && last.write[0] === name ? "changed" : ""}">${name} = ${formatRegister(name, device.registers[name])}</span>`).join("") +
+      `<span>mscratch = ${device.csr.mscratch}</span><span>mem[0x80001000] = ${device.memory[STORE_ADDRESS] === undefined ? "—" : device.memory[STORE_ADDRESS]}</span>`;
+    MB.set("difftest-count", deviceLog.length);
+    const stateText = { running: "실행 중", aborted: "ABORT · 불일치", good: "HIT GOOD TRAP", bad: "HIT BAD TRAP" }[status];
+    MB.set("difftest-state", stateText, status === "good" ? "good" : status === "aborted" ? "bad" : "");
+    MB.set("difftest-planted", bugName === "none" ? "없음" : plantedAt ? `${plantedAt}번째 커밋` : `${BUGS[bugName].label} 대기`);
+    MB.set("difftest-caught", caughtAt ? `${caughtAt}번째 커밋` : "—", caughtAt ? "bad" : "");
+    const panel = document.getElementById("difftest-diff");
+    if (status === "aborted" && rows) {
+      const gap = caughtAt - plantedAt;
+      panel.innerHTML = `<b>DiffTest가 ${caughtAt}번째 커밋(PC ${hex(deviceLog[caughtAt - 1].pc)})에서 멈췄다.</b> ` +
+        (gap > 0 ? `버그는 ${plantedAt}번째 커밋에 심겼지만 그 명령 자체는 비교 항목을 바꾸지 않아 ${gap}커밋 뒤에야 드러났다.` : "버그가 심긴 바로 그 명령에서 잡혔다.") +
+        `<table class="diff-table"><tr><th>항목</th><th>DUT</th><th>REF</th><th>지키는 프로브</th></tr>` +
+        rows.map((row) => `<tr><td>${row.field}</td><td class="${row.isDifferent ? "bad" : "good"}">${row.device}</td><td>${row.reference}</td><td class="probe">${PROBE_OF_FIELD[row.field]}</td></tr>`).join("") + "</table>";
+    } else if (status === "good") {
+      panel.innerHTML = bugName === "none" ? "<b>HIT GOOD TRAP.</b> 끝까지 모든 커밋이 일치했다. 합은 15다. DiffTrapEvent가 종료를 알린다." : "<b>HIT GOOD TRAP.</b> 버그가 비교 항목에 닿지 않았다.";
+    } else if (last) {
+      panel.textContent = `${deviceLog.length}번째 커밋 '${last.text}' — PC와 레지스터, CSR, store가 모두 일치한다.`;
+    }
+  }
+  MB.seg("#difftest-bug", (value) => { bugName = value; resetDifftest(); });
+  document.getElementById("difftest-reset").onclick = resetDifftest;
+  document.getElementById("difftest-step").onclick = () => paintDifftest(stepDifftest());
+  const MAXIMUM_COMMITS = 64;
+  document.getElementById("difftest-run").onclick = () => {
+    let rows = null;
+    for (let k = 0; k < MAXIMUM_COMMITS && status === "running"; k++) rows = stepDifftest();
+    paintDifftest(rows);
+  };
+  let autoClock = 0;
+  const SECONDS_PER_COMMIT = 0.45;
+  const difftestLoop = MB.loop(document.getElementById("sim-difftest"), (dt) => {
+    autoClock += dt;
+    if (autoClock < SECONDS_PER_COMMIT) return;
+    autoClock = 0;
+    if (status !== "running") { difftestLoop.running = false; paintPlay(); return; }
+    paintDifftest(stepDifftest());
+  });
+  difftestLoop.running = false;
+  const paintPlay = MB.playButton("difftest-play", difftestLoop, ["⏸ 멈춤", "▶ 자동"]);
+  resetDifftest();
+
+  /* ======================================================== 그림 15-4: 프로브 표 */
+  const STATE_COLUMNS = ["PC·명령", "정수 레지스터", "FP·벡터 레지스터", "CSR", "예외·인터럽트", "store·메모리", "load", "캐시 리필", "TLB 변환", "원자·LR/SC", "종료"];
+  const PROBES = [
+    { name: "DiffInstrCommit", columns: [0], isMandatory: true, where: "backend/rob/Rob.scala:1743", note: "커밋 폭만큼 만든다. pc, instr, 쓴 레지스터 번호, skip, isRVC 등을 보낸다." },
+    { name: "DiffArchEvent", columns: [4], isMandatory: true, where: "backend/fu/NewCSR/NewCSR.scala:1678", note: "interrupt·exception 원인과 예외 PC를 보낸다. REF가 같은 트랩을 일으키게 한다." },
+    { name: "DiffTrapEvent", columns: [10], isMandatory: true, where: "backend/rob/Rob.scala:1808", note: "시뮬레이션 종료 명령(GOOD/BAD TRAP), cycleCnt, instrCnt, WFI." },
+    { name: "DiffCSRState", columns: [3], isMandatory: true, where: "backend/fu/NewCSR/NewCSR.scala:1697", note: "privilegeMode, mstatus, mepc, mtvec, mcause, satp, mip, mie 등 18개 CSR." },
+    { name: "DiffPhyIntRegState", columns: [1], isMandatory: true, where: "backend/datapath/DataPath.scala:365", note: "물리 정수 레지스터 파일 전체. 리네임 테이블과 함께 아키텍처 값으로 복원된다." },
+    { name: "DiffArchIntRenameTable", columns: [1], isMandatory: false, where: "backend/rename/RenameTable.scala:243", note: "아키텍처 레지스터 32개가 어느 물리 레지스터를 가리키는지. numPhyRegs > 32일 때만 쓴다." },
+    { name: "DiffPhyFpRegState / Vec", columns: [2], isMandatory: false, where: "backend/datapath/DataPath.scala:393, 497", note: "부동소수·벡터 물리 레지스터. 리네임 테이블(Fp/Vec)과 함께 쓴다." },
+    { name: "DiffFpCSRState / VecCSRState / HCSRState", columns: [3], isMandatory: false, where: "backend/fu/NewCSR/NewCSR.scala:1732-1746", note: "fcsr, 벡터 CSR(vl, vtype …), 하이퍼바이저 CSR." },
+    { name: "DiffStoreEvent", columns: [5], isMandatory: false, where: "mem/sbuffer/Sbuffer.scala:940", note: "커밋된 store의 주소·데이터·마스크. REF의 store와 비교한다." },
+    { name: "DiffSbufferEvent", columns: [5], isMandatory: false, where: "mem/sbuffer/Sbuffer.scala:773", note: "스토어 버퍼가 캐시로 내보낸 64바이트 줄. 골든 메모리를 갱신한다." },
+    { name: "DiffLoadEvent", columns: [6], isMandatory: false, where: "backend/rob/Rob.scala:1785", note: "커밋된 load의 물리 주소와 종류. MMIO 등 REF가 모르는 값을 맞추는 데 쓴다." },
+    { name: "DiffRefillEvent", columns: [7], isMandatory: false, where: "cache/dcache/mainpipe/MissQueue.scala:1990", note: "캐시가 다시 채운 줄의 데이터를 골든 메모리와 비교한다. ICache, DCache, L2TLB에 있다." },
+    { name: "DiffL1TLBEvent / L2TLBEvent", columns: [8], isMandatory: false, where: "cache/mmu/TLB.scala:783 · L2TLB.scala:695", note: "가상 페이지 번호 → 물리 페이지 번호 변환 결과를 REF의 페이지 테이블 탐색과 비교한다." },
+    { name: "DiffAtomicEvent / LrScEvent", columns: [9, 5], isMandatory: false, where: "mem/pipeline/AtomicsUnit.scala:594, 609", note: "AMO 연산의 입력·출력, SC 성공 여부." },
+    { name: "DiffNonRegInterruptPendingEvent", columns: [4], isMandatory: false, where: "backend/fu/NewCSR/NewCSR.scala:1792", note: "레지스터가 아닌 외부 신호로 들어오는 인터럽트 대기 상태(플랫폼 인터럽트 등)." },
+  ];
+  const BUG_PROBES = {
+    none: [],
+    regfile: { probe: "DiffArchIntRenameTable", columns: [1], text: "리네임 매핑이 틀리면 리네임 테이블과 물리 레지스터 값으로 복원한 아키텍처 레지스터가 REF와 달라진다." },
+    csr: { probe: "DiffCSRState", columns: [3], text: "CSR 쓰기를 빠뜨리면 다음 비교에서 DiffCSRState 값이 어긋난다." },
+    store: { probe: "DiffStoreEvent", columns: [5], text: "스토어 데이터가 틀리면 커밋된 store를 REF와 비교하는 DiffStoreEvent가 먼저 잡는다. 스토어 버퍼가 줄을 내보낼 때 DiffSbufferEvent도 골든 메모리를 확인한다." },
+    refill: { probe: "DiffRefillEvent", columns: [7], text: "캐시가 틀린 데이터로 줄을 채우면, 그 값을 load가 쓰기 전에도 DiffRefillEvent가 골든 메모리와 비교해 잡는다." },
+    tlb: { probe: "DiffL1TLBEvent / L2TLBEvent", columns: [8], text: "주소 변환이 틀리면 TLB 이벤트 프로브가 REF의 페이지 테이블 탐색 결과와 비교해 잡는다." },
+    interrupt: { probe: "DiffArchEvent", columns: [4], text: "인터럽트를 받아야 할 때 받지 않으면, REF와 트랩 시점이 달라 DiffArchEvent 비교나 다음 PC 비교에서 드러난다." },
+  };
+  let probeBug = "none", probeSelected = 0, probeLayout = null;
+  const probeView = MB.canvas("#cv-probes", { aspect: 0.62, minHeight: 440, maxHeight: 560, draw: drawProbes });
+  function drawProbes(ctx, width, height) {
+    const isNarrow = width < 640;
+    const labelWidth = isNarrow ? 150 : 270;
+    const top = isNarrow ? 92 : 76;
+    const columnWidth = (width - labelWidth - 12) / STATE_COLUMNS.length;
+    const rowHeight = (height - top - 8) / PROBES.length;
+    probeLayout = { labelWidth, top, columnWidth, rowHeight };
+    const bug = BUG_PROBES[probeBug];
+    STATE_COLUMNS.forEach((name, column) => {
+      const x = labelWidth + column * columnWidth + columnWidth / 2;
+      ctx.save(); ctx.translate(x, top - 6); ctx.rotate(-Math.PI / 3.2);
+      const isBugColumn = bug && bug.columns && bug.columns.includes(column);
+      MB.text(ctx, name, 0, 0, { size: isNarrow ? 9.5 : 11, color: isBugColumn ? MB.css("bad") : MB.css("text-dim"), weight: isBugColumn ? 700 : 400 });
+      ctx.restore();
+    });
+    PROBES.forEach((probe, row) => {
+      const y = top + row * rowHeight;
+      const isSelected = row === probeSelected;
+      const isBugProbe = bug && bug.probe === probe.name;
+      if (isSelected || isBugProbe) {
+        ctx.fillStyle = isBugProbe ? MB.alpha(MB.css("bad"), 0.12) : MB.css("accent-soft");
+        ctx.fillRect(0, y, width, rowHeight);
+      }
+      const label = isNarrow && probe.name.length > 22 ? probe.name.slice(0, 21) + "…" : probe.name;
+      MB.text(ctx, label, 6, y + rowHeight / 2, { size: isNarrow ? 9.5 : 11.5, mono: true, weight: probe.isMandatory ? 700 : 400, color: isBugProbe ? MB.css("bad") : MB.css("text") });
+      STATE_COLUMNS.forEach((_, column) => {
+        const x = labelWidth + column * columnWidth;
+        const isCovered = probe.columns.includes(column);
+        ctx.fillStyle = isCovered ? (isBugProbe ? MB.css("bad") : MB.css("accent-2")) : MB.css("surface");
+        MB.roundRect(ctx, x + 2, y + 2, columnWidth - 4, rowHeight - 4, 4); ctx.fill();
+        if (isCovered && probe.isMandatory) { ctx.strokeStyle = MB.css("text"); ctx.lineWidth = 1.5; ctx.stroke(); }
+      });
+    });
+  }
+  function paintProbeInfo() {
+    const probe = PROBES[probeSelected];
+    const bug = BUG_PROBES[probeBug];
+    let html = `<b class="mono">${probe.name}</b> ${probe.isMandatory ? '<span class="pill">필수</span>' : '<span class="pill">선택</span>'} — ${probe.note}<br><span class="dim small">위치: <code>src/main/scala/xiangshan/${probe.where}</code></span>`;
+    if (bug && bug.probe) html = `<b>버그 → ${bug.probe}</b>: ${bug.text}<br>` + html;
+    document.getElementById("probe-info").innerHTML = html;
+  }
+  probeView.onPointer("click", (x, y) => {
+    if (!probeLayout) return;
+    const row = Math.floor((y - probeLayout.top) / probeLayout.rowHeight);
+    if (row >= 0 && row < PROBES.length) { probeSelected = row; paintProbeInfo(); probeView.redraw(); }
+  });
+  MB.seg("#probe-bug", (value) => {
+    probeBug = value;
+    const bug = BUG_PROBES[value];
+    if (bug && bug.probe) probeSelected = Math.max(0, PROBES.findIndex((probe) => probe.name === bug.probe));
+    paintProbeInfo(); probeView.redraw();
+  });
+  paintProbeInfo();
+
+  /* ======================================================== 그림 15-5: emu 명령 조립대 */
+  const EMU_PRESETS = {
+    readme: { image: "./ready-to-run/coremark-2-iteration.bin", reference: "nemu", window: "0,0", maximum: 0, warmup: 0, wave: false, fork: false, database: false, noSquash: false },
+    perf: { image: "spec06/gcc_166_checkpoint.zstd", reference: "nemu", window: "", maximum: 5000000, warmup: 0, wave: false, fork: false, database: false, noSquash: false },
+    debug: { image: "./ready-to-run/coremark-2-iteration.bin", reference: "nemu", window: "120000,121000", maximum: 0, warmup: 0, wave: true, fork: false, database: false, noSquash: true },
+    lightsss: { image: "./ready-to-run/coremark-2-iteration.bin", reference: "nemu", window: "", maximum: 0, warmup: 0, wave: false, fork: true, database: false, noSquash: false },
+  };
+  const emuElements = {
+    image: document.getElementById("emu-image"), reference: document.getElementById("emu-ref"), window: document.getElementById("emu-window"),
+    maximum: document.getElementById("emu-max"), warmup: document.getElementById("emu-warmup"), wave: document.getElementById("emu-wave"),
+    fork: document.getElementById("emu-fork"), database: document.getElementById("emu-db"), noSquash: document.getElementById("emu-nosquash"),
+  };
+  function loadEmuPreset(name) {
+    const preset = EMU_PRESETS[name];
+    emuElements.image.value = preset.image; emuElements.reference.value = preset.reference; emuElements.window.value = preset.window;
+    emuElements.maximum.value = preset.maximum; emuElements.warmup.value = preset.warmup; emuElements.wave.checked = preset.wave;
+    emuElements.fork.checked = preset.fork; emuElements.database.checked = preset.database; emuElements.noSquash.checked = preset.noSquash;
+    paintEmu();
+  }
+  function paintEmu() {
+    const parts = ["./build/emu"];
+    const notes = [];
+    const windowText = emuElements.window.value.trim();
+    let hasWindow = false;
+    if (windowText) {
+      const [begin, end] = windowText.split(",").map((text) => text.trim());
+      if (begin !== undefined && begin !== "") { parts.push(`-b ${begin}`); hasWindow = true; }
+      if (end !== undefined && end !== "") parts.push(`-e ${end}`);
+      if (begin === "0" && end === "0") { hasWindow = false; notes.push(`<div class="note">-b 0 -e 0은 로그 구간을 비워 사이클별 로그를 찍지 않는다(README 예시)</div>`); }
+    }
+    parts.push(`-i ${emuElements.image.value || "&lt;image&gt;"}`);
+    if (emuElements.reference.value === "nemu") parts.push("--diff ./ready-to-run/riscv64-nemu-interpreter-so");
+    else { parts.push("--no-diff"); notes.push(`<div class="note warn">--no-diff는 비교를 끈다. 성능만 볼 때 쓰지만, 그 실행은 올바름을 보장하지 않는다</div>`); }
+    if (+emuElements.maximum.value > 0) parts.push(`-I ${emuElements.maximum.value}`);
+    if (+emuElements.warmup.value > 0) parts.push(`-W ${emuElements.warmup.value}`);
+    if (+emuElements.warmup.value > 0 && +emuElements.maximum.value > 0 && +emuElements.warmup.value >= +emuElements.maximum.value) notes.push(`<div class="note warn">워밍업 명령 수가 최대 명령 수보다 크거나 같으면 측정할 구간이 남지 않는다</div>`);
+    if (emuElements.wave.checked) { parts.push("--dump-wave"); notes.push(`<div class="note">파형은 빌드할 때 EMU_TRACE를 켜야 기록할 수 있고, -b/-e 구간에서만 찍힌다</div>`); if (!hasWindow) notes.push(`<div class="note warn">--dump-wave를 켰지만 로그 구간(-b/-e)이 없어 파형이 비어 있을 수 있다</div>`); }
+    if (emuElements.fork.checked) {
+      parts.push("--enable-fork", "-X 10");
+      notes.push(`<div class="note added">LightSSS: 10초마다 fork해 스냅숏을 남긴다(-X, 기본 10초). 실패하면 오래된 스냅숏이 파형과 함께 다시 돈다</div>`);
+      if (hasWindow || emuElements.wave.checked) notes.push(`<div class="note warn">difftest README: --enable-fork를 -b, -e, --dump-wave 같은 디버깅 옵션과 함께 쓰면 동작이 정의되지 않는다</div>`);
+    }
+    if (emuElements.database.checked) { parts.push("--dump-db"); notes.push(`<div class="note">ChiselDB 기록은 WITH_CHISELDB=1로 빌드한 emu에서만 생긴다</div>`); }
+    if (emuElements.noSquash.checked) { parts.push("--no-squash"); notes.push(`<div class="note">스쿼시를 끄면 커밋마다 비교해 느려지지만, 어긋난 명령을 정확히 짚는다</div>`); }
+    document.getElementById("emu-command").innerHTML = parts.join(" ");
+    document.getElementById("emu-notes").innerHTML = notes.join("") || `<div class="note">문제없는 조합이다.</div>`;
+  }
+  Object.values(emuElements).forEach((element) => { element.addEventListener("input", paintEmu); element.addEventListener("change", paintEmu); });
+  MB.seg("#emu-preset", loadEmuPreset);
+  loadEmuPreset("readme");
+
+  /* ======================================================== 그림 15-6: LightSSS 시간축 */
+  const SLOT_SIZE = 2;                 // difftest/config/config.h:88
+  const STEP_FORWARD_CYCLES = 100;     // difftest/config/config.h:103
+  let forkInterval = 10, abortTime = 73;
+  /** 처음 한 번 바로 fork하고, 이후 interval마다 fork한다. 자리가 차면 가장 오래된 자식을 죽인다. */
+  function computeSnapshots() {
+    const forks = [];
+    for (let time = 0; time < abortTime; time += forkInterval) forks.push(time);
+    const alive = forks.slice(-SLOT_SIZE);
+    return { forks, alive, oldest: alive[0] };
+  }
+  const lightsssView = MB.canvas("#cv-lightsss", { aspect: 0.3, minHeight: 200, maxHeight: 250, draw: drawLightsss });
+  function drawLightsss(ctx, width, height) {
+    const result = computeSnapshots();
+    const left = 40, right = width - 20, maximumTime = 120;
+    const sx = (t) => left + (t / maximumTime) * (right - left);
+    const parentY = height * 0.32, childY = height * 0.58, replayY = height * 0.8;
+    MB.text(ctx, "부모", 6, parentY, { size: 11, color: MB.css("text-dim") });
+    MB.text(ctx, "자식", 6, childY, { size: 11, color: MB.css("text-dim") });
+    MB.text(ctx, "재실행", 4, replayY, { size: 10.5, color: MB.css("text-dim") });
+    ctx.strokeStyle = MB.css("accent-2"); ctx.lineWidth = 4; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(sx(0), parentY); ctx.lineTo(sx(abortTime), parentY); ctx.stroke();
+    ctx.lineCap = "butt";
+    MB.text(ctx, "✗ ABORT", sx(abortTime) + 4, parentY - 12, { size: 11.5, weight: 800, color: MB.css("bad") });
+    ctx.strokeStyle = MB.css("bad"); ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(sx(abortTime), parentY - 6); ctx.lineTo(sx(abortTime), replayY + 8); ctx.stroke(); ctx.setLineDash([]);
+    result.forks.forEach((time) => {
+      const isAlive = result.alive.includes(time);
+      const isOldest = time === result.oldest;
+      ctx.strokeStyle = MB.css("border"); ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(sx(time), parentY); ctx.lineTo(sx(time), childY); ctx.stroke();
+      ctx.fillStyle = isOldest ? MB.css("accent") : isAlive ? MB.css("accent-2") : MB.css("text-faint");
+      ctx.beginPath(); ctx.arc(sx(time), childY, isAlive ? 6 : 3.5, 0, Math.PI * 2); ctx.fill();
+    });
+    ctx.fillStyle = MB.alpha(MB.css("accent"), 0.25);
+    MB.roundRect(ctx, sx(result.oldest), replayY - 8, Math.max(3, sx(abortTime) - sx(result.oldest)), 16, 5); ctx.fill();
+    ctx.strokeStyle = MB.css("accent"); ctx.lineWidth = 1.5; ctx.stroke();
+    const replayLabel = `파형 켜고 ${abortTime - result.oldest}초 구간 재실행 (+${STEP_FORWARD_CYCLES}사이클)`;
+    ctx.font = `700 11px ${MB.css("font")}`;
+    const labelX = Math.max(left, Math.min(sx(result.oldest) + 6, right - ctx.measureText(replayLabel).width));
+    MB.text(ctx, replayLabel, labelX, replayY + 20, { size: 11, color: MB.css("accent"), weight: 700 });
+    for (let t = 0; t <= maximumTime; t += 20) MB.text(ctx, `${t}s`, sx(t), height - 8, { align: "center", size: 10, mono: true, color: MB.css("text-faint") });
+  }
+  function paintLightsss() {
+    const result = computeSnapshots();
+    MB.set("lightsss-count", `${result.forks.length}개`);
+    MB.set("lightsss-alive", `${result.alive.length} / ${SLOT_SIZE}`);
+    MB.set("lightsss-oldest", `${result.oldest}초`);
+    MB.set("lightsss-window", `${abortTime - result.oldest}초`);
+    lightsssView.redraw();
+  }
+  MB.range("fork-interval", (value) => { forkInterval = value; paintLightsss(); }, (value) => `${value}초`);
+  MB.range("abort-time", (value) => { abortTime = value; paintLightsss(); }, (value) => `${value}초`);
+  paintLightsss();
+
+  /* ======================================================== 그림 15-7: SimPoint */
+  const PHASES = [
+    { name: "초기화", cpi: 0.62, signature: [0.9, 0.1, 0.1, 0.3, 0.1, 0.1] },
+    { name: "정수 루프", cpi: 0.45, signature: [0.2, 0.9, 0.2, 0.1, 0.1, 0.2] },
+    { name: "포인터 추적", cpi: 2.6, signature: [0.1, 0.2, 0.9, 0.2, 0.8, 0.1] },
+    { name: "부동소수", cpi: 0.9, signature: [0.1, 0.2, 0.1, 0.9, 0.2, 0.7] },
+  ];
+  /** [국면 번호, 구간 수] 순서로 프로그램을 만든다. 모두 200구간이다. */
+  const SCHEDULE = [[0, 12], [1, 40], [2, 30], [1, 30], [3, 36], [2, 22], [1, 20], [3, 10]];
+  const SIGNATURE_NOISE = 0.16, CPI_NOISE = 0.12, KMEANS_ITERATIONS = 25;
+  const PROGRAM_SEED = 7, CLUSTER_SEED = 3;
+  function makeProgram(seed) {
+    const random = MB.rng(seed);
+    const intervals = [];
+    SCHEDULE.forEach(([phase, length]) => {
+      for (let i = 0; i < length; i++) {
+        const source = PHASES[phase];
+        intervals.push({ phase, signature: source.signature.map((value) => value + (random() - 0.5) * SIGNATURE_NOISE), cpi: source.cpi * (1 + (random() - 0.5) * CPI_NOISE) });
+      }
+    });
+    return intervals;
+  }
+  function squaredDistance(a, b) { let sum = 0; for (let i = 0; i < a.length; i++) { const d = a[i] - b[i]; sum += d * d; } return sum; }
+  /** k-means++로 시작점을 고르고 묶은 뒤, 묶음마다 중심에 가장 가까운 구간을 대표로 고른다. */
+  function clusterIntervals(intervals, k, seed) {
+    const random = MB.rng(seed);
+    const centroids = [intervals[Math.floor(random() * intervals.length)].signature.slice()];
+    while (centroids.length < k) {
+      const weights = intervals.map((interval) => Math.min(...centroids.map((centroid) => squaredDistance(interval.signature, centroid))));
+      const total = weights.reduce((a, b) => a + b, 0);
+      let remaining = random() * total, index = 0;
+      for (; index < weights.length - 1; index++) { remaining -= weights[index]; if (remaining <= 0) break; }
+      centroids.push(intervals[index].signature.slice());
+    }
+    let assignment = new Array(intervals.length).fill(0);
+    for (let iteration = 0; iteration < KMEANS_ITERATIONS; iteration++) {
+      assignment = intervals.map((interval) => {
+        let best = 0, bestDistance = Infinity;
+        centroids.forEach((centroid, j) => { const d = squaredDistance(interval.signature, centroid); if (d < bestDistance) { bestDistance = d; best = j; } });
+        return best;
+      });
+      centroids.forEach((centroid, j) => {
+        const members = intervals.filter((_, i) => assignment[i] === j);
+        if (!members.length) return;
+        for (let d = 0; d < centroid.length; d++) centroid[d] = members.reduce((sum, member) => sum + member.signature[d], 0) / members.length;
+      });
+    }
+    const clusters = centroids.map((centroid, j) => {
+      const members = intervals.map((_, i) => i).filter((i) => assignment[i] === j);
+      let representative = members[0], bestDistance = Infinity;
+      members.forEach((i) => { const d = squaredDistance(intervals[i].signature, centroid); if (d < bestDistance) { bestDistance = d; representative = i; } });
+      return { index: j, members, representative, weight: members.length / intervals.length };
+    }).filter((cluster) => cluster.members.length);
+    return { assignment, clusters };
+  }
+  const program = makeProgram(PROGRAM_SEED);
+  const trueCpi = program.reduce((sum, interval) => sum + interval.cpi, 0) / program.length;
+  let simpointK = 4, simpointMethod = "cluster", simpointResult = null;
+  const CLUSTER_COLORS = ["accent", "accent-2", "ok", "warn", "bad", "text-dim", "accent", "accent-2", "ok", "warn"];
+  function computeSimpoint() {
+    if (simpointMethod === "cluster") {
+      const result = clusterIntervals(program, simpointK, CLUSTER_SEED);
+      const estimate = result.clusters.reduce((sum, cluster) => sum + cluster.weight * program[cluster.representative].cpi, 0);
+      return { assignment: result.assignment, representatives: result.clusters.map((cluster) => cluster.representative), estimate };
+    }
+    const step = program.length / simpointK;
+    const representatives = [];
+    for (let i = 0; i < simpointK; i++) representatives.push(Math.floor(i * step + step / 2));
+    const estimate = representatives.reduce((sum, i) => sum + program[i].cpi, 0) / simpointK;
+    return { assignment: program.map((_, i) => Math.min(simpointK - 1, Math.floor(i / step))), representatives, estimate };
+  }
+  const simpointView = MB.canvas("#cv-simpoint", { aspect: 0.36, minHeight: 220, maxHeight: 320, draw: drawSimpoint });
+  function drawSimpoint(ctx, width, height) {
+    if (!simpointResult) return;
+    const left = 36, right = width - 10, top = 24, bottom = height - 30;
+    const maximumCpi = 3.2;
+    const barWidth = (right - left) / program.length;
+    const sy = (value) => bottom - (value / maximumCpi) * (bottom - top);
+    [0, 1, 2, 3].forEach((value) => {
+      ctx.strokeStyle = MB.css("grid"); ctx.beginPath(); ctx.moveTo(left, sy(value)); ctx.lineTo(right, sy(value)); ctx.stroke();
+      MB.text(ctx, String(value), left - 6, sy(value), { align: "right", size: 10, mono: true, color: MB.css("text-faint") });
+    });
+    MB.text(ctx, "구간 CPI", left, top - 12, { size: 11, color: MB.css("text-dim") });
+    const representativeSet = new Set(simpointResult.representatives);
+    program.forEach((interval, i) => {
+      const color = MB.css(CLUSTER_COLORS[simpointResult.assignment[i] % CLUSTER_COLORS.length]);
+      const isRepresentative = representativeSet.has(i);
+      ctx.fillStyle = isRepresentative ? color : MB.alpha(color, 0.45);
+      ctx.fillRect(left + i * barWidth, sy(interval.cpi), Math.max(1, barWidth - 0.5), bottom - sy(interval.cpi));
+      if (isRepresentative) {
+        ctx.strokeStyle = MB.css("text"); ctx.lineWidth = 1.5;
+        ctx.strokeRect(left + i * barWidth - 1, sy(interval.cpi) - 1, Math.max(3, barWidth + 1), bottom - sy(interval.cpi) + 1);
+        MB.text(ctx, "▼", left + i * barWidth + barWidth / 2, sy(interval.cpi) - 9, { align: "center", size: 10, color: MB.css("text") });
+      }
+    });
+    [[trueCpi, "참값", "text"], [simpointResult.estimate, "추정", "accent"]].forEach(([value, label, color]) => {
+      ctx.strokeStyle = MB.css(color); ctx.lineWidth = 1.5; ctx.setLineDash(label === "참값" ? [] : [5, 4]);
+      ctx.beginPath(); ctx.moveTo(left, sy(value)); ctx.lineTo(right, sy(value)); ctx.stroke(); ctx.setLineDash([]);
+      const isTruth = label === "참값";
+      MB.text(ctx, `${label} ${value.toFixed(3)}`, isTruth ? left + 4 : right - 4, sy(value) + (isTruth ? 9 : -7), { align: isTruth ? "left" : "right", size: 11, weight: 700, color: MB.css(color), mono: true });
+    });
+    MB.text(ctx, "프로그램 진행 (구간 200개) →", left, height - 10, { size: 10.5, color: MB.css("text-faint") });
+  }
+  function paintSimpoint() {
+    simpointResult = computeSimpoint();
+    const error = (simpointResult.estimate - trueCpi) / trueCpi;
+    MB.set("simpoint-truth", trueCpi.toFixed(3));
+    MB.set("simpoint-estimate", simpointResult.estimate.toFixed(3));
+    MB.set("simpoint-error", `${error >= 0 ? "+" : ""}${(100 * error).toFixed(1)}%`, Math.abs(error) < 0.02 ? "good" : Math.abs(error) > 0.1 ? "bad" : "");
+    MB.set("simpoint-cost", `${simpointResult.representatives.length} / ${program.length}`);
+    simpointView.redraw();
+  }
+  MB.range("simpoint-k", (value) => { simpointK = value; paintSimpoint(); });
+  MB.seg("#simpoint-method", (value) => { simpointMethod = value; paintSimpoint(); });
+  paintSimpoint();
+
+  /* ======================================================== 그림 15-8: CI 지도 */
+  const CI_WORKFLOWS = [
+    { name: "EMU Basics", file: "emu-basics.yml", trigger: "push · PR", job: "Verilator 8스레드 + PGO로 emu 하나를 짓고(OpenLLC, FST 파형), 작업 부하 13개를 행렬로 나눠 돌린다.", tests: ["cputest", "riscv-tests", "misc-tests", "rvh-tests", "microbench", "coremark", "linux-hello-opensbi", "iopmp-test", "povray", "copy_and_run", "f16_test", "zcb-test", "frontend-misc-test"], where: "emu-basics.yml:54-60, 85-109" },
+    { name: "EMU Misc Test", file: "emu.yml", trigger: "push · PR", job: "GSIM emu로 Linux 부팅, 이상적 프런트엔드(SimFrontend)로 SPEC06 일부, 멀티코어(MC) SMP Linux, ZhuJiang LLC CoreMark, VCS simv, 생성된 Verilog 검사(check-verilog)까지 돌린다.", tests: ["EMU - GSIM", "EMU - SimFrontend", "EMU - MC", "EMU - ZhuJiang", "SIMV - Basics", "Check Docker", "Check Verilog"], where: "emu.yml:44-378" },
+    { name: "EMU Performance", file: "emu-performance.yml", trigger: "push · PR", job: "GSIM + DRAMsim3로 emu를 짓고, 체크포인트 JSON에서 고른 SPEC06 체크포인트를 각각 500만 명령씩 돌려 IPC를 모은다. GSIM이 LightSSS를 아직 지원하지 않아 --disable-fork를 쓴다.", tests: ["ckpt_select.py", "--max-instr 5000000", "--disable-fork", "IPC 보고서"], where: "emu-performance.yml:67-144" },
+    { name: "Nightly Regression", file: "nightly.yml", trigger: "cron 33 15 * * *", job: "매일 무작위 체크포인트로 성능 검사와 퍼즈 검사를 돌리고, 이전 커밋 결과와 비교한 보고서를 만든다.", tests: ["Run Performance Test", "Run Fuzz Test", "Diff with previous result"], where: "nightly.yml:1-84" },
+    { name: "Weekly Regression", file: "weekly.yml", trigger: "cron 0 10 * * 5", job: "매주 SPEC06(GCC16, XSCC 컴파일)과 SPEC17 성능 검사를 돌린다.", tests: ["SPEC06 GCC16", "SPEC06 XSCC", "SPEC17 GCC16"], where: "weekly.yml:1-39" },
+  ];
+  let ciSelected = 0, ciBoxes = [];
+  const ciView = MB.canvas("#cv-ci", { aspect: 0.36, minHeight: 250, maxHeight: 320, draw: drawCi });
+  function drawCi(ctx, width, height) {
+    const isNarrow = width < 600;
+    const rowHeight = (height - 20) / CI_WORKFLOWS.length;
+    const triggerX = 8, triggerWidth = isNarrow ? width * 0.3 : width * 0.22;
+    const fileX = triggerX + triggerWidth + 26, fileWidth = isNarrow ? width - fileX - 8 : width * 0.3;
+    const jobX = fileX + fileWidth + 26;
+    ciBoxes = [];
+    CI_WORKFLOWS.forEach((workflow, i) => {
+      const y = 10 + i * rowHeight;
+      const isSelected = i === ciSelected;
+      ctx.fillStyle = MB.css("surface"); MB.roundRect(ctx, triggerX, y + 4, triggerWidth, rowHeight - 8, 8); ctx.fill();
+      MB.text(ctx, workflow.trigger, triggerX + triggerWidth / 2, y + rowHeight / 2, { align: "center", size: isNarrow ? 9.5 : 11, mono: true, color: MB.css("text-dim") });
+      MB.arrow(ctx, triggerX + triggerWidth + 4, y + rowHeight / 2, fileX - 4, y + rowHeight / 2, MB.css("text-faint"), 1.2, 6);
+      ctx.fillStyle = isSelected ? MB.css("accent-soft") : MB.css("bg-elev");
+      MB.roundRect(ctx, fileX, y + 4, fileWidth, rowHeight - 8, 8); ctx.fill();
+      ctx.strokeStyle = isSelected ? MB.css("accent") : MB.css("border"); ctx.lineWidth = isSelected ? 2 : 1; ctx.stroke();
+      MB.text(ctx, workflow.name, fileX + 10, y + rowHeight / 2 - 7, { size: isNarrow ? 11 : 12.5, weight: 700, color: isSelected ? MB.css("accent") : MB.css("text") });
+      MB.text(ctx, workflow.file, fileX + 10, y + rowHeight / 2 + 9, { size: 10, mono: true, color: MB.css("text-faint") });
+      ciBoxes.push({ x: fileX, y: y + 4, w: fileWidth, h: rowHeight - 8, index: i });
+      if (!isNarrow) {
+        MB.arrow(ctx, fileX + fileWidth + 4, y + rowHeight / 2, jobX - 4, y + rowHeight / 2, MB.css("text-faint"), 1.2, 6);
+        const count = workflow.tests.length;
+        const dotSpace = Math.min(16, (width - jobX - 16) / Math.max(1, count));
+        workflow.tests.forEach((_, k) => {
+          ctx.fillStyle = isSelected ? MB.css("accent") : MB.css("accent-2");
+          ctx.beginPath(); ctx.arc(jobX + 6 + k * dotSpace, y + rowHeight / 2, 5, 0, Math.PI * 2); ctx.fill();
+        });
+        MB.text(ctx, `${count}개`, jobX + 6 + count * dotSpace + 4, y + rowHeight / 2, { size: 11, mono: true, color: MB.css("text-dim") });
+      }
+    });
+  }
+  function paintCi() {
+    const workflow = CI_WORKFLOWS[ciSelected];
+    document.getElementById("ci-info").innerHTML = `<b>${workflow.name}</b> (<code>.github/workflows/${workflow.file}</code>, 트리거 ${workflow.trigger}) — ${workflow.job} <span class="dim small">(${workflow.where})</span>`;
+    document.getElementById("ci-tests").innerHTML = workflow.tests.map((test) => `<span>${test}</span>`).join("");
+    ciView.redraw();
+  }
+  ciView.onPointer("click", (x, y) => {
+    const hit = ciBoxes.find((box) => x >= box.x && x <= box.x + box.w && y >= box.y && y <= box.y + box.h);
+    if (hit) { ciSelected = hit.index; paintCi(); }
+  });
+  paintCi();
+})();
+</script>
+</body>
+</html>

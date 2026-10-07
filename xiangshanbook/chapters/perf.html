@@ -1,0 +1,770 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>성능 카운터와 Top-down · XiangShanBook</title>
+<meta name="description" content="XiangShan kunminghu-v3의 하드웨어 성능 카운터(mhpmcounter·mhpmevent), 이벤트 결합 연산, 카운터 오버플로 인터럽트와 표본 추출, 시뮬레이션 전용 XSPerf 카운터, 그리고 슬롯마다 원인을 매기는 Top-down 분석을 코드로 따라간다.">
+<link rel="icon" type="image/svg+xml" href="../favicon.svg">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/common.js"></script>
+<style>
+  .grid-form { display: grid; gap: 10px 18px; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); padding: 14px 18px; border-top: 1px solid var(--border); }
+  .grid-form label { font-size: 14px; color: var(--text-dim); display: grid; gap: 4px; }
+  .grid-form select, .grid-form input[type="text"] { font: inherit; font-size: 13.5px; padding: 6px 9px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg-elev); color: var(--text); font-family: var(--mono); min-width: 0; }
+  .hexout { font-family: var(--mono); font-size: 14px; padding: 10px 18px; border-top: 1px solid var(--border); word-break: break-all; }
+  .hexout b { color: var(--accent); }
+  .counter-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(78px, 1fr)); gap: 5px; padding: 14px 18px; }
+  .counter-grid button { font: inherit; font-family: var(--mono); font-size: 12px; padding: 6px 4px; border-radius: 7px; border: 1px solid var(--border); background: var(--surface); color: var(--text); cursor: pointer; }
+  .counter-grid button.on { outline: 2px solid var(--text); }
+  .counter-grid button[data-block="frontend"] { border-color: var(--accent); }
+  .counter-grid button[data-block="backend"] { border-color: var(--accent-2); }
+  .counter-grid button[data-block="memblock"] { border-color: var(--ok); }
+  .counter-grid button[data-block="l2"] { border-color: var(--warn); }
+  .rule-list { display: grid; gap: 6px; padding: 12px 18px; }
+  .rule-list label { display: flex; gap: 8px; align-items: center; font-size: 14px; color: var(--text-dim); cursor: pointer; }
+  .rule-list select { font: inherit; font-size: 13px; padding: 3px 6px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg-elev); color: var(--text); }
+  .profile-card { border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; background: var(--bg); }
+  .profile-table { width: 100%; border-collapse: collapse; font-size: 13px; font-family: var(--mono); }
+  .profile-table td { padding: 3px 6px; border-bottom: 1px solid var(--border); }
+  .profile-table td.n { text-align: right; }
+  .answer-row { display: flex; flex-wrap: wrap; gap: 6px; padding: 12px 18px; border-top: 1px solid var(--border); }
+  .answer-row button.right { border-color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }
+  .answer-row button.wrong { border-color: var(--bad); background: color-mix(in srgb, var(--bad) 12%, transparent); }
+</style>
+</head>
+<body data-chapter="perf">
+<main class="chapter">
+  <header class="chapter-hero">
+    <div class="eyebrow">Chapter 14</div>
+    <h1>성능 카운터와 Top-down</h1>
+    <p class="lead">"이 프로그램은 왜 느린가?"에 답하려면 먼저 세어야 한다. 캐시 미스가 몇 번 났는지, 분기 예측이 몇 번 틀렸는지, 디코더가 몇 사이클이나 굶었는지를 세는 것이다. XiangShan 곤명호 v3에는 이런 사건을 세는 장치가 두 벌 있다. 하나는 실리콘에 그대로 남아 운영체제가 읽는 <b>하드웨어 성능 카운터</b>(HPM)다. 다른 하나는 시뮬레이션에서만 켜는 수천 개의 <b>디버그 카운터</b>다. 이 장에서는 카운터 하나가 이벤트를 고르고 더하는 회로를 직접 조작해 보고, 사이클마다 버려진 디코드 슬롯에 이유를 붙이는 <b>Top-down 분석</b>이 코드에서 어떻게 이루어지는지 따라간다.</p>
+    <ul class="objectives">
+      <li><code>mhpmcounter3~31</code> 29개가 프런트엔드·백엔드·메모리 블록·L2 중 어디의 사건을 세는지 짝짓는다.</li>
+      <li><code>mhpmevent</code> 64비트 안의 이벤트 선택 4칸과 결합 연산 3칸을 직접 인코딩해 본다.</li>
+      <li>카운터 오버플로가 <code>OF</code> 비트와 LCOFI 인터럽트로 이어지는 과정과, 이를 이용한 표본 추출을 실험한다.</li>
+      <li>디스패치 슬롯마다 정체 원인을 고르는 우선순위 규칙과, Top-down 원인 목록의 구조를 설명한다.</li>
+      <li>카운터 묶음을 보고 병목이 프런트엔드·백엔드·메모리·잘못된 추측 중 어디인지 짚어 낸다.</li>
+    </ul>
+  </header>
+
+  <!-- ============================================================ 1 -->
+  <section id="counters">
+    <h2>29개 카운터, 네 덩어리</h2>
+    <p>RISC-V는 카운터 자리를 32개 마련해 두었다. 0번 <code>mcycle</code>은 사이클, 2번 <code>minstret</code>은 커밋된 명령어 수를 센다. 1번은 <code>time</code>이 차지하므로 M 모드 카운터는 없다. 남은 3~31번 29개가 <span class="term">하드웨어 성능 카운터</span><span class="en">(HPM, mhpmcounter)</span>다. 각 카운터에는 짝이 되는 <code>mhpmevent</code> 레지스터가 있어, 무엇을 셀지 소프트웨어가 정한다.</p>
+    <p>곤명호 v3는 29개를 코어의 네 덩어리에 나눠 준다. <code>NewCSR.scala</code>의 주석이 그대로 말해 준다. "perf number: 29 (frontend 8, ctrlblock 8, memblock 8, huancun 5)". 프런트엔드는 <code>hpmevent.take(8)</code>, 백엔드는 <code>slice(8, 16)</code>, 메모리 블록은 <code>slice(16, 24)</code>, L2 캐시는 <code>slice(24, 29)</code>를 가져가 자기 이벤트 중에서 고른다. 그래서 같은 이벤트 번호라도 어느 카운터에 쓰느냐에 따라 다른 사건을 가리킨다.</p>
+    <figure class="play" id="fig-map">
+      <div class="counter-grid" id="cm-grid"></div>
+      <div class="play-view"><canvas id="cv-map"></canvas></div>
+      <div class="info-panel" id="cm-info">카운터를 눌러 보자.</div>
+      <figcaption><span class="try">눌러 보기</span>칸 하나가 카운터 하나다. 테두리 색은 그 카운터에 이벤트를 대 주는 덩어리다. 빨강은 프런트엔드, 파랑은 백엔드(CtrlBlock), 초록은 메모리 블록, 노랑은 L2다. 카운터를 누르면 아래 그림에서 그 <code>mhpmevent</code> 값이 어느 모듈의 <code>HPerfMonitor</code>로 가는지, 그리고 그 모듈의 이벤트 목록에서 몇 번을 골라 다시 CSR로 돌아오는지가 강조된다. 덩어리별 이벤트 목록은 빌드 때 <code>printEventCoding</code>을 켜면 출력된다.</figcaption>
+    </figure>
+    <div class="callout code"><strong>덩어리마다 자기 몫의 mhpmevent를 가져간다</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/frontend/Frontend.scala:279</span>
+<span class="k">private val</span> csrevents = pfevent.io.hpmevent.take(8)
+<span class="k">private val</span> perfFromUnits = Seq(ifu, ibuffer, icache, ftq).flatMap(_.getPerfEvents)
+<span class="c">// let index = 0 be no event</span>
+<span class="k">private val</span> allPerfEvents = Seq((<span class="s">"noEvent"</span>, 0.U)) ++ perfFromUnits ++ perfFromIO ++ perfBlock ++ perfFromITLB
+<span class="k">override val</span> perfEvents = HPerfMonitor(csrevents, allPerfInc).getPerfEvents
+<span class="c">// src/main/scala/xiangshan/backend/Backend.scala:693</span>
+<span class="k">val</span> csrevents = pfevent.io.hpmevent.slice(8,16)
+<span class="c">// src/main/scala/xiangshan/mem/MemBlock.scala:1534</span>
+<span class="k">val</span> csrevents = pfevent.io.hpmevent.slice(16,24)</code></pre>
+    </div>
+  </section>
+
+  <!-- ============================================================ 2 -->
+  <section id="event">
+    <h2>mhpmevent 안의 작은 계산기</h2>
+    <p>보통의 성능 카운터는 이벤트 하나를 고른다. 곤명호 v3의 <code>mhpmevent</code>는 이벤트를 <b>네 개</b> 고르고, 이를 연산자 세 개로 묶는다. <code>utility</code> 라이브러리의 <code>HPerfCounter</code>가 그 회로다. 10비트 칸 네 개(<code>EVENT0~3</code>)가 이벤트 번호이고, 5비트 칸 세 개(<code>OPTYPE0~2</code>)가 연산자다. 연산자는 OR(0), AND(1), XOR(2), ADD(4) 넷이다. 트리 모양으로 계산된다. EVENT0과 EVENT1을 OPTYPE0으로, EVENT2와 EVENT3을 OPTYPE1으로 묶고, 두 결과를 OPTYPE2로 다시 묶는다.</p>
+    <p>이 덕분에 카운터 하나로 "ICache 미스이면서 IBuffer가 비어 있던 사이클"(AND)이나 "두 이벤트의 합"(ADD)을 셀 수 있다. 위쪽 비트에는 모드별 금지 비트(<code>MINH</code>·<code>SINH</code>·<code>UINH</code>·<code>VSINH</code>·<code>VUINH</code>)와 오버플로 표시 <code>OF</code>가 있다. 이벤트 값은 1비트가 아니라 6비트 <code>PerfEvent</code>라서, 한 사이클에 여러 번 일어난 사건(예: 커밋된 명령어 수)도 한 번에 더할 수 있다.</p>
+    <div class="callout code"><strong>HPerfCounter: 네 이벤트, 세 연산자, 두 단 파이프라인</strong>
+<pre><code><span class="c">// utility/src/main/scala/utility/HardwarePerfMonitor.scala:52</span>
+<span class="k">val</span> events_incr_0 = RegNext(io.events_sets(io.hpm_event( 9,  0)))
+<span class="k">val</span> events_incr_1 = RegNext(io.events_sets(io.hpm_event(19, 10)))
+<span class="k">val</span> events_incr_2 = RegNext(io.events_sets(io.hpm_event(29, 20)))
+<span class="k">val</span> events_incr_3 = RegNext(io.events_sets(io.hpm_event(39, 30)))
+<span class="k">def</span> combineEvents(cnt_1: UInt, cnt_2: UInt, optype: UInt): UInt =
+  Mux(optype(0), cnt_1 &amp; cnt_2,
+  Mux(optype(1), cnt_1 ^ cnt_2,
+  Mux(optype(2), cnt_1 + cnt_2,
+                 cnt_1 | cnt_2)))
+<span class="k">val</span> event_step_0 = combineEvents(events_incr_0.value, events_incr_1.value, event_op_0)
+<span class="k">val</span> event_step_1 = combineEvents(events_incr_2.value, events_incr_3.value, event_op_1)
+<span class="k">val</span> selected = combineEvents(event_step_0_reg, event_step_1_reg, event_op_2_reg)</code></pre>
+    </div>
+    <div class="sim" id="sim-encode">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>mhpmevent 인코더 (프런트엔드 카운터)</h3>
+        <div class="seg" id="en-preset"><button data-value="miss" class="on">ICache 미스 횟수</button><button data-value="both" >미스 &amp; 굶주림</button><button data-value="sum">두 줄 요청 합</button></div>
+      </div>
+      <div class="grid-form" id="en-form"></div>
+      <div class="sim-view"><canvas id="cv-encode"></canvas></div>
+      <div class="sim-controls">
+        <div class="ctrl-row"><span class="small dim">이번 사이클에 일어난 일(6비트 이벤트 값):</span></div>
+        <div class="ctrl-row" id="en-values"></div>
+      </div>
+      <div class="hexout" id="en-hex">—</div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">step0 = E0 ∘ E1</span><span class="v" id="en-s0">—</span></div>
+        <div class="stat"><span class="k">step1 = E2 ∘ E3</span><span class="v" id="en-s1">—</span></div>
+        <div class="stat"><span class="k">selected (카운터에 더할 값)</span><span class="v" id="en-sel">—</span></div>
+      </div>
+      <figcaption><span class="try">조립해 보기</span>위 칸에서 이벤트 네 개와 연산자 세 개를 고르면 아래 줄에 64비트 <code>mhpmevent</code> 값이 만들어진다. 이 값을 <code>csrw mhpmevent3, …</code>로 쓰면 된다. 가운데 그림은 그 값이 만드는 결합 트리다. 아래 숫자 칸은 이번 사이클에 각 이벤트가 낸 값이다. 사용하지 않는 칸은 0번 <code>noEvent</code>(늘 0)를 고르고 연산자는 OR로 두면 된다. 이벤트 번호는 <code>Frontend.scala:285</code>의 연결 순서(0번 noEvent, 이어서 IFU 13개, IBuffer 9개, ICache 2개)로 센 값이다. 빌드 옵션이 바뀌면 번호도 바뀔 수 있다. 실제 하드웨어는 이벤트를 고른 뒤 레지스터를 여러 단 거쳐 몇 사이클 늦게 카운터에 더한다.</figcaption>
+    </div>
+  </section>
+
+  <!-- ============================================================ 3 -->
+  <section id="overflow">
+    <h2>넘치면 인터럽트: 표본 추출</h2>
+    <p>카운터는 64비트다. 평소에는 넘칠 일이 없지만, 일부러 넘치게 만들면 쓸모가 생긴다. 카운터에 2<sup>64</sup> − N을 써 두면, 사건이 N번 일어나는 순간 넘친다. 그때 하드웨어가 인터럽트를 걸어 주면, 핸들러는 그 순간의 PC를 기록하고 다시 2<sup>64</sup> − N을 써 둔다. 이것을 반복하면 "사건 N번마다 한 번씩 어디서 일어났는지"를 모을 수 있다. 리눅스 <code>perf record</code>가 쓰는 <span class="term">표본 추출</span><span class="en">(sampling)</span>이다.</p>
+    <p>곤명호 v3는 이를 위한 <b>Sscofpmf</b> 확장을 구현한다. <code>mhpmcounter</code>에 사건 값을 더할 때 맨 위 자리올림이 생기면 오버플로다. 그 순간 해당 <code>mhpmevent.OF</code>가 아직 0이었다면 <b>LCOFI</b>(로컬 카운터 오버플로 인터럽트, 13번)를 요청하고 <code>OF</code>를 1로 잠근다. 핸들러가 <code>OF</code>를 지우기 전까지는 같은 카운터가 다시 넘쳐도 인터럽트를 또 걸지 않는다. 카운터에 직접 쓰는 것으로는 오버플로가 생기지 않는다. 하드웨어가 더할 때만 생긴다.</p>
+    <div class="callout code"><strong>더하기, 자리올림, 그리고 OF</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/backend/fu/NewCSR/MachineLevel.scala:383</span>
+<span class="k">val</span> countingInhibit = <span class="k">this</span>.mcountinhibit.asUInt(num) | !countingEn
+<span class="k">val</span> counterAdd = reg.ALL.asUInt +&amp; perf.value
+<span class="k">when</span> (w.wen) { reg := w.wdata
+}.elsewhen (perf.value =/= 0.U &amp;&amp; !countingInhibit) { reg := counterAdd.tail(1) }
+toMhpmeventOF := !countingInhibit &amp; counterAdd.head(1)
+<span class="c">// src/main/scala/xiangshan/backend/fu/NewCSR/NewCSR.scala:1398</span>
+lcofiReqVec(i) := ofFromPerfCntVec(i) &amp;&amp; !mhpmevent.OF.asBool
+countingEn(i) := (privState.isModeM &amp;&amp; !mhpmevent.MINH) || (privState.isModeHS &amp;&amp; !mhpmevent.SINH) || ...</code></pre>
+    </div>
+    <div class="sim" id="sim-sample">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>오버플로 표본 추출</h3>
+        <button class="btn sm" id="sp-play">▶ 실행</button><button class="btn sm" id="sp-reset">⏮ 처음</button>
+      </div>
+      <div class="sim-view"><canvas id="cv-sample"></canvas></div>
+      <div class="sim-controls">
+        <label class="ctrl"><span>표본 간격 N <output id="sp-n-out"></output></span><input type="range" id="sp-n" min="2" max="40" step="1" value="12"></label>
+        <label class="ctrl"><span>사이클당 사건 확률 <output id="sp-rate-out"></output></span><input type="range" id="sp-rate" min="0.05" max="1" step="0.05" value="0.4"></label>
+        <div class="ctrl"><span>핸들러가 OF를</span><div class="seg" id="sp-clear"><button data-value="1" class="on">지운다</button><button data-value="0">지우지 않는다</button></div></div>
+        <div class="ctrl"><span>금지 비트</span><div class="ctrl-row"><label class="check"><input type="checkbox" id="sp-uinh"> UINH (U 모드에서 세지 않음)</label></div></div>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">카운터 (2⁶⁴ − 남은 수)</span><span class="v" id="sp-counter" style="font-size:14px">—</span></div>
+        <div class="stat"><span class="k">센 사건</span><span class="v" id="sp-events">0</span></div>
+        <div class="stat"><span class="k">LCOFI 인터럽트</span><span class="v" id="sp-irq">0</span></div>
+        <div class="stat"><span class="k">조용히 넘친 횟수</span><span class="v" id="sp-silent">0</span></div>
+      </div>
+      <figcaption><span class="try">돌려 보기</span>가로축은 사이클이다. 위 띠는 그 사이클의 특권 모드(파랑은 U, 회색은 S)다. 점은 카운터가 센 사건이고, 빨간 세로선은 LCOFI 인터럽트다. 핸들러가 <code>OF</code>를 지우고 카운터를 2<sup>64</sup> − N으로 다시 쓰면 인터럽트 사이마다 사건이 정확히 N개 들어간다. '지우지 않는다'로 바꾸면 첫 인터럽트 뒤로는 카운터가 넘쳐도 인터럽트가 다시 오지 않는다. <code>OF</code>가 1로 잠겨 있기 때문이다. UINH를 켜면 U 모드 구간의 사건은 세지 않는다. 사건 확률은 이 그림만의 가정이다.</figcaption>
+    </div>
+  </section>
+
+  <!-- ============================================================ 4 -->
+  <section id="xsperf">
+    <h2>시뮬레이션 전용 카운터: XSPerf</h2>
+    <p>HPM 카운터는 29개뿐이고, 무엇을 셀지 런타임에 골라야 한다. 설계자는 그보다 훨씬 많은 것을 알고 싶다. 그래서 곤명호 v3 소스 곳곳에는 <code>XSPerfAccumulate</code>, <code>XSPerfHistogram</code>, <code>XSPerfMax</code>, <code>XSPerfRolling</code> 같은 호출이 1,400곳 가까이 박혀 있다(호출 위치 기준이다. 반복문 안의 호출은 카운터를 여러 개 만든다). 이 호출은 각자 64비트 누산 레지스터를 만들고, 시뮬레이션이 끝나면 이름과 값을 출력한다. 단, <code>PerfCounterOptions</code>의 <code>enablePerfPrint</code>가 켜져 있고 호출의 레벨(<code>XSPerfLevel</code>)이 설정한 문턱 이상일 때만 회로가 생긴다(<code>PerfCounterUtils.scala:64</code>). 칩으로 만들 때는 꺼서 면적을 쓰지 않는다.</p>
+    <div class="callout code"><strong>XSPerfAccumulate</strong>
+<pre><code><span class="c">// utility/src/main/scala/utility/PerfCounterUtils.scala:61</span>
+<span class="k">def</span> apply(perfName: String, perfCnt: UInt, perfLevel: XSPerfLevel = XSPerfLevel.VERBOSE)
+         (<span class="k">implicit</span> p: Parameters): Unit = {
+  judgeName(perfName)
+  <span class="k">if</span> (p(PerfCounterOptionsKey).enablePerfPrint &amp;&amp; perfLevel &gt;= p(PerfCounterOptionsKey).perfLevel) {
+    ...
+      <span class="k">val</span> counter = RegInit(0.U(64.W)).suggestName(perfName + <span class="s">"Counter"</span>)
+      next_counter := counter + perfCnt
+      counter := Mux(perfClean, 0.U, next_counter)</code></pre>
+    </div>
+    <p>Top-down 분석에 쓰는 원인별 슬롯 카운터도 이 방식으로 만든다. 디스패치 단계의 슬롯 원인을 원인마다 <code>PopCount</code>해서 <code>XSPerfAccumulate</code>로 쌓는다. 레벨은 <code>CRITICAL</code>이라 가장 낮은 출력 설정에서도 남는다(<code>Dispatch.scala:1263</code>).</p>
+  </section>
+
+  <!-- ============================================================ 5 -->
+  <section id="topdown">
+    <h2>Top-down: 버려진 슬롯에 이유 붙이기</h2>
+    <p>곤명호 v3는 사이클마다 명령어를 최대 8개(<code>RenameWidth = 8</code>, <code>Parameters.scala:82</code>) 디스패치할 수 있다. 사이클 하나에 <span class="term">슬롯</span>이 8칸 있는 셈이다. 실행 시간 동안의 슬롯 총수는 8 × 사이클이다. 이 가운데 실제로 명령어가 지나간 슬롯만 일을 한 것이다. <span class="term">Top-down 분석</span>은 놀고 있는 슬롯 하나하나에 "왜 비었는가"를 붙여, 버려진 슬롯을 원인별로 나눈다. 원인을 모두 합하면 정확히 전체 슬롯 수가 된다. 그래서 "성능 손실의 몇 %가 ICache 미스 때문인가"를 같은 저울로 비교할 수 있다.</p>
+    <p>원인 목록은 <code>package.scala</code>의 <code>TopDownCounters</code> 열거형이다. 주석이 이를 네 무리로 나눈다.</p>
+    <ul>
+      <li><b>frontend</b>: <code>OverrideBubble</code>, <code>TAGEMissBubble</code>, <code>ICacheMissBubble</code>, <code>FetchFragBubble</code> 등. 명령어가 아예 오지 않아 생긴 빈칸이다.</li>
+      <li><b>backend</b>: <code>RobStall</code>, <code>LqStall</code>, <code>IntFlStall</code>, <code>IntIQFullStallAlu</code> 등. 명령어는 왔지만 뒤가 막혀 못 보낸 경우다.</li>
+      <li><b>memblock</b>: <code>LoadL1Stall</code>부터 <code>LoadMemStall</code>까지. 메모리 대기다.</li>
+      <li><b>bad speculation</b>: <code>ControlRedirectStall</code>, <code>FlushedInsts</code> 등. 잘못된 추측의 대가다.</li>
+    </ul>
+    <p>디스패치 <code>fire</code>가 발생한 슬롯은 <code>NoStall</code>이다. 이후 오예측으로 폐기되는 uop도 포함되므로 커밋 여부를 뜻하지 않는다. NoStall 비율은 디스패치 슬롯 사용률이며, 커밋 IPC는 커밋된 명령 수와 사이클 수로 따로 계산한다.</p>
+    <div class="sim" id="sim-slots">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>슬롯 장부 (설명용 모델)</h3>
+        <div class="seg" id="sl-preset"><button data-value="balanced" class="on">고른 혼합</button><button data-value="frontend">프런트엔드 굶주림</button><button data-value="memory">메모리 대기</button><button data-value="branchy">분기 오예측 많음</button></div>
+      </div>
+      <div class="sim-view"><canvas id="cv-slots"></canvas></div>
+      <div class="sim-controls">
+        <button class="btn sm" id="sl-play">⏸ 멈춤</button>
+        <label class="ctrl"><span>슬롯 폭 <output id="sl-width-out"></output></span><input type="range" id="sl-width" min="2" max="8" step="1" value="8"></label>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">사이클</span><span class="v" id="sl-cycles">0</span></div>
+        <div class="stat"><span class="k">디스패치된 슬롯 (NoStall)</span><span class="v" id="sl-dispatched">—</span></div>
+        <div class="stat"><span class="k">디스패치 슬롯 사용률</span><span class="v" id="sl-utilization">—</span></div>
+      </div>
+      <figcaption><span class="try">지켜보기</span>왼쪽 격자는 최근 사이클들이다. 세로 한 줄이 사이클 하나, 칸 하나가 슬롯 하나다. 색은 그 슬롯에 붙은 원인이다. 오른쪽은 누적한 슬롯을 네 무리와 세부 원인으로 나눈 나무다. 막대 길이가 그 원인의 슬롯 비율이다. 원인이 나오는 확률은 <b>이 그림만의 가정</b>이고 실측값이 아니다. 실제 비율은 시뮬레이션에서 <code>XSPerfAccumulate</code> 출력으로 얻는다. 확인할 것은 구조다. 모든 슬롯에 원인이 하나씩 붙고, 그 합은 늘 '폭 × 사이클'과 같다.</figcaption>
+    </div>
+
+    <h3>누구의 탓인가: 원인이 파이프라인을 타고 흐른다</h3>
+    <p>디스패치에서 빈 슬롯을 봤다고 해서 디스패치 탓은 아니다. 디코드가 애초에 명령어를 못 받았다면 원인은 프런트엔드에 있다. 그래서 원인 코드는 프런트엔드 → 디코드 → 리네임 → 디스패치로 명령어와 함께 흘러간다. 단계마다 "앞 단계가 넘긴 원인"과 "내 단계에서 생긴 원인" 중 하나를 고른다. 디스패치 단계의 규칙은 다음 순서다.</p>
+    <ol>
+      <li>슬롯이 실제로 나갔다면 <code>NoStall</code>이다.</li>
+      <li>앞 단계(리네임)가 막혀 있었고 원인이 있으면 앞 단계의 원인을 쓴다.</li>
+      <li>내 단계가 막히거나 거품을 만들었으면 내 원인을 쓴다.</li>
+      <li>앞 단계가 남긴 거품 원인이 있으면 그것을 쓴다.</li>
+      <li>내 단계가 저장해 둔 거품 원인이 있으면 그것을 쓴다.</li>
+      <li>그래도 없으면 <code>BackendOtherCoreStall</code>이다.</li>
+    </ol>
+    <div class="callout code"><strong>디스패치 슬롯의 원인 고르기</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/backend/dispatch/Dispatch.scala:1251</span>
+update := MuxCase(BackendOtherCoreStall.id.U, Seq(
+  (fire                                                 ) -&gt; NoStall.id.U                  ,
+  (prePipeStall &amp;&amp; (prePipeStallReason =/= NoStall.id.U)) -&gt; prePipeStallReason            ,
+  (currentPipeStall                                     ) -&gt; currentPipeStallReason        ,
+  (prePipeBubbleRelease                                 ) -&gt; prePipeBubbleReason           ,
+  (currentPipeBubbleRelease                             ) -&gt; currentPipeBubbleReason       ,
+))
+TopDownCounters.values.foreach(ctr =&gt; XSPerfAccumulate(ctr.toString(), PopCount(stallReason.map(_ === ctr.id.U)), XSPerfLevel.CRITICAL))</code></pre>
+    </div>
+    <figure class="play" id="fig-blame">
+      <div class="rule-list" id="bl-rules"></div>
+      <div class="play-view"><canvas id="cv-blame"></canvas></div>
+      <div class="info-panel" id="bl-info">—</div>
+      <figcaption><span class="try">켜고 꺼 보기</span>다섯 조건과 각 조건이 들고 오는 원인을 고른다. 아래 사다리는 <code>MuxCase</code>를 위에서부터 훑어 처음 참인 줄에서 멈추는 모습이다. 예를 들어 리네임이 정수 프리 리스트가 바닥나 막혔고(IntFlStall), 동시에 디스패치 쪽 이슈 큐도 가득 찼다고 하자. 이때는 2번 줄이 먼저 걸려 슬롯이 IntFlStall로 기록된다. 앞 단계의 정체가 더 근본적인 원인이라고 보는 것이다. 리네임 단계에서도 같은 모양의 규칙으로 디코드의 원인과 자기 원인(리다이렉트, ROB 되감기 등)을 고른다(<code>Rename.scala:863</code> 부근).</figcaption>
+    </figure>
+
+    <h3>메모리 대기 세분하기: TopDownGen</h3>
+    <p>백엔드는 다른 시각의 보조 카운터도 만든다. <code>TopDownGen</code>은 이슈된 마이크로 연산이 적은 사이클(<code>fewUops = 4</code>, 4개 미만)을 "실행 정체"로 센다. 그중 아무것도 이슈되지 않았고 로드가 재시도 중이면 "로드 대기"로 센다. 그리고 그 로드가 L1, L2, L3에서 각각 미스였는지에 따라 단계별로 다시 나눈다. 이 값들은 XSPerf 카운터이면서 <code>perfEvents</code>로도 등록된다. 그래서 HPM 카운터로 고를 수 있다.</p>
+    <figure class="play" id="fig-gen">
+      <div class="play-view"><canvas id="cv-gen"></canvas></div>
+      <div class="play-ctrl">
+        <label class="ctrl"><span>이번 사이클 이슈된 연산 수 <output id="gn-cnt-out"></output></span><input type="range" id="gn-cnt" min="0" max="8" step="1" value="0"></label>
+        <div class="ctrl-row">
+          <label class="check"><input type="checkbox" id="gn-store"> 저장 연산은 이슈 안 됨</label>
+          <label class="check"><input type="checkbox" id="gn-replay" checked> 로드 재시도 할당</label>
+          <label class="check"><input type="checkbox" id="gn-sq"> SQ/스토어 버퍼 가득</label>
+          <label class="check"><input type="checkbox" id="gn-l1" checked> L1 미스</label>
+          <label class="check"><input type="checkbox" id="gn-l2" checked> L2 미스</label>
+          <label class="check"><input type="checkbox" id="gn-l3"> L3 미스</label>
+        </div>
+      </div>
+      <figcaption><span class="try">분류해 보기</span>조건을 바꾸면 이번 사이클에 어느 카운터가 1 오르는지 초록으로 켜진다. <code>MEMSTALL_L2MISS</code>는 <code>MEMSTALL_L1MISS</code>의 부분집합이고, L1MISS는 <code>MEMSTALL_ANY_LOAD</code>의 부분집합이다. 그래서 세 카운터의 차이로 "L1에서만 놓친 대기", "L2까지 놓친 대기"를 계산할 수 있다. 실제 회로에서 로드·저장 판정은 한 사이클 지연된 값으로 하는데(<code>TopDownGen.scala:22</code>), 이 그림은 같은 사이클로 단순화했다.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ============================================================ 6 -->
+  <section id="diagnose">
+    <h2>카운터로 병목 짚기</h2>
+    <p>숫자를 모았다면 읽어야 한다. 아래는 <b>가상의</b> 프로그램 네 개에서 나왔다고 가정한 카운터 묶음이다. 각 묶음에서 가장 큰 병목을 골라 보자. 판단 순서는 Top-down의 정신을 따른다. 먼저 슬롯이 어느 무리에서 가장 많이 버려졌는지 보고, 그다음 그 무리 안의 세부 원인과 보조 카운터로 내려간다.</p>
+    <div class="sim" id="sim-diag">
+      <div class="sim-head"><span class="sim-tag lab">EXERCISE</span><h3>병목 진단 연습</h3>
+        <div class="seg" id="dx-pick"><button data-value="0" class="on">프로그램 A</button><button data-value="1">B</button><button data-value="2">C</button><button data-value="3">D</button></div>
+      </div>
+      <div style="padding:14px 18px" id="dx-card"></div>
+      <div class="sim-view"><canvas id="cv-diag"></canvas></div>
+      <div class="answer-row" id="dx-answers"></div>
+      <div class="info-panel" id="dx-info">답을 골라 보자.</div>
+      <figcaption><span class="try">풀어 보기</span>표의 값은 연습용으로 지어낸 숫자다. 슬롯 비율은 8 × 사이클에 대한 비율이다. instret은 별도로 정한 커밋 명령 수이며, NoStall 슬롯 수와 같지 않다. 그래프는 같은 숫자를 네 무리로 묶어 그린 것이다. 답을 고르면 해설이 나온다.</figcaption>
+    </div>
+  </section>
+
+  <section class="keypoints">
+    <h2>핵심 정리</h2>
+    <ol>
+      <li><code>mhpmcounter3~31</code> 29개는 프런트엔드 8, 백엔드 8, 메모리 블록 8, L2 5개로 나뉜다. 각 덩어리의 <code>HPerfMonitor</code>가 자기 몫의 <code>mhpmevent</code>로 자기 이벤트 목록에서 고른다.</li>
+      <li><code>mhpmevent</code>는 이벤트 번호 4개(10비트씩)와 연산자 3개(OR·AND·XOR·ADD)를 담는다. (E0∘E1)∘(E2∘E3) 트리로 결합한 6비트 값이 매 사이클 카운터에 더해진다. 모드별 금지 비트로 셀 모드를 고른다.</li>
+      <li>카운터를 더하다 자리올림이 생기면 오버플로다. <code>OF</code>가 0이었다면 LCOFI(13번)를 걸고 <code>OF</code>를 잠근다. 이를 이용해 N번마다 표본을 뜬다.</li>
+      <li><code>XSPerfAccumulate</code> 등은 시뮬레이션 전용 카운터로, 설정에 따라 회로 자체가 생기지 않는다. Top-down 원인 카운터도 이것으로 만든다.</li>
+      <li>Top-down은 '폭 × 사이클' 슬롯 하나하나에 원인 하나를 붙인다. 원인은 단계를 따라 흐르고, 단계마다 '나감 → 앞 단계 정체 → 내 정체 → 앞 거품 → 내 거품 → 기타' 순으로 고른다.</li>
+    </ol>
+  </section>
+
+  <section id="quiz">
+    <h2>확인 퀴즈</h2>
+    <div class="quiz">
+      <div class="quiz-q" data-answer="2"><p>Q1. <code>mhpmcounter20</code>은 어느 덩어리의 이벤트를 셀 수 있는가?</p><div class="opts">
+        <button class="opt">프런트엔드</button><button class="opt">백엔드</button><button class="opt">메모리 블록</button><button class="opt">L2</button></div>
+        <div class="quiz-exp">카운터 3~10은 프런트엔드(take(8)), 11~18은 백엔드(slice(8,16)), 19~26은 메모리 블록(slice(16,24)), 27~31은 L2(slice(24,29))다. 20은 메모리 블록이다.</div></div>
+      <div class="quiz-q" data-answer="1"><p>Q2. OPTYPE0 = AND(1), OPTYPE1 = OR(0), OPTYPE2 = ADD(4)이다. 이번 사이클 E0 = 1, E1 = 0, E2 = 1, E3 = 1이다. 카운터에 더해지는 값은?</p><div class="opts">
+        <button class="opt">0</button><button class="opt">1</button><button class="opt">2</button><button class="opt">3</button></div>
+        <div class="quiz-exp">step0 = 1 AND 0 = 0, step1 = 1 OR 1 = 1, selected = 0 + 1 = 1.</div></div>
+      <div class="quiz-q" data-answer="0"><p>Q3. 카운터가 넘쳐 LCOFI를 받았는데 핸들러가 해당 <code>mhpmevent.OF</code>를 지우지 않았다. 카운터가 다시 넘치면?</p><div class="opts">
+        <button class="opt">인터럽트가 다시 오지 않는다</button><button class="opt">인터럽트가 다시 온다</button><button class="opt">카운터가 멈춘다</button></div>
+        <div class="quiz-exp">LCOFI 요청 조건은 <code>ofFromPerfCnt &amp;&amp; !mhpmevent.OF</code>다. OF가 1로 남아 있으면 넘쳐도 새 요청이 생기지 않는다. 카운터는 계속 센다.</div></div>
+      <div class="quiz-q" data-answer="3"><p>Q4. 한 사이클에 디스패치 슬롯 하나가 나가지 못했다. 리네임은 막히지 않았고, 디스패치 단계는 이슈 큐가 가득 차 막혀 있다. 이 슬롯의 원인은?</p><div class="opts">
+        <button class="opt">NoStall</button><button class="opt">앞 단계의 거품 원인</button><button class="opt">BackendOtherCoreStall</button><button class="opt">디스패치의 정체 원인(이슈 큐 가득)</button></div>
+        <div class="quiz-exp">나가지 않았고(fire 거짓), 앞 단계 정체도 없으니 세 번째 줄인 <code>currentPipeStall</code>이 걸린다. 원인은 디스패치의 정체 원인, 예를 들어 <code>IntIQFullStallAlu</code>다.</div></div>
+      <div class="quiz-q" data-answer="1"><p>Q5. 칩으로 만들 RTL에서 <code>XSPerfAccumulate</code> 카운터가 차지하는 면적은?</p><div class="opts">
+        <button class="opt">카운터 하나당 64비트 레지스터가 늘 생긴다</button><button class="opt">enablePerfPrint를 끄면 회로가 생기지 않는다</button><button class="opt">HPM 카운터와 레지스터를 공유한다</button></div>
+        <div class="quiz-exp"><code>XSPerfAccumulate.apply</code>는 <code>enablePerfPrint</code>가 켜져 있고 레벨이 문턱 이상일 때만 누산 레지스터를 등록한다. 끄면 아무 회로도 만들지 않는다. HPM과는 별개다.</div></div>
+    </div>
+  </section>
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ======================================================= 그림: 카운터 지도 */
+  const COUNTER_FIRST = 3, COUNTER_LAST = 31;
+  const BLOCKS = [
+    { id: "frontend", name: "Frontend", first: 3,  last: 10, color: "accent",   source: "Frontend.scala:279 take(8)", units: "IFU · IBuffer · ICache · FTQ · ITLB" },
+    { id: "backend",  name: "Backend (CtrlBlock)", first: 11, last: 18, color: "accent-2", source: "Backend.scala:693 slice(8,16)", units: "CtrlBlock · TopDownGen · cpu_cycle" },
+    { id: "memblock", name: "MemBlock", first: 19, last: 26, color: "ok",       source: "MemBlock.scala:1534 slice(16,24)", units: "LoadUnit · Sbuffer · LSQ · DCache …" },
+    { id: "l2",       name: "L2 (CoupledL2)", first: 27, last: 31, color: "warn",     source: "NewCSR.scala:1365 slice(24,29)", units: "L2 뱅크별 이벤트" },
+  ];
+  let selectedCounter = 3;
+  const blockOf = (counter) => BLOCKS.find((block) => counter >= block.first && counter <= block.last);
+  const grid = document.getElementById("cm-grid");
+  let gridHtml = "";
+  for (let counter = COUNTER_FIRST; counter <= COUNTER_LAST; counter++) gridHtml += `<button data-counter="${counter}" data-block="${blockOf(counter).id}">hpm${counter}</button>`;
+  grid.innerHTML = gridHtml;
+  grid.addEventListener("click", (event) => { const button = event.target.closest("button"); if (button) { selectedCounter = +button.dataset.counter; paintMap(); } });
+  const mapView = MB.canvas("#cv-map", { aspect: 0.34, minHeight: 210, maxHeight: 280, draw(ctx, width, height) {
+    const selectedBlock = blockOf(selectedCounter);
+    const csrX = 16, csrWidth = Math.min(150, width * 0.24), blockX = width * 0.42, blockWidth = Math.min(220, width * 0.33);
+    const rowHeight = (height - 30) / BLOCKS.length;
+    ctx.fillStyle = MB.css("surface");
+    MB.roundRect(ctx, csrX, 14, csrWidth, height - 28, 10); ctx.fill();
+    MB.text(ctx, "NewCSR", csrX + csrWidth / 2, 30, { align: "center", size: 13, weight: 800 });
+    MB.text(ctx, `mhpmevent${selectedCounter}`, csrX + csrWidth / 2, height / 2 - 10, { align: "center", size: 12, mono: true, color: MB.css(selectedBlock.color), weight: 700 });
+    MB.text(ctx, `mhpmcounter${selectedCounter}`, csrX + csrWidth / 2, height / 2 + 12, { align: "center", size: 12, mono: true, color: MB.css(selectedBlock.color), weight: 700 });
+    BLOCKS.forEach((block, index) => {
+      const y = 15 + index * rowHeight, isSelected = block === selectedBlock;
+      const color = MB.css(block.color);
+      ctx.fillStyle = isSelected ? MB.alpha(color, 0.18) : MB.css("surface");
+      MB.roundRect(ctx, blockX, y + 4, blockWidth, rowHeight - 8, 8); ctx.fill();
+      ctx.strokeStyle = isSelected ? color : MB.css("border"); ctx.lineWidth = isSelected ? 2 : 1; ctx.stroke();
+      MB.text(ctx, block.name, blockX + 10, y + rowHeight / 2 - 7, { size: 12, weight: 700, color: isSelected ? color : MB.css("text-dim") });
+      MB.text(ctx, `hpm${block.first}~${block.last} · HPerfMonitor`, blockX + 10, y + rowHeight / 2 + 9, { size: 10.5, mono: true, color: MB.css("text-faint") });
+      if (width > 560) MB.text(ctx, block.units, blockX + blockWidth + 10, y + rowHeight / 2, { size: 11, color: MB.css("text-faint") });
+      if (isSelected) {
+        MB.arrow(ctx, csrX + csrWidth, height / 2 - 10, blockX - 4, y + rowHeight / 2 - 6, color, 2, 8);
+        MB.arrow(ctx, blockX - 4, y + rowHeight / 2 + 6, csrX + csrWidth + 2, height / 2 + 12, color, 2, 8);
+      }
+    });
+  } });
+  function paintMap() {
+    grid.querySelectorAll("button").forEach((button) => button.classList.toggle("on", +button.dataset.counter === selectedCounter));
+    const block = blockOf(selectedCounter);
+    const localIndex = selectedCounter - block.first;
+    document.getElementById("cm-info").innerHTML = `<b>mhpmcounter${selectedCounter}</b> (CSR 0x${(0xb00 + selectedCounter).toString(16).toUpperCase()}) ← <b>${block.name}</b>의 HPerfMonitor ${localIndex}번 출력. 짝 이벤트 레지스터는 <code>mhpmevent${selectedCounter}</code> (0x${(0x320 + selectedCounter).toString(16).toUpperCase()}). 출처: <code>${block.source}</code>.`;
+    mapView.redraw();
+  }
+  paintMap();
+
+  /* ======================================================= 그림: mhpmevent 인코더 */
+  // Frontend.scala:285: noEvent, IFU(Ifu.scala:773) 13개, IBuffer(IBuffer.scala:611) 9개, ICache(ICacheImp.scala:250) 2개
+  const FRONTEND_EVENTS = ["noEvent",
+    "frontendFlush", "ifu_req", "ifu_miss", "ifu_req_cacheline_0", "ifu_req_cacheline_1", "ifu_req_cacheline_0_hit", "ifu_req_cacheline_1_hit",
+    "only_0_hit", "only_0_miss", "hit_0_hit_1", "hit_0_miss_1", "miss_0_hit_1", "miss_0_miss_1",
+    "IBuffer_Flushed", "IBuffer_hungry", "IBuffer_1_4_valid", "IBuffer_2_4_valid", "IBuffer_3_4_valid", "IBuffer_4_4_valid", "IBuffer_full", "Front_Bubble", "Fetch_Latency_Bound",
+    "icache_miss_cnt", "icache_miss_penalty"];
+  const OPERATORS = [[0, "OR"], [1, "AND"], [2, "XOR"], [4, "ADD"]];
+  const EVENT_FIELD_LOW_BITS = [0, 10, 20, 30];
+  const OPERATOR_FIELD_LOW_BITS = [40, 45, 50];
+  const encoder = { events: [23, 0, 0, 0], operators: [0, 0, 0], values: [1, 0, 0, 0] };
+  const ENCODER_PRESETS = {
+    miss: { events: [23, 0, 0, 0], operators: [0, 0, 0] },
+    both: { events: [23, 15, 0, 0], operators: [1, 0, 0] },
+    sum: { events: [4, 0, 5, 0], operators: [0, 0, 4] },
+  };
+  const form = document.getElementById("en-form");
+  form.innerHTML = [0, 1, 2, 3].map((k) => `<label>EVENT${k} [${EVENT_FIELD_LOW_BITS[k] + 9}:${EVENT_FIELD_LOW_BITS[k]}]<select data-event="${k}">${FRONTEND_EVENTS.map((name, index) => `<option value="${index}">${index} · ${name}</option>`).join("")}</select></label>`).join("") +
+    [0, 1, 2].map((k) => `<label>OPTYPE${k} [${OPERATOR_FIELD_LOW_BITS[k] + 4}:${OPERATOR_FIELD_LOW_BITS[k]}]<select data-operator="${k}">${OPERATORS.map(([code, name]) => `<option value="${code}">${code} · ${name}</option>`).join("")}</select></label>`).join("");
+  const valuesBox = document.getElementById("en-values");
+  valuesBox.innerHTML = [0, 1, 2, 3].map((k) => `<label class="ctrl" style="min-width:120px"><span>E${k} 값 <output id="en-v${k}-out"></output></span><input type="range" id="en-v${k}" min="0" max="3" step="1" value="${encoder.values[k]}"></label>`).join("");
+  form.addEventListener("change", (event) => {
+    const target = event.target;
+    if (target.dataset.event !== undefined) encoder.events[+target.dataset.event] = +target.value;
+    if (target.dataset.operator !== undefined) encoder.operators[+target.dataset.operator] = +target.value;
+    paintEncoder();
+  });
+  [0, 1, 2, 3].forEach((k) => MB.range("en-v" + k, (value) => { encoder.values[k] = value; paintEncoder(); }));
+  /** HardwarePerfMonitor.scala:61 combineEvents: 비트0 AND, 비트1 XOR, 비트2 ADD, 그 밖에 OR */
+  function combine(first, second, operator) {
+    const SIX_BIT_MASK = 63;
+    if (operator & 1) return first & second;
+    if (operator & 2) return first ^ second;
+    if (operator & 4) return (first + second) & SIX_BIT_MASK;
+    return first | second;
+  }
+  function operatorName(code) { return (OPERATORS.find(([value]) => value === code) || [0, "OR"])[1]; }
+  function encodeEvent() {
+    let value = 0n;
+    encoder.events.forEach((event, k) => { value |= BigInt(event) << BigInt(EVENT_FIELD_LOW_BITS[k]); });
+    encoder.operators.forEach((operator, k) => { value |= BigInt(operator) << BigInt(OPERATOR_FIELD_LOW_BITS[k]); });
+    return value;
+  }
+  const encodeView = MB.canvas("#cv-encode", { aspect: 0.36, minHeight: 210, maxHeight: 290, draw(ctx, width, height) {
+    // 값은 noEvent(0번)이면 늘 0이다.
+    const values = encoder.values.map((value, k) => (encoder.events[k] === 0 ? 0 : value));
+    const stepZero = combine(values[0], values[1], encoder.operators[0]);
+    const stepOne = combine(values[2], values[3], encoder.operators[1]);
+    const selected = combine(stepZero, stepOne, encoder.operators[2]);
+    const leafY = 30, middleY = height * 0.55, rootY = height - 30;
+    const leafX = [0.12, 0.36, 0.64, 0.88].map((f) => f * width);
+    const middleX = [0.24 * width, 0.76 * width], rootX = width / 2;
+    const node = (x, y, label, sub, color, isWide) => {
+      const boxWidth = isWide ? Math.min(170, width * 0.28) : Math.min(150, width * 0.22);
+      ctx.fillStyle = MB.css("surface"); MB.roundRect(ctx, x - boxWidth / 2, y - 16, boxWidth, 32, 8); ctx.fill();
+      ctx.strokeStyle = MB.css(color); ctx.lineWidth = 1.6; ctx.stroke();
+      MB.text(ctx, label, x, y - 3, { align: "center", size: 11.5, weight: 700, mono: true, color: MB.css(color) });
+      MB.text(ctx, sub, x, y + 10, { align: "center", size: 10, color: MB.css("text-dim") });
+    };
+    [0, 1].forEach((pair) => {
+      MB.arrow(ctx, leafX[pair * 2], leafY + 16, middleX[pair] - 10, middleY - 18, MB.css("text-faint"), 1.2, 6);
+      MB.arrow(ctx, leafX[pair * 2 + 1], leafY + 16, middleX[pair] + 10, middleY - 18, MB.css("text-faint"), 1.2, 6);
+      MB.arrow(ctx, middleX[pair], middleY + 16, rootX + (pair ? 12 : -12), rootY - 18, MB.css("text-faint"), 1.2, 6);
+    });
+    const isNarrow = width < 520;
+    encoder.events.forEach((event, k) => {
+      const name = FRONTEND_EVENTS[event];
+      node(leafX[k], leafY, `E${k} = ${values[k]}`, isNarrow ? `#${event}` : name.length > 18 ? name.slice(0, 17) + "…" : name, "accent");
+    });
+    node(middleX[0], middleY, `${operatorName(encoder.operators[0])} → ${stepZero}`, "step0 (레지스터)", "accent-2", true);
+    node(middleX[1], middleY, `${operatorName(encoder.operators[1])} → ${stepOne}`, "step1 (레지스터)", "accent-2", true);
+    node(rootX, rootY, `${operatorName(encoder.operators[2])} → ${selected}`, "selected → mhpmcounter += ", "ok", true);
+  } });
+  function paintEncoder() {
+    form.querySelectorAll("select[data-event]").forEach((select) => (select.value = encoder.events[+select.dataset.event]));
+    form.querySelectorAll("select[data-operator]").forEach((select) => (select.value = encoder.operators[+select.dataset.operator]));
+    const values = encoder.values.map((value, k) => (encoder.events[k] === 0 ? 0 : value));
+    const stepZero = combine(values[0], values[1], encoder.operators[0]);
+    const stepOne = combine(values[2], values[3], encoder.operators[1]);
+    const encoded = encodeEvent();
+    document.getElementById("en-hex").innerHTML = `mhpmevent3 = <b>0x${encoded.toString(16).padStart(16, "0")}</b> <span class="dim small">(MINH·SINH·UINH·VSINH·VUINH = 0, OF = 0)</span>`;
+    MB.set("en-s0", String(stepZero)); MB.set("en-s1", String(stepOne));
+    MB.set("en-sel", String(combine(stepZero, stepOne, encoder.operators[2])));
+    encodeView.redraw();
+  }
+  MB.seg("#en-preset", (value) => {
+    encoder.events = ENCODER_PRESETS[value].events.slice(); encoder.operators = ENCODER_PRESETS[value].operators.slice();
+    paintEncoder();
+  });
+  paintEncoder();
+
+  /* ======================================================= 그림: 오버플로 표본 추출 */
+  const TWO_TO_64 = 1n << 64n;
+  const SAMPLE_WINDOW = 160;               // 화면에 보이는 사이클 수
+  const MODE_SEGMENT_CYCLES = 40;          // 이 길이마다 U·S 모드가 바뀐다고 가정
+  const sampler = { cycle: 0, counter: 0n, overflowFlag: false, events: 0, interrupts: 0, silentOverflows: 0, history: [] };
+  const sampleRandom = { next: MB.rng(14) };
+  function resetSampler() {
+    const interval = BigInt(+document.getElementById("sp-n").value);
+    Object.assign(sampler, { cycle: 0, counter: TWO_TO_64 - interval, overflowFlag: false, events: 0, interrupts: 0, silentOverflows: 0, history: [] });
+    sampleRandom.next = MB.rng(14);
+    paintSampler();
+  }
+  function stepSampler() {
+    const interval = BigInt(+document.getElementById("sp-n").value);
+    const rate = +document.getElementById("sp-rate").value;
+    const isUserMode = Math.floor(sampler.cycle / MODE_SEGMENT_CYCLES) % 2 === 0;
+    const isInhibited = isUserMode && document.getElementById("sp-uinh").checked;
+    const hasEvent = sampleRandom.next() < rate;
+    const entry = { isUserMode, hasEvent: hasEvent && !isInhibited, wasIgnored: hasEvent && isInhibited, interrupt: false };
+    if (hasEvent && !isInhibited) {
+      const sum = sampler.counter + 1n;                    // counterAdd = reg +& perf.value
+      const hasCarry = sum >= TWO_TO_64;
+      sampler.counter = sum % TWO_TO_64;
+      sampler.events++;
+      if (hasCarry) {
+        if (!sampler.overflowFlag) {                      // lcofiReq = of && !OF
+          sampler.interrupts++; entry.interrupt = true;
+          sampler.overflowFlag = true;
+          // 핸들러: 표본 기록, 카운터 다시 쓰기, (선택) OF 지우기
+          sampler.counter = TWO_TO_64 - interval;
+          if (document.querySelector("#sp-clear .on").dataset.value === "1") sampler.overflowFlag = false;
+        } else sampler.silentOverflows++;
+      }
+    }
+    sampler.history.push(entry);
+    if (sampler.history.length > SAMPLE_WINDOW) sampler.history.shift();
+    sampler.cycle++;
+  }
+  const sampleView = MB.canvas("#cv-sample", { aspect: 0.3, minHeight: 170, maxHeight: 230, draw(ctx, width, height) {
+    const left = 12, right = width - 12, step = (right - left) / SAMPLE_WINDOW;
+    const firstCycle = sampler.cycle - sampler.history.length;
+    sampler.history.forEach((entry, index) => {
+      const x = left + index * step;
+      ctx.fillStyle = entry.isUserMode ? MB.alpha(MB.css("nottaken"), 0.35) : MB.css("surface");
+      ctx.fillRect(x, 12, step + 0.5, 14);
+      if (entry.hasEvent) { ctx.fillStyle = MB.css("accent-2"); ctx.beginPath(); ctx.arc(x + step / 2, height * 0.55, Math.max(2, Math.min(4, step / 2)), 0, Math.PI * 2); ctx.fill(); }
+      if (entry.wasIgnored) { ctx.strokeStyle = MB.css("text-faint"); ctx.lineWidth = 1; ctx.beginPath(); ctx.arc(x + step / 2, height * 0.55, Math.max(2, Math.min(4, step / 2)), 0, Math.PI * 2); ctx.stroke(); }
+      if (entry.interrupt) {
+        ctx.strokeStyle = MB.css("bad"); ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(x + step / 2, 30); ctx.lineTo(x + step / 2, height - 24); ctx.stroke();
+        MB.text(ctx, "LCOFI", x + step / 2 + 3, 38, { size: 10, weight: 700, color: MB.css("bad") });
+      }
+      if ((firstCycle + index) % 40 === 0) MB.text(ctx, String(firstCycle + index), x, height - 10, { size: 10, mono: true, color: MB.css("text-faint") });
+    });
+    MB.text(ctx, "U", left + 2, 19, { size: 9.5, weight: 700, color: MB.css("nottaken") });
+  } });
+  function paintSampler() {
+    const remaining = TWO_TO_64 - sampler.counter;
+    MB.set("sp-counter", `2⁶⁴ − ${remaining.toString()}${sampler.overflowFlag ? " <small>OF=1</small>" : ""}`);
+    MB.set("sp-events", String(sampler.events));
+    MB.set("sp-irq", String(sampler.interrupts));
+    MB.set("sp-silent", String(sampler.silentOverflows), sampler.silentOverflows ? "bad" : "");
+    sampleView.redraw();
+  }
+  MB.range("sp-n", resetSampler, (v) => String(v));
+  MB.range("sp-rate", () => {}, (v) => v.toFixed(2));
+  MB.seg("#sp-clear", resetSampler);
+  document.getElementById("sp-uinh").addEventListener("change", resetSampler);
+  document.getElementById("sp-reset").onclick = resetSampler;
+  let sampleAccumulator = 0;
+  const SAMPLE_CYCLES_PER_SECOND = 24;
+  const sampleLoop = MB.loop(document.getElementById("sim-sample"), (dt) => {
+    sampleAccumulator += dt * SAMPLE_CYCLES_PER_SECOND;
+    while (sampleAccumulator >= 1) { stepSampler(); sampleAccumulator -= 1; }
+    paintSampler();
+  });
+  sampleLoop.running = false;
+  MB.playButton("sp-play", sampleLoop, ["⏸ 멈춤", "▶ 실행"]);
+  resetSampler();
+  for (let k = 0; k < 120; k++) stepSampler();
+  paintSampler();
+
+  /* ======================================================= 그림: 슬롯 장부 (설명용 모델) */
+  // 원인 이름은 package.scala:817 TopDownCounters, 묶음은 그 주석(frontend/backend/memblock/bad speculation)을 따른다.
+  const GROUPS = [
+    { id: "dispatch",   name: "디스패치된 슬롯 (NoStall)", color: "ok", causes: ["NoStall"] },
+    { id: "frontend", name: "frontend",            color: "accent", causes: ["OverrideBubble", "TAGEMissBubble", "ICacheMissBubble", "ITLBMissBubble", "FetchFragBubble", "FrontendOtherCoreStall"] },
+    { id: "badspec",  name: "bad speculation",     color: "bad", causes: ["ControlRedirectStall", "ControlRecoveryStall", "MemVioRedirectStall", "FlushedInsts"] },
+    { id: "backend",  name: "backend",             color: "accent-2", causes: ["RobStall", "IntFlStall", "IntIQFullStallAlu", "LoadIQFullStall", "MemNotReadyStall", "DivStall"] },
+    { id: "memblock", name: "memblock",            color: "warn", causes: ["LoadL1Stall", "LoadL2Stall", "LoadL3Stall", "LoadMemStall", "StoreStall"] },
+  ];
+  // 각 장면에서 '이번 사이클의 주된 사건' 확률. 설명용 가정이다.
+  const SLOT_PRESETS = {
+    balanced: { dispatch: 0.55, frontend: 0.15, badspec: 0.1, backend: 0.12, memblock: 0.08 },
+    frontend: { dispatch: 0.4, frontend: 0.4, badspec: 0.06, backend: 0.08, memblock: 0.06 },
+    memory:   { dispatch: 0.35, frontend: 0.08, badspec: 0.05, backend: 0.17, memblock: 0.35 },
+    branchy:  { dispatch: 0.42, frontend: 0.16, badspec: 0.3, backend: 0.07, memblock: 0.05 },
+  };
+  const CAUSE_COLOR = {};
+  GROUPS.forEach((group) => group.causes.forEach((cause) => (CAUSE_COLOR[cause] = group.color)));
+  const ledger = { mix: SLOT_PRESETS.balanced, width: 8, cycles: 0, totals: {}, recent: [] };
+  const slotRandom = MB.rng(31);
+  function resetLedger() { ledger.cycles = 0; ledger.totals = {}; ledger.recent = []; }
+  function pickWeighted(weights) {
+    let roll = slotRandom(), sum = 0;
+    for (const [key, weight] of Object.entries(weights)) { sum += weight; if (roll < sum) return key; }
+    return Object.keys(weights)[0];
+  }
+  /** 한 사이클: 주된 사건 하나를 고르고, 일부 슬롯은 일하고 나머지는 그 원인으로 채운다(설명용). */
+  function stepLedger() {
+    const groupId = pickWeighted(ledger.mix);
+    const group = GROUPS.find((g) => g.id === groupId);
+    const cause = group.causes[Math.floor(slotRandom() * group.causes.length)];
+    const slots = [];
+    const workingSlots = groupId === "dispatch" ? ledger.width : Math.floor(slotRandom() * (ledger.width / 2));
+    for (let slot = 0; slot < ledger.width; slot++) slots.push(slot < workingSlots ? "NoStall" : cause);
+    slots.forEach((reason) => (ledger.totals[reason] = (ledger.totals[reason] || 0) + 1));
+    ledger.recent.push(slots);
+    if (ledger.recent.length > 40) ledger.recent.shift();
+    ledger.cycles++;
+  }
+  const IS_NARROW_SCREEN = window.innerWidth < 600;
+  const slotView = MB.canvas("#cv-slots", { aspect: IS_NARROW_SCREEN ? 1.75 : 0.5, minHeight: 300, maxHeight: IS_NARROW_SCREEN ? 680 : 420, draw(ctx, width, height) {
+    const isNarrow = width < 600;
+    const gridWidth = isNarrow ? width - 24 : width * 0.42, gridHeight = isNarrow ? height * 0.36 : height - 30;
+    const cellWidth = gridWidth / 40, cellHeight = Math.min(18, gridHeight / ledger.width);
+    ledger.recent.forEach((slots, column) => {
+      slots.forEach((reason, row) => {
+        ctx.fillStyle = reason === "NoStall" ? MB.alpha(MB.css("ok"), 0.75) : MB.alpha(MB.css(CAUSE_COLOR[reason]), 0.7);
+        ctx.fillRect(12 + column * cellWidth, 14 + row * cellHeight, cellWidth - 1, cellHeight - 1);
+      });
+    });
+    MB.text(ctx, "← 최근 40 사이클 (세로: 슬롯)", 12, 14 + ledger.width * cellHeight + 12, { size: 10.5, color: MB.css("text-faint") });
+    const total = ledger.cycles * ledger.width || 1;
+    const treeLeft = isNarrow ? 12 : width * 0.47, treeTop = isNarrow ? 14 + ledger.width * cellHeight + 30 : 14;
+    const treeWidth = width - treeLeft - 12;
+    let y = treeTop;
+    const lineHeight = Math.max(12, (height - treeTop - 10) / (GROUPS.length + 22));
+    GROUPS.forEach((group) => {
+      const groupSlots = group.causes.reduce((sum, cause) => sum + (ledger.totals[cause] || 0), 0);
+      const fraction = groupSlots / total;
+      ctx.fillStyle = MB.alpha(MB.css(group.color), 0.85);
+      ctx.fillRect(treeLeft + treeWidth * 0.42, y + 2, treeWidth * 0.5 * fraction, lineHeight - 3);
+      MB.text(ctx, group.name, treeLeft, y + lineHeight / 2, { size: 11.5, weight: 800, color: MB.css(group.color) });
+      MB.text(ctx, MB.pct(fraction), treeLeft + treeWidth * 0.42 - 6, y + lineHeight / 2, { size: 10.5, mono: true, align: "right", color: MB.css("text") });
+      y += lineHeight;
+      if (group.id === "dispatch") return;
+      group.causes.forEach((cause) => {
+        const causeFraction = (ledger.totals[cause] || 0) / total;
+        ctx.fillStyle = MB.alpha(MB.css(group.color), 0.4);
+        ctx.fillRect(treeLeft + treeWidth * 0.42, y + 3, treeWidth * 0.5 * causeFraction, lineHeight - 5);
+        MB.text(ctx, cause, treeLeft + 10, y + lineHeight / 2, { size: 9.5, mono: true, color: MB.css("text-dim") });
+        y += lineHeight * 0.82;
+      });
+    });
+  } });
+  function paintLedger() {
+    const total = ledger.cycles * ledger.width;
+    MB.set("sl-cycles", String(ledger.cycles));
+    const dispatched = ledger.totals.NoStall || 0;
+    MB.set("sl-dispatched", total ? `${dispatched} / ${total}` : "—");
+    MB.set("sl-utilization", total ? MB.pct(dispatched / total) : "—");
+    slotView.redraw();
+  }
+  MB.seg("#sl-preset", (value) => { ledger.mix = SLOT_PRESETS[value]; resetLedger(); paintLedger(); });
+  MB.range("sl-width", (value) => { ledger.width = value; resetLedger(); paintLedger(); }, (v) => `${v}칸`);
+  let ledgerAccumulator = 0;
+  const LEDGER_CYCLES_PER_SECOND = 12;
+  const ledgerLoop = MB.loop(document.getElementById("sim-slots"), (dt) => {
+    ledgerAccumulator += dt * LEDGER_CYCLES_PER_SECOND;
+    while (ledgerAccumulator >= 1) { stepLedger(); ledgerAccumulator -= 1; }
+    paintLedger();
+  });
+  MB.playButton("sl-play", ledgerLoop, ["⏸ 멈춤", "▶ 재생"]);
+  for (let k = 0; k < 60; k++) stepLedger();
+  paintLedger();
+
+  /* ======================================================= 그림: 원인 고르기 사다리 */
+  const BLAME_RULES = [
+    { id: "fire", label: "1. fire — 슬롯이 나갔다", reasons: ["NoStall"], isOn: false },
+    { id: "prePipeStall", label: "2. 앞 단계(리네임) 정체", reasons: ["IntFlStall", "FpFlStall", "RobStall", "ControlRedirectStall", "NoStall"], isOn: true },
+    { id: "currentPipeStall", label: "3. 내 단계(디스패치) 정체·거품", reasons: ["IntIQFullStallAlu", "LoadIQFullStall", "LoadDispatchPolicyStall", "RobStall"], isOn: true },
+    { id: "prePipeBubbleRelease", label: "4. 앞 단계가 남긴 거품", reasons: ["ICacheMissBubble", "TAGEMissBubble", "FetchFragBubble"], isOn: false },
+    { id: "currentPipeBubbleRelease", label: "5. 내가 저장해 둔 거품", reasons: ["BalanceDispatchPolicyStallAlu", "IQEnqPolicyStall"], isOn: false },
+  ];
+  const blameSelection = BLAME_RULES.map((rule) => rule.reasons[0]);
+  const rulesBox = document.getElementById("bl-rules");
+  rulesBox.innerHTML = BLAME_RULES.map((rule, index) =>
+    `<label><input type="checkbox" data-index="${index}" ${rule.isOn ? "checked" : ""}> ${rule.label} ` +
+    (rule.reasons.length > 1 ? `<select data-index="${index}">${rule.reasons.map((reason) => `<option>${reason}</option>`).join("")}</select>` : `<code>${rule.reasons[0]}</code>`) + "</label>").join("");
+  rulesBox.addEventListener("change", (event) => {
+    const index = +event.target.dataset.index;
+    if (event.target.type === "checkbox") BLAME_RULES[index].isOn = event.target.checked;
+    else blameSelection[index] = event.target.value;
+    paintBlame();
+  });
+  /** Dispatch.scala:1251 MuxCase. 2번 줄은 원인이 NoStall이 아닐 때만 참이다. */
+  function decideBlame() {
+    for (let index = 0; index < BLAME_RULES.length; index++) {
+      const rule = BLAME_RULES[index];
+      if (!rule.isOn) continue;
+      if (index === 1 && blameSelection[index] === "NoStall") continue;
+      return { index, reason: blameSelection[index] };
+    }
+    return { index: BLAME_RULES.length, reason: "BackendOtherCoreStall" };
+  }
+  const blameView = MB.canvas("#cv-blame", { aspect: 0.32, minHeight: 200, maxHeight: 260, draw(ctx, width, height) {
+    const decision = decideBlame();
+    const rows = BLAME_RULES.length + 1, rowHeight = (height - 20) / rows;
+    for (let index = 0; index < rows; index++) {
+      const y = 10 + index * rowHeight;
+      const isRule = index < BLAME_RULES.length;
+      const isOn = isRule ? BLAME_RULES[index].isOn && !(index === 1 && blameSelection[index] === "NoStall") : true;
+      const isChosen = decision.index === index;
+      const isSkipped = index < decision.index;
+      ctx.fillStyle = isChosen ? MB.alpha(MB.css("accent"), 0.2) : MB.css("surface");
+      MB.roundRect(ctx, 14, y + 2, width - 28, rowHeight - 5, 7); ctx.fill();
+      if (isChosen) { ctx.strokeStyle = MB.css("accent"); ctx.lineWidth = 2; ctx.stroke(); }
+      const label = isRule ? BLAME_RULES[index].label : "6. 그 밖 — 기본값";
+      MB.text(ctx, label, 26, y + rowHeight / 2, { size: 12, weight: isChosen ? 800 : 500, color: isSkipped || !isOn ? MB.css("text-faint") : MB.css("text") });
+      const reason = isRule ? blameSelection[index] : "BackendOtherCoreStall";
+      MB.text(ctx, isOn ? (isChosen ? `→ ${reason}` : isSkipped ? "거짓, 다음 줄" : "보지 않음") : "거짓", width - 26, y + rowHeight / 2, { align: "right", size: 11.5, mono: true, weight: isChosen ? 800 : 400, color: isChosen ? MB.css("accent") : MB.css("text-faint") });
+    }
+  } });
+  function paintBlame() {
+    const decision = decideBlame();
+    document.getElementById("bl-info").innerHTML = `이 슬롯은 <b><code>${decision.reason}</code></b>으로 기록된다 (사다리 ${decision.index + 1}번 줄).`;
+    blameView.redraw();
+  }
+  paintBlame();
+
+  /* ======================================================= 그림: TopDownGen */
+  const FEW_UOPS = 4; // Parameters.scala:326
+  const generatorView = MB.canvas("#cv-gen", { aspect: 0.3, minHeight: 190, maxHeight: 250, draw(ctx, width, height) {
+    const issuedCount = +document.getElementById("gn-cnt").value;
+    const isNoStoreIssued = document.getElementById("gn-store").checked;
+    const hasReplay = document.getElementById("gn-replay").checked;
+    const isStoreQueueFull = document.getElementById("gn-sq").checked;
+    const hasL1Miss = document.getElementById("gn-l1").checked, hasL2Miss = document.getElementById("gn-l2").checked, hasL3Miss = document.getElementById("gn-l3").checked;
+    // TopDownGen.scala:17-36 (지연 레지스터는 생략)
+    const isFewUopsIssued = issuedCount < FEW_UOPS;
+    const isAnyIssued = issuedCount > 0;
+    const isStallLoad = isFewUopsIssued && !isAnyIssued;
+    const isStallStore = isFewUopsIssued && isAnyIssued && isNoStoreIssued;
+    const memoryStallAnyLoad = isStallLoad && hasReplay;
+    const memoryStallStore = isStallStore && isStoreQueueFull;
+    const memoryStallL1 = memoryStallAnyLoad && hasL1Miss;
+    const memoryStallL2 = memoryStallL1 && hasL2Miss;
+    const memoryStallL3 = memoryStallL2 && hasL3Miss;
+    const boxes = [
+      { name: "EXEC_STALL_CYCLE", on: isFewUopsIssued, x: 0.5, y: 0.17, note: `이슈 < ${FEW_UOPS}` },
+      { name: "MEMSTALL_ANY_LOAD", on: memoryStallAnyLoad, x: 0.28, y: 0.45, note: "이슈 0 & 로드 재시도" },
+      { name: "MEMSTALL_STORE", on: memoryStallStore, x: 0.75, y: 0.45, note: "저장 없음 & SQ·SB 가득" },
+      { name: "MEMSTALL_L1MISS", on: memoryStallL1, x: 0.14, y: 0.78, note: "+ L1 미스" },
+      { name: "MEMSTALL_L2MISS", on: memoryStallL2, x: 0.4, y: 0.78, note: "+ L2 미스" },
+      { name: "MEMSTALL_L3MISS", on: memoryStallL3, x: 0.66, y: 0.78, note: "+ L3 미스" },
+    ];
+    const boxWidth = Math.min(170, width * 0.24);
+    const link = (from, to) => MB.arrow(ctx, boxes[from].x * width, boxes[from].y * height + 16, boxes[to].x * width, boxes[to].y * height - 16, MB.css("text-faint"), 1.2, 6);
+    const sideLink = (from, to) => MB.arrow(ctx, boxes[from].x * width + boxWidth / 2, boxes[from].y * height, boxes[to].x * width - boxWidth / 2, boxes[to].y * height, MB.css("text-faint"), 1.2, 6);
+    link(0, 1); link(0, 2); link(1, 3); sideLink(3, 4); sideLink(4, 5);
+    boxes.forEach((box) => {
+      const x = box.x * width, y = box.y * height;
+      ctx.fillStyle = box.on ? MB.alpha(MB.css("ok"), 0.25) : MB.css("surface");
+      MB.roundRect(ctx, x - boxWidth / 2, y - 16, boxWidth, 32, 8); ctx.fill();
+      ctx.strokeStyle = box.on ? MB.css("ok") : MB.css("border"); ctx.lineWidth = box.on ? 2 : 1; ctx.stroke();
+      MB.text(ctx, box.name + (box.on ? " +1" : ""), x, y - 4, { align: "center", size: width < 520 ? 8.5 : 10.5, weight: 700, mono: true, color: box.on ? MB.css("ok") : MB.css("text-dim") });
+      MB.text(ctx, box.note, x, y + 9, { align: "center", size: 9.5, color: MB.css("text-faint") });
+    });
+  } });
+  MB.range("gn-cnt", () => generatorView.redraw(), (v) => String(v));
+  ["gn-store", "gn-replay", "gn-sq", "gn-l1", "gn-l2", "gn-l3"].forEach((id) => document.getElementById(id).addEventListener("change", () => generatorView.redraw()));
+
+  /* ======================================================= 그림: 병목 진단 연습 (지어낸 숫자) */
+  const PROFILES = [
+    { name: "프로그램 A", groups: { dispatch: 0.38, frontend: 0.12, badspec: 0.08, backend: 0.12, memblock: 0.3 },
+      rows: [["cycles", "10,000,000"], ["instret", "28,000,000"], ["MEMSTALL_ANY_LOAD", "3,100,000"], ["MEMSTALL_L1MISS", "2,900,000"], ["MEMSTALL_L2MISS", "2,500,000"], ["MEMSTALL_L3MISS", "1,900,000"], ["icache_miss_cnt", "12,000"]],
+      answer: "memory", explanation: "슬롯의 30%가 memblock이고, 로드 대기 사이클 대부분이 L3까지 놓쳤다(1.9M / 3.1M). DRAM 지연이 병목이다. 데이터 지역성 개선이나 프리페치(10장)가 먼저다." },
+    { name: "프로그램 B", groups: { dispatch: 0.41, frontend: 0.36, badspec: 0.09, backend: 0.08, memblock: 0.06 },
+      rows: [["cycles", "10,000,000"], ["instret", "29,000,000"], ["icache_miss_cnt", "410,000"], ["icache_miss_penalty", "2,700,000"], ["IBuffer_hungry", "3,600,000"], ["ICacheMissBubble 슬롯", "17%"], ["FetchFragBubble 슬롯", "9%"]],
+      answer: "frontend", explanation: "frontend가 36%이고, 그 안에서 ICache 미스 거품이 가장 크다. ICache 미스 처리 사이클만 2.7M이다. 코드 크기가 큰 프로그램의 전형이다. 명령어 프리페치와 코드 배치(5장)를 먼저 볼 일이다." },
+    { name: "프로그램 C", groups: { dispatch: 0.44, frontend: 0.1, badspec: 0.32, backend: 0.08, memblock: 0.06 },
+      rows: [["cycles", "10,000,000"], ["instret", "24,000,000"], ["ControlRedirectStall 슬롯", "11%"], ["ControlRecoveryStall 슬롯", "8%"], ["FlushedInsts 슬롯", "13%"], ["icache_miss_cnt", "9,000"]],
+      answer: "badspec", explanation: "bad speculation이 32%다. 리다이렉트와 복구, 버려진 명령어가 고르게 크다. 분기 예측 실패가 병목이다(3·4장). 분기 없는 코드로 바꾸거나 예측하기 쉬운 패턴으로 다듬어야 한다." },
+    { name: "프로그램 D", groups: { dispatch: 0.43, frontend: 0.09, badspec: 0.06, backend: 0.36, memblock: 0.06 },
+      rows: [["cycles", "10,000,000"], ["instret", "32,000,000"], ["DivStall 슬롯", "21%"], ["IntIQFullStallAlu 슬롯", "6%"], ["RobStall 슬롯", "5%"], ["MEMSTALL_ANY_LOAD", "210,000"]],
+      answer: "backend", explanation: "backend가 36%이고 그 대부분이 DivStall이다. 나눗셈처럼 긴 연산이 ROB 머리를 막고 있다. 메모리는 깨끗하다. 나눗셈을 곱셈과 시프트로 바꾸는 식의 코드 수정이 효과적이다." },
+  ];
+  const ANSWERS = [["frontend", "프런트엔드 (인출·예측 경로)"], ["badspec", "잘못된 추측"], ["backend", "백엔드 (실행·자원)"], ["memory", "메모리 대기"]];
+  let profileIndex = 0;
+  const answersBox = document.getElementById("dx-answers");
+  answersBox.innerHTML = ANSWERS.map(([id, label]) => `<button class="btn sm" data-answer="${id}">${label}</button>`).join("");
+  answersBox.addEventListener("click", (event) => {
+    const button = event.target.closest("button");
+    if (!button) return;
+    const profile = PROFILES[profileIndex];
+    const isRight = button.dataset.answer === profile.answer;
+    answersBox.querySelectorAll("button").forEach((b) => b.classList.remove("right", "wrong"));
+    button.classList.add(isRight ? "right" : "wrong");
+    if (!isRight) answersBox.querySelector(`[data-answer="${profile.answer}"]`).classList.add("right");
+    document.getElementById("dx-info").innerHTML = `${isRight ? "<b>맞다.</b> " : "<b>아니다.</b> "}${profile.explanation}`;
+  });
+  const diagnoseView = MB.canvas("#cv-diag", { aspect: 0.2, minHeight: 110, maxHeight: 150, draw(ctx, width, height) {
+    const profile = PROFILES[profileIndex];
+    const order = [["dispatch", "디스패치된 슬롯", "ok"], ["frontend", "frontend", "accent"], ["badspec", "bad spec", "bad"], ["backend", "backend", "accent-2"], ["memblock", "memblock", "warn"]];
+    let x = 14;
+    const barWidth = width - 28;
+    order.forEach(([id, label, color]) => {
+      const segmentWidth = barWidth * profile.groups[id];
+      ctx.fillStyle = MB.alpha(MB.css(color), 0.8);
+      ctx.fillRect(x, 20, segmentWidth - 1, 34);
+      if (segmentWidth > 50) {
+        MB.text(ctx, label, x + 6, 30, { size: 10.5, weight: 700, color: "#fff" });
+        MB.text(ctx, MB.pct(profile.groups[id], 0), x + 6, 45, { size: 10.5, mono: true, color: "#fff" });
+      }
+      x += segmentWidth;
+    });
+    MB.text(ctx, "슬롯 = 8 × cycles 기준 비율 (지어낸 값)", 14, height - 14, { size: 10.5, color: MB.css("text-faint") });
+  } });
+  function paintProfile() {
+    const profile = PROFILES[profileIndex];
+    document.getElementById("dx-card").innerHTML = `<div class="profile-card"><b>${profile.name}</b><table class="profile-table">${profile.rows.map(([name, value]) => `<tr><td>${name}</td><td class="n">${value}</td></tr>`).join("")}</table></div>`;
+    answersBox.querySelectorAll("button").forEach((b) => b.classList.remove("right", "wrong"));
+    document.getElementById("dx-info").textContent = "답을 골라 보자.";
+    diagnoseView.redraw();
+  }
+  MB.seg("#dx-pick", (value) => { profileIndex = +value; paintProfile(); });
+  paintProfile();
+})();
+</script>
+</body>
+</html>

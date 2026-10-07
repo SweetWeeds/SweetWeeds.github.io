@@ -1,0 +1,677 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>디코드와 리네임 · XiangShanBook</title>
+<meta name="description" content="XiangShan 곤명호 v3의 디코드와 레지스터 리네임. 벡터 uop 분할, 28가지 명령어 융합, 리네임 테이블과 그룹 내 바이패스, 프리 리스트와 이동 제거, 스냅샷과 RAB walk 복구.">
+<link rel="icon" type="image/svg+xml" href="../favicon.svg">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/common.js"></script>
+<style>
+  .asm-in { width: 100%; min-height: 190px; font-family: var(--mono); font-size: 13.5px; line-height: 1.6; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg-elev); color: var(--text); resize: vertical; }
+  .fusion-list { padding: 4px 18px 14px; font-family: var(--mono); font-size: 13px; }
+  .fusion-list div { padding: 3px 8px; border-radius: 6px; }
+  .fusion-list .fused { background: var(--accent-soft); }
+  .fusion-list .cleared { color: var(--text-faint); text-decoration: line-through; }
+  .fusion-list .tag { font-family: var(--font); font-size: 11.5px; font-weight: 700; color: var(--accent); margin-left: 8px; }
+  .two-col { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; padding: 14px 18px; }
+  @media (max-width: 700px) { .two-col { grid-template-columns: minmax(0, 1fr); } }
+  .program { font-family: var(--mono); font-size: 13px; }
+  .program div { padding: 3px 8px; border-radius: 6px; display: flex; gap: 8px; }
+  .program div.now { background: var(--accent-soft); font-weight: 700; }
+  .program div.done { color: var(--text-faint); }
+  .program .n { color: var(--text-faint); width: 18px; flex: none; }
+</style>
+</head>
+<body data-chapter="rename">
+<main class="chapter">
+  <header class="chapter-hero">
+    <div class="eyebrow">Chapter 06</div>
+    <h1>디코드와 리네임</h1>
+    <p class="lead">IBuffer를 떠난 명령어는 두 번 다시 쓰인다. 먼저 <b>디코드</b>가 명령어를 하드웨어가 실행할 마이크로 연산(uop)으로 바꾼다. 벡터 명령어 하나는 여러 uop로 쪼개고, 붙어 있는 정수 명령어 두 개는 하나로 합친다. 그다음 <b>리네임</b>이 "x5"처럼 프로그램이 쓰는 이름을 물리 레지스터 번호로 바꾼다. 같은 x5에 차례로 값을 쓰는 두 명령어가 서로 다른 물리 레지스터를 받으면, 둘은 더 이상 순서를 기다릴 이유가 없다. 이 장에서는 곤명호 v3가 사이클마다 8개씩 이 일을 해내는 방법을 따라간다. 분기 예측이 틀렸을 때 이름표를 되돌리는 방법도 함께 본다.</p>
+    <ul class="objectives">
+      <li>벡터 명령어가 LMUL·SEW·EEW·NF에 따라 몇 개의 uop로 쪼개지는지 계산한다.</li>
+      <li>디코드 뒤에서 이웃한 두 명령어를 하나로 합치는 28가지 융합 규칙을 실제 어셈블리로 찾아본다.</li>
+      <li>8개를 한꺼번에 리네임할 때 같은 그룹 안의 앞 명령어 결과를 바이패스로 받는 과정을 단계별로 본다.</li>
+      <li>이동 명령어를 제거해 물리 레지스터를 공유할 때, 레지스터를 언제 프리 리스트에 돌려주는지 확인한다.</li>
+      <li>리다이렉트 뒤 리네임 테이블을 스냅샷과 RAB walk로 복구하는 비용을 잰다.</li>
+    </ul>
+  </header>
+
+  <!-- ============================================================ 1 -->
+  <section id="decode">
+    <h2>디코드: 명령어를 uop로</h2>
+    <p>곤명호 v3의 디코드 폭과 리네임 폭은 모두 8이다(<code>Parameters.scala:81-82</code>). 정수·부동소수 명령어 대부분은 uop 하나가 되지만, 벡터 명령어는 레지스터 그룹 전체를 다루므로 여러 uop로 나뉜다. 명령어 하나가 만들 수 있는 uop는 최대 8개다(<code>MaxUopSize = 8</code>). 디코드 단계(<code>vector/Decoder/DecodeStage.scala</code>)는 명령어를 '채널'에 배정한다. 채널은 uop를 1개, 2개, 4개, 8개 만드는 종류로 나뉘며, 각 종류마다 8개씩 있다(<code>numM2M4M8Channel = (8, 8, 8)</code>).</p>
+    <p>몇 개로 쪼갤지는 벡터 설정이 정한다. 데이터 원소 폭 SEW와 레지스터 그룹 배수 LMUL, 그리고 적재·저장 명령어라면 메모리 원소 폭 EEW와 세그먼트 수 NF가 쓰인다. EEW가 SEW와 다르면 메모리 쪽 그룹 배수가 \(\text{EMUL} = \text{LMUL}\cdot\text{EEW}/\text{SEW}\)로 바뀐다. 코드는 둘 중 큰 쪽을 uop 수로 삼는다.</p>
+    <div class="formula">$$n_{\text{uop}} = \max\!\big(1,\ \text{LMUL},\ \text{LMUL}\cdot\tfrac{\text{EEW}}{\text{SEW}}\big), \qquad n_{\text{seg}} = n_{\text{uop}} \cdot \text{NF} \le 8$$
+      <div class="where">첫 식은 <code>UopNumModule.scala:119-120</code>의 <code>(1.0 max iEmul max dEmul).toInt</code>를 옮긴 것이다. 세그먼트 적재·저장은 여기에 NF를 곱하고, 결과가 8을 넘는 조합은 합법적인 출력이 없다(<code>:73</code>, 출력 0 = 불법). 채널은 1·2·4·8 단위이므로 3은 4짜리, 5~8은 8짜리 채널을 쓴다.</div></div>
+    <figure class="play" id="fig-vec">
+      <div class="play-ctrl" style="border-top:0;border-bottom:1px solid var(--border)">
+        <div class="ctrl"><span>SEW(데이터 원소 폭)</span><div class="seg" id="vec-sew"><button data-value="8">8</button><button data-value="16">16</button><button data-value="32" class="on">32</button><button data-value="64">64</button></div></div>
+        <div class="ctrl"><span>EEW(메모리 원소 폭)</span><div class="seg" id="vec-eew"><button data-value="8">8</button><button data-value="16">16</button><button data-value="32" class="on">32</button><button data-value="64">64</button></div></div>
+        <div class="ctrl"><span>LMUL</span><div class="seg" id="vec-lmul"><button data-value="0.125">1/8</button><button data-value="0.25">1/4</button><button data-value="0.5">1/2</button><button data-value="1">1</button><button data-value="2" class="on">2</button><button data-value="4">4</button><button data-value="8">8</button></div></div>
+        <label class="ctrl"><span>NF(세그먼트 수) <output id="vec-nf-out"></output></span><input type="range" id="vec-nf" min="1" max="8" value="1"></label>
+      </div>
+      <div class="play-view"><canvas id="cv-vec"></canvas></div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">EMUL(메모리 쪽)</span><span class="v" id="vec-emul">—</span></div>
+        <div class="stat"><span class="k">uop 수</span><span class="v" id="vec-uops">—</span></div>
+        <div class="stat"><span class="k">채널 종류</span><span class="v" id="vec-channel">—</span></div>
+      </div>
+      <figcaption><span class="try">골라 보기</span>위 띠는 데이터 쪽 레지스터 그룹(LMUL), 아래 띠는 메모리 쪽 그룹(EMUL)이다. 칸 하나가 벡터 레지스터 하나다. 아래 상자들이 실제로 만들어지는 uop이며, 세그먼트 수를 늘리면 세그먼트마다 한 벌씩 반복된다. SEW 8, EEW 64, LMUL 2로 두면 EMUL이 16이 되어 불법이다. LMUL 4에 NF 3을 주면 12개가 되어 역시 불법이다. 이 계산은 인덱스·스트라이드 구분 없이 위 식만 따른 단순화다.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ============================================================ 2 -->
+  <section id="fusion">
+    <h2>명령어 융합: 둘을 하나로</h2>
+    <p>컴파일러는 "하위 32비트만 남기기"를 <code>slli x1, x1, 32</code> 다음 <code>srli x1, x1, 32</code>로 표현하곤 한다. 두 명령어지만 하는 일은 한 가지이고, 두 번째는 첫 번째 결과를 기다려야 한다. 곤명호 v3의 <code>FusionDecoder</code>는 디코드 출력 중 이웃한 두 명령어(최대 7쌍, <code>DecodeWidth − 1</code>)를 검사한다. 미리 정한 패턴에 맞으면 첫 명령어를 새 연산(예: <code>add.uw</code>)으로 바꾸고 두 번째는 지운다. 그러면 실행 유닛 하나, 물리 레지스터 하나, 의존 사슬 한 고리가 절약된다.</p>
+    <p>패턴은 28가지다(<code>FusionDecoder.scala:530</code>의 <code>fusionList</code>). 공통 조건이 있다. 두 명령어의 목적지가 같고, 첫 명령어의 목적지가 두 번째 명령어의 원천이어야 한다. 그래야 첫 결과를 버려도 안전하다. 또 목적지가 x0인 HINT 명령어는 합치지 않는다. 여러 패턴이 동시에 맞으면 시뮬레이션 단언(<code>XSError</code>)이 걸리도록 되어 있어, 패턴들은 서로 겹치지 않게 설계되었다.</p>
+    <div class="table-wrap"><table>
+      <tr><th>무리</th><th>예시 (첫 명령어 + 두 번째)</th><th>결과</th></tr>
+      <tr><td>확장·추출</td><td class="mono">slli 32 + srli 32</td><td class="mono">add.uw (zext.w)</td></tr>
+      <tr><td></td><td class="mono">slli 48 + srli 48 · slliw 16 + srliw 16</td><td class="mono">zext.h</td></tr>
+      <tr><td></td><td class="mono">slliw 16 + sraiw 16</td><td class="mono">sext.h</td></tr>
+      <tr><td>시프트 후 덧셈</td><td class="mono">slli 1·2·3·4 + add</td><td class="mono">sh1add · sh2add · sh3add · sh4add</td></tr>
+      <tr><td></td><td class="mono">srli 29·30·31·32 + add</td><td class="mono">sr29add ~ sr32add (내부 전용)</td></tr>
+      <tr><td></td><td class="mono">slli 32 + srli 31·30·29</td><td class="mono">szewl1 ~ szewl3 (내부 전용)</td></tr>
+      <tr><td>비트 다듬기</td><td class="mono">srli 8 + andi 255</td><td class="mono">byte2</td></tr>
+      <tr><td></td><td class="mono">andi 1 + add / addw</td><td class="mono">oddadd / oddaddw</td></tr>
+      <tr><td></td><td class="mono">addw·addiw + andi 255 / andi 1 / zext.h / sext.h</td><td class="mono">addwbyte · addwbit · addwzexth · addwsexth</td></tr>
+      <tr><td></td><td class="mono">and·or·xor(·i)·orc.b + andi 1 / zext.h</td><td class="mono">logic → lsb / zexth</td></tr>
+      <tr><td></td><td class="mono">andi −256 + or</td><td class="mono">orh48</td></tr>
+      <tr><td>곱셈</td><td class="mono">andi 127 + mulw</td><td class="mono">mulw7</td></tr>
+      <tr><td>상수 만들기</td><td class="mono">lui + addi / addiw</td><td class="mono">lui32 (32비트 즉치값 한 번에)</td></tr>
+    </table></div>
+    <div class="sim" id="sim-fusion">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>융합 탐지기</h3>
+        <div class="seg" id="fu-preset"><button data-value="mix" class="on">섞인 예</button><button data-value="array">배열 주소</button><button data-value="const">상수</button><button data-value="miss">안 맞는 예</button></div>
+      </div>
+      <div class="two-col">
+        <label class="ctrl"><span>어셈블리 (한 줄에 하나, 위에서부터 디코드 순서)</span><textarea class="asm-in" id="fu-in" spellcheck="false"></textarea></label>
+        <div><div class="small dim" style="padding:0 0 6px">디코드 결과</div><div class="fusion-list" id="fu-out" style="padding:0"></div></div>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">명령어</span><span class="v" id="fu-count">—</span></div>
+        <div class="stat"><span class="k">융합된 쌍</span><span class="v" id="fu-pairs">—</span></div>
+        <div class="stat"><span class="k">리네임으로 가는 uop</span><span class="v" id="fu-uops">—</span></div>
+      </div>
+      <figcaption><span class="try">써 보기</span>왼쪽에 RISC-V 어셈블리를 쓰면 오른쪽에 디코드 결과가 나온다. 강조된 줄이 융합된 첫 명령어이고, 지워진 줄이 사라진 두 번째 명령어다. 레지스터는 <code>x0</code>~<code>x31</code>이나 <code>a0</code>, <code>t1</code> 같은 ABI 이름을 쓴다. 규칙은 <code>FusionDecoder.scala</code>의 28개 <code>isValid</code> 식을 그대로 옮겼다. 앞에서부터 쌍을 보고, 이미 지워진 명령어는 다음 쌍의 첫 명령어가 될 수 없다(<code>thisCleared</code>). 실제 하드웨어는 디코드 그룹(8개) 경계를 넘어서는 합치지 않는다. 이 탐지기도 8줄마다 그룹을 끊는다. '섞인 예'의 <code>srli t1, t2, 8</code> + <code>andi t1, t1, 255</code>는 규칙에 맞는다. 그런데 8번째와 9번째 명령어라 그룹 경계에 걸려 합쳐지지 않는다. 위에 줄을 하나 지워 보자.</figcaption>
+    </div>
+  </section>
+
+  <!-- ============================================================ 3 -->
+  <section id="rat">
+    <h2>리네임 테이블과 그룹 안의 바이패스</h2>
+    <p>리네임의 중심은 <span class="term">리네임 테이블</span><span class="en">(RAT)</span>이다. 아키텍처 레지스터마다 지금 어느 물리 레지스터가 최신 값을 가질 예정인지 적힌 표다. 곤명호 v3는 정수·부동소수·벡터·vl 레지스터마다 RAT를 따로 두고, 각 RAT를 두 벌씩 유지한다(<code>RenameTable.scala:97-104</code>).</p>
+    <ul>
+      <li><b>추측 테이블</b> <code>spec_table</code>: 리네임이 사이클마다 고쳐 쓰는 앞선 상태.</li>
+      <li><b>아키텍처 테이블</b> <code>arch_table</code>: 커밋된 명령어까지만 반영한 확정 상태.</li>
+    </ul>
+    <p>명령어 하나를 리네임하는 규칙은 간단하다. 원천 레지스터는 RAT에서 물리 번호를 읽고(psrc), 목적지 레지스터는 프리 리스트에서 새 물리 번호를 받는다(pdest). 그런 다음 RAT의 그 칸을 새 번호로 바꾼다. 어려움은 8개를 <b>한 사이클에</b> 한다는 데 있다. 그룹의 3번째 명령어가 1번째 명령어의 결과를 읽는다면, RAT에는 아직 1번째의 새 번호가 없다. 그래서 그룹 안의 앞 명령어 중 같은 레지스터에 쓰는 가장 가까운 것을 찾아 그 pdest를 바로 가져온다. 이것이 <span class="term">그룹 내 바이패스</span>다(<code>Rename.scala:661-700</code>).</p>
+<div class="callout code"><strong>이동 명령어와 크리티컬 패스</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/backend/rename/Rename.scala:664-680 (주석 발췌)</span>
+<span class="c">// How to set pdest: Mux(isMove, psrc, pdest_from_freelist).</span>
+<span class="c">// The critical path of rename lies here:</span>
+<span class="c">// pdest(N) = Mux(isMove(N), Mux(bypass(N, N - 1), pdest(N - 1),</span>
+<span class="c">//                           Mux(bypass(N, N - 2), pdest(N - 2),</span>
+<span class="c">//                           ...  rat_out(N))...)),</span>
+<span class="c">//                           freelist_out(N))</span>
+io.out(<span class="s">0</span>).bits.pdest := Mux(isMove(<span class="s">0</span>), uops(<span class="s">0</span>).psrc.head, uops(<span class="s">0</span>).pdest)</code></pre>
+<p>이동 명령어는 새 레지스터를 받지 않고 원천의 물리 번호를 그대로 목적지로 쓴다. 그 원천이 같은 그룹 앞 명령어의 결과라면, 바이패스 사슬이 pdest까지 길게 이어진다. 코드 주석은 이 경로를 리네임 단계의 크리티컬 패스로 지목한다.</p>
+</div>
+    <div class="sim" id="sim-rename">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>8개 한 그룹 리네임</h3>
+        <div class="ctrl-row"><button class="btn sm" id="rn-reset">⏮ 처음</button><button class="btn sm primary" id="rn-step">다음 명령어 →</button><button class="btn sm" id="rn-all">그룹 전체</button></div>
+      </div>
+      <div class="two-col">
+        <div><div class="small dim" style="padding:0 0 6px">프로그램 (한 리네임 그룹)</div><div class="program" id="rn-program"></div></div>
+        <div class="sim-view" style="background:none"><canvas id="cv-rename"></canvas></div>
+      </div>
+      <div class="info-panel" id="rn-info">'다음 명령어'를 눌러 하나씩 리네임해 보자.</div>
+      <figcaption><span class="try">따라가 보기</span>오른쪽 표는 그룹이 시작될 때의 RAT와, 지금까지 리네임한 명령어의 psrc·pdest다. 리셋 직후처럼 모든 정수 레지스터가 p0(값 0)을 가리키는 상태에서 출발한다. 곤명호 v3의 정수 RAT 초기값이 실제로 모두 0이다(<code>RenameTable.scala:97</code>). 주황 화살표는 RAT 대신 같은 그룹 앞 명령어의 pdest를 바이패스로 받은 경우다. <code>mv</code>(= <code>addi rd, rs, 0</code>)는 프리 리스트에서 번호를 받지 않고 원천 번호를 공유한다. 이동 명령어는 리네임만 거치고 디스패치로는 가지 않는다(<code>CtrlBlock.scala:689</code>).</figcaption>
+    </div>
+  </section>
+
+  <!-- ============================================================ 4 -->
+  <section id="freelist">
+    <h2>프리 리스트와 이동 제거</h2>
+    <p>물리 레지스터 번호는 <span class="term">프리 리스트</span>라는 원형 큐에서 나온다. 리네임이 머리에서 꺼내 쓰고, 커밋이 꼬리에 돌려준다. 돌려주는 번호는 새 명령어가 아니라 <b>덮어쓰인 옛 번호</b>(old pdest)다. 커밋된 명령어가 x5를 p12로 바꿨다면, 그 전에 x5가 쓰던 번호는 더 이상 누구도 읽지 않는다. 곤명호 v3의 프리 리스트는 레지스터 종류마다 따로 있다(<code>Rename.scala:117-120</code>).</p>
+    <div class="table-wrap"><table>
+      <tr><th>종류</th><th class="num">물리 레지스터</th><th class="num">프리 리스트 크기</th><th>비고</th></tr>
+      <tr><td>정수</td><td class="num">224</td><td class="num">223</td><td>p0은 늘 0, 리셋 때 모든 x가 p0을 가리킨다</td></tr>
+      <tr><td>부동소수</td><td class="num">256</td><td class="num">224</td><td>아키텍처 레지스터 32개만큼 뺀다</td></tr>
+      <tr><td>벡터</td><td class="num">128</td><td class="num">81</td><td>아키텍처 32개 + 내부 임시 15개를 뺀다</td></tr>
+      <tr><td>vl</td><td class="num">32</td><td class="num">31</td><td></td></tr>
+    </table></div>
+    <p>이동 제거가 들어오면 문제가 하나 생긴다. <code>mv x7, x6</code>를 리네임하면 x6과 x7이 같은 물리 레지스터를 가리킨다. 나중에 x6을 덮어쓰는 명령어가 커밋될 때 옛 번호를 그냥 돌려주면, 아직 x7이 그것을 쓰고 있다. 흔한 해법은 물리 레지스터마다 참조 수를 세는 것이다. 곤명호 v3는 다른 길을 택했다. 정수 아키텍처 테이블의 32칸 전체를 훑어, 옛 번호를 가리키는 칸이 하나도 없을 때만 돌려준다(<code>need_free</code>).</p>
+<div class="callout code"><strong>참조 카운터 대신 전체 비교</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/backend/rename/RenameTable.scala:159-163</span>
+<span class="k">for</span> (((old, free), i) &lt;- (old_pdest zip need_free).zipWithIndex) {
+  <span class="k">val</span> hasDuplicate = old_pdest.take(i).map(_ === old)
+  <span class="k">val</span> blockedByDup = <span class="k">if</span> (i == <span class="s">0</span>) false.B <span class="k">else</span> VecInit(hasDuplicate).asUInt.orR
+  free := VecInit(arch_table.map(_ =/= old)).asUInt.andR &amp;&amp; !blockedByDup
+}</code></pre>
+<p>같은 사이클에 커밋하는 명령어 여럿이 같은 옛 번호를 내놓으면, 첫 번째만 돌려준다(<code>blockedByDup</code>). 아키텍처 테이블은 커밋된 상태라서, 이 비교는 투기 상태와 무관하게 정확하다.</p>
+</div>
+    <div class="sim" id="sim-free">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>커밋과 레지스터 반환</h3>
+        <div class="ctrl-row"><button class="btn sm" id="fr-reset">⏮ 처음</button><button class="btn sm primary" id="fr-step">하나 커밋 →</button></div>
+      </div>
+      <div class="sim-view"><canvas id="cv-free"></canvas></div>
+      <div class="info-panel" id="fr-info">위 그룹을 모두 리네임한 상태에서 출발한다. '하나 커밋'을 눌러 보자.</div>
+      <figcaption><span class="try">따라가 보기</span>왼쪽은 아키텍처 테이블(커밋된 상태), 오른쪽은 프리 리스트의 머리 쪽 칸들이다. 커밋할 때마다 그 명령어의 목적지 칸이 새 번호로 바뀌고, 옛 번호를 다른 칸이 아직 가리키는지 검사한다. 7번째 커밋(<code>add x6, x9, x8</code>)과 8번째 커밋(<code>addi x5, x5, 1</code>)을 눈여겨보자. 옛 번호 p2와 p3는 이동 명령어로 x7·x9와 공유되어 있어서 돌려지지 않고 남는다. p0은 x0이 늘 가리키므로 절대 돌아가지 않는다.</figcaption>
+    </div>
+    <figure class="play" id="fig-capacity">
+      <div class="play-view"><canvas id="cv-capacity"></canvas></div>
+      <div class="play-ctrl">
+        <label class="ctrl"><span>정수 목적지 uop 비율 <output id="cap-int-out"></output></span><input type="range" id="cap-int" min="0" max="1" step="0.05" value="0.7"></label>
+        <label class="ctrl"><span>부동소수 목적지 비율 <output id="cap-fp-out"></output></span><input type="range" id="cap-fp" min="0" max="1" step="0.05" value="0.1"></label>
+        <label class="ctrl"><span>벡터 목적지 비율 <output id="cap-vec-out"></output></span><input type="range" id="cap-vec" min="0" max="1" step="0.05" value="0"></label>
+        <label class="ctrl"><span>이동 제거 비율(정수 중) <output id="cap-move-out"></output></span><input type="range" id="cap-move" min="0" max="0.3" step="0.01" value="0.05"></label>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">최대 동시 진행 uop</span><span class="v" id="cap-max">—</span></div>
+        <div class="stat"><span class="k">먼저 바닥나는 자원</span><span class="v" id="cap-limit">—</span></div>
+      </div>
+      <figcaption><span class="try">조절해 보기</span>커밋되지 않은 uop는 저마다 물리 레지스터 하나를 붙들고 있다. 그래서 동시에 날아다닐 수 있는 uop 수는 ROB(352칸)와 각 프리 리스트 중 가장 먼저 바닥나는 쪽이 정한다. 이동 제거가 없고 정수 목적지가 70%라면, 223 ÷ 0.7 ≈ 318개에서 정수 레지스터가 먼저 바닥나 ROB 352칸을 다 쓰지 못한다. 이동 제거된 uop는 새 레지스터를 받지 않으므로 그만큼 정수 쪽 부담이 준다. 이 그림은 평균 비율만 쓴 단순 계산이다.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ============================================================ 5 -->
+  <section id="recovery">
+    <h2>되돌리기: 스냅샷과 RAB walk</h2>
+    <p>분기 예측이 틀리면 그 뒤에 리네임된 명령어는 모두 무효다. 추측 RAT도 틀린 분기 직후 상태로 돌아가야 한다. 곤명호 v3는 두 장치를 함께 쓴다.</p>
+    <ul>
+      <li><b>RAB(리네임 버퍼, 352칸)</b>: 리네임한 uop마다 "어느 아키텍처 레지스터에 어느 물리 번호를 썼는가"를 순서대로 적어 둔다. 복구 때 출발점에서부터 틀린 분기 직전까지 이 기록을 사이클당 8개(<code>RabCommitWidth</code>)씩 <b>다시 적용</b>하며 RAT를 재건한다. 이것이 <span class="term">walk</span>다(<code>rob/Rab.scala:152-160</code>).</li>
+      <li><b>스냅샷(최대 4개)</b>: 특정 시점의 추측 RAT 전체를 통째로 복사해 둔다(<code>RenameSnapshotNum = 4</code>). 복구할 때 틀린 분기보다 앞선 가장 가까운 스냅샷을 불러오면, walk는 그 지점부터만 하면 된다. 스냅샷이 없으면 아키텍처 테이블(커밋 지점)에서 출발한다(<code>RenameTable.scala:126-131</code>).</li>
+    </ul>
+<div class="callout code"><strong>스냅샷을 찍는 조건</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/backend/rename/Rename.scala:766-771</span>
+<span class="k">val</span> sameSnptDistance = (RobCommitWidth * <span class="s">4</span>).U
+<span class="c">// notInSameSnpt: 1.robidxHead - snapLastEnq >= sameSnptDistance 2.no snap</span>
+<span class="k">val</span> notInSameSnpt = GatedValidRegNext(distanceBetween(robIdxHeadNext, io.snptLastEnq.bits) >= sameSnptDistance || !io.snptLastEnq.valid)
+<span class="k">val</span> allowSnpt = <span class="k">if</span> (EnableRenameSnapshot) notInSameSnpt &amp;&amp; !lastCycleCreateSnpt &amp;&amp; io.in.head.bits.firstUop <span class="k">else</span> false.B
+uops.zip(io.in).foreach{ <span class="k">case</span> (uop, in) => uop.snapshot := allowSnpt &amp;&amp; FuType.isJump(in.bits.fuType) &amp;&amp; in.fire }</code></pre>
+<p>스냅샷은 점프 계열 uop가 있는 그룹에서만 찍는다. 직전 스냅샷과 ROB에서 32칸(<code>RobCommitWidth × 4</code>) 이상 떨어져 있어야 하고, 바로 앞 사이클에 찍지 않았어야 한다. 네 칸이 다 차 있으면 찍지 않는다(<code>CtrlBlock.scala:777</code>).</p>
+</div>
+    <div class="sim" id="sim-recovery">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>복구 비용 재기</h3>
+        <div class="ctrl-row"><label class="check"><input type="checkbox" id="rc-snapshot" checked> 스냅샷 사용</label></div>
+      </div>
+      <div class="sim-view"><canvas id="cv-recovery"></canvas></div>
+      <div class="sim-controls">
+        <label class="ctrl"><span>분기 간격(평균 uop) <output id="rc-gap-out"></output></span><input type="range" id="rc-gap" min="3" max="40" value="8"></label>
+        <label class="ctrl"><span>틀린 분기의 위치(커밋 지점으로부터) <output id="rc-pos-out"></output></span><input type="range" id="rc-pos" min="1" max="351" value="150"></label>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">walk 출발점</span><span class="v" id="rc-start">—</span></div>
+        <div class="stat"><span class="k">walk 길이</span><span class="v" id="rc-len">—</span></div>
+        <div class="stat"><span class="k">walk 사이클</span><span class="v" id="rc-cycles">—</span></div>
+        <div class="stat"><span class="k">평균 walk 사이클(모든 위치)</span><span class="v" id="rc-avg">—</span></div>
+      </div>
+      <figcaption><span class="try">조절해 보기</span>가로 띠는 ROB에 들어 있는 uop들이다(왼쪽 끝이 커밋 지점). 작은 눈금이 분기, 깃발이 스냅샷이다. 아래 그래프는 틀린 분기가 어디 있든 복구에 드는 walk 사이클이다. 회색은 스냅샷 없이, 붉은색은 스냅샷을 쓸 때다. 스냅샷 네 개는 32칸 이상 간격으로 앞쪽에 몰린다. 그래서 그보다 뒤에서 틀리면 마지막 스냅샷부터 걸어야 한다. 모든 분기가 똑같이 틀릴 수 있다고 보고 평균을 내 보자. 분기 간격 8일 때 스냅샷 없이 약 21.8사이클, 스냅샷을 쓰면 약 10.5사이클로 절반이 된다. 이 모델은 ROB가 꽉 찬 순간 한 번의 리다이렉트만 보며, 커밋이 동시에 진행되는 효과(<code>s_special_walk</code>)는 뺐다.</figcaption>
+    </div>
+    <div class="predict"><strong>스냅샷이 네 개뿐인 이유</strong>
+      <p>스냅샷 하나는 정수·부동소수·벡터·vl RAT 전체와 프리 리스트·RAB 포인터의 사본이다. 개수를 늘리면 복구는 빨라지는데 왜 넷에서 멈췄을까?</p>
+      <details><summary>답 보기</summary><p>스냅샷은 플립플롭으로 된 통째 사본이다(<code>Snapshot.scala</code>의 <code>Reg(Vec(RenameSnapshotNum, …))</code>). 하나를 늘릴 때마다 RAT 전체 크기만큼 면적이 늘고, 복구할 때 고르는 MUX도 넓어진다. 위 그림에서 보듯 분기는 대부분 커밋 지점 가까이에서 해결된다. 그래서 앞쪽 몇 개만으로도 평균 walk가 크게 준다. 나머지는 사이클당 8개씩 걷는 walk로 충분하다는 절충이다.</p></details>
+    </div>
+  </section>
+
+  <section class="keypoints">
+    <h2>핵심 정리</h2>
+    <ol>
+      <li>디코드·리네임 폭은 8이다. 벡터 명령어는 \(\max(1, \text{LMUL}, \text{EMUL})\)개(세그먼트면 × NF, 최대 8)의 uop로 쪼개진다.</li>
+      <li><code>FusionDecoder</code>는 이웃한 두 명령어를 28가지 패턴으로 합친다. 공통 조건은 같은 목적지, 첫 결과가 두 번째의 원천, x0이 아닌 목적지다.</li>
+      <li>RAT는 추측·아키텍처 두 벌이다. 한 그룹 8개를 리네임할 때 앞 명령어의 결과는 그룹 내 바이패스로 받는다. 이동 명령어는 원천 번호를 공유하고 디스패치를 건너뛴다.</li>
+      <li>프리 리스트는 정수 223·부동소수 224·벡터 81·vl 31칸이다. 정수 레지스터는 참조 카운터 대신 아키텍처 테이블 전체를 비교해, 아무도 가리키지 않을 때만 돌려준다.</li>
+      <li>복구는 가장 가까운 스냅샷(최대 4개, 32칸 이상 간격, 점프 uop에서) 또는 아키텍처 테이블에서 출발해, RAB를 사이클당 8개씩 다시 적용하는 walk로 마무리한다.</li>
+    </ol>
+  </section>
+
+  <section id="quiz">
+    <h2>확인 퀴즈</h2>
+    <div class="quiz">
+      <div class="quiz-q" data-answer="2"><p>Q1. SEW 16, EEW 64, LMUL 1인 인덱스 적재는 몇 개의 uop가 되는가?</p><div class="opts">
+        <button class="opt">1</button><button class="opt">2</button><button class="opt">4</button><button class="opt">8</button></div>
+        <div class="quiz-exp">EMUL = 1 × 64/16 = 4. max(1, 1, 4) = 4개다.</div></div>
+      <div class="quiz-q" data-answer="1"><p>Q2. <code>slli a0, a1, 3</code> 다음 <code>add a0, a0, a2</code>는 무엇으로 합쳐지는가?</p><div class="opts">
+        <button class="opt">합쳐지지 않는다(목적지가 다르다)</button><button class="opt">sh3add a0, a1, a2</button><button class="opt">add.uw a0, a1, a2</button><button class="opt">lui32</button></div>
+        <div class="quiz-exp">첫 명령어의 목적지 a0가 두 번째의 목적지이자 원천(rs1)이다. slli 3 + add 패턴(slli3_add)이 맞아 sh3add가 된다.</div></div>
+      <div class="quiz-q" data-answer="3"><p>Q3. <code>mv x7, x6</code>(이동 제거) 뒤에 <code>add x6, x1, x2</code>가 커밋되었다. x6의 옛 물리 번호는?</p><div class="opts">
+        <button class="opt">즉시 프리 리스트로 돌아간다</button><button class="opt">참조 카운터가 0이 될 때 돌아간다</button><button class="opt">버려지고 영영 돌아오지 않는다</button><button class="opt">아키텍처 테이블에서 x7이 아직 그것을 가리키므로 돌아가지 않는다</button></div>
+        <div class="quiz-exp">need_free는 아키텍처 테이블 전체가 옛 번호를 가리키지 않을 때만 참이다. x7이 같은 번호를 쓰고 있으므로 돌려주지 않는다. 나중에 x7이 덮어써질 때 그 커밋에서 돌려준다.</div></div>
+      <div class="quiz-q" data-answer="0"><p>Q4. 스냅샷 없이 복구할 때 walk는 어디서 시작하는가?</p><div class="opts">
+        <button class="opt">아키텍처 테이블(커밋 지점)에서 시작해 틀린 분기까지 앞으로 다시 적용한다</button><button class="opt">틀린 분기에서 시작해 뒤로 지운다</button><button class="opt">ROB 꼬리에서 시작한다</button><button class="opt">walk 없이 아키텍처 테이블만 복사한다</button></div>
+        <div class="quiz-exp">리다이렉트 때 추측 테이블을 arch_table(또는 스냅샷)로 바꾸고, RAB의 해당 구간을 사이클당 8개씩 다시 적용한다. 스냅샷이 있으면 출발점이 그만큼 가까워진다.</div></div>
+      <div class="quiz-q" data-answer="2"><p>Q5. 리네임 그룹의 5번째 명령어가 2번째 명령어가 쓴 x9를 읽는다. psrc는 어디서 오는가?</p><div class="opts">
+        <button class="opt">RAT의 x9 칸</button><button class="opt">프리 리스트 머리</button><button class="opt">2번째 명령어가 받은 pdest(그룹 내 바이패스)</button><button class="opt">아키텍처 테이블</button></div>
+        <div class="quiz-exp">같은 그룹의 앞 명령어가 쓴 레지스터는 RAT에 아직 반영되지 않았다. 그래서 가장 가까운 앞 명령어의 pdest를 바이패스로 받는다.</div></div>
+    </div>
+  </section>
+</main>
+
+<script>
+(function () {
+  "use strict";
+  const RENAME_WIDTH = 8;
+  const MAX_UOP_SIZE = 8;
+  const ROB_SIZE = 352;
+  const RAB_WALK_WIDTH = 8;
+  const SNAPSHOT_COUNT = 4;
+  const SNAPSHOT_MIN_DISTANCE = 32; // RobCommitWidth × 4
+
+  /* ================================================================ 그림 6-1: 벡터 uop */
+  const vectorInput = { sew: 32, eew: 32, lmul: 2, nf: 1 };
+  function vectorUops() {
+    const emul = (vectorInput.lmul * vectorInput.eew) / vectorInput.sew;
+    const isEmulLegal = emul >= 0.125 && emul <= 8;
+    const base = Math.floor(Math.max(1, emul, vectorInput.lmul));
+    const total = base * vectorInput.nf;
+    const isLegal = isEmulLegal && total <= MAX_UOP_SIZE;
+    let channel = "—";
+    if (isLegal) channel = total <= 1 ? "1" : total <= 2 ? "2" : total <= 4 ? "4" : "8";
+    return { emul, base, total, isLegal, channel };
+  }
+  const lmulText = (v) => (v >= 1 ? String(v) : `1/${Math.round(1 / v)}`);
+  const vecView = MB.canvas("#cv-vec", { aspect: 0.3, minHeight: 200, maxHeight: 260, draw: drawVector });
+  function drawVector(ctx, width, height) {
+    const result = vectorUops();
+    const left = 110, right = width - 14, cellWidth = (right - left) / 8;
+    const drawGroup = (label, multiplier, y, color) => {
+      MB.text(ctx, label, 12, y + 12, { size: 12, color: MB.css("text-dim") });
+      for (let i = 0; i < 8; i++) {
+        ctx.fillStyle = MB.css("surface"); ctx.fillRect(left + i * cellWidth + 1, y, cellWidth - 2, 24);
+      }
+      if (multiplier > 8) {
+        MB.text(ctx, `${lmulText(multiplier)} > 8 (불법)`, left + 4, y + 12, { size: 12, weight: 700, color: MB.css("bad") });
+        return;
+      }
+      const used = Math.max(multiplier, 1);
+      ctx.fillStyle = MB.alpha(MB.css(color), 0.6);
+      ctx.fillRect(left + 1, y, cellWidth * (multiplier >= 1 ? used : multiplier) - 2, 24);
+      MB.text(ctx, multiplier >= 1 ? `${used}개 레지스터` : `레지스터 ${lmulText(multiplier)}`, left + 6, y + 12, { size: 11, weight: 700 });
+    };
+    drawGroup(`LMUL ${lmulText(vectorInput.lmul)}`, vectorInput.lmul, 14, "accent-2");
+    drawGroup(`EMUL ${lmulText(result.emul)}`, result.emul, 46, "ok");
+    MB.text(ctx, "만들어지는 uop", 12, 100, { size: 12, color: MB.css("text-dim") });
+    if (!result.isLegal) {
+      MB.text(ctx, `불법 조합 (uop ${result.total}개 또는 EMUL 범위 밖)`, left, 100, { size: 13, weight: 700, color: MB.css("bad") });
+      return;
+    }
+    const uopWidth = Math.min(64, (right - left) / MAX_UOP_SIZE - 4);
+    for (let i = 0; i < result.total; i++) {
+      const segment = Math.floor(i / result.base);
+      const x = left + i * (uopWidth + 4), y = 90;
+      ctx.fillStyle = MB.alpha(MB.css(segment % 2 === 0 ? "accent" : "warn"), 0.65);
+      MB.roundRect(ctx, x, y, uopWidth, 34, 6); ctx.fill();
+      MB.text(ctx, `uop${i}`, x + uopWidth / 2, y + 12, { align: "center", size: 10.5, mono: true, weight: 700, color: "#fff" });
+      if (vectorInput.nf > 1) MB.text(ctx, `seg${segment}`, x + uopWidth / 2, y + 25, { align: "center", size: 9.5, mono: true, color: "#fff" });
+    }
+  }
+  function paintVector() {
+    const result = vectorUops();
+    MB.set("vec-emul", lmulText(result.emul), result.emul > 8 || result.emul < 0.125 ? "bad" : "");
+    MB.set("vec-uops", result.isLegal ? String(result.total) : `불법 (${result.total})`, result.isLegal ? "" : "bad");
+    MB.set("vec-channel", result.isLegal ? `${result.channel}-uop 채널` : "—");
+    vecView.redraw();
+  }
+  MB.seg("#vec-sew", (v) => { vectorInput.sew = +v; paintVector(); });
+  MB.seg("#vec-eew", (v) => { vectorInput.eew = +v; paintVector(); });
+  MB.seg("#vec-lmul", (v) => { vectorInput.lmul = +v; paintVector(); });
+  MB.range("vec-nf", (v) => { vectorInput.nf = v; paintVector(); });
+  paintVector();
+
+  /* ================================================================ 그림 6-2: 융합 탐지기 */
+  const ABI_NAMES = ["zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2", "s0", "s1", "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6"];
+  function registerNumber(name) {
+    const text = name.trim().toLowerCase();
+    if (/^x\d+$/.test(text)) return +text.slice(1);
+    if (text === "fp") return 8;
+    return ABI_NAMES.indexOf(text);
+  }
+  function parseImmediate(text) {
+    const value = text.trim().toLowerCase();
+    return value.startsWith("-0x") ? -parseInt(value.slice(3), 16) : value.startsWith("0x") ? parseInt(value.slice(2), 16) : parseInt(value, 10);
+  }
+  /** 한 줄을 {op, rd, rs1, rs2, imm} 으로 읽는다. mv는 addi rd, rs, 0으로 바꾼다. */
+  function parseLine(line) {
+    const clean = line.replace(/#.*/, "").trim();
+    if (!clean) return null;
+    const [opText, ...rest] = clean.split(/\s+/);
+    const op = opText.toLowerCase();
+    const args = rest.join(" ").split(",").map((x) => x.trim()).filter((x) => x.length);
+    const instruction = { text: clean, op, rd: -1, rs1: -1, rs2: -1, imm: NaN };
+    if (op === "mv" && args.length === 2) Object.assign(instruction, { op: "addi", rd: registerNumber(args[0]), rs1: registerNumber(args[1]), imm: 0 });
+    else if (op === "lui" && args.length === 2) Object.assign(instruction, { rd: registerNumber(args[0]), imm: parseImmediate(args[1]) });
+    else if (["zext.h", "sext.h", "orc.b"].includes(op) && args.length === 2) Object.assign(instruction, { rd: registerNumber(args[0]), rs1: registerNumber(args[1]) });
+    else if (args.length === 3) {
+      const isImmediateForm = /i$|iw$/.test(op) && !["mulw"].includes(op);
+      Object.assign(instruction, { rd: registerNumber(args[0]), rs1: registerNumber(args[1]) });
+      if (isImmediateForm) instruction.imm = parseImmediate(args[2]); else instruction.rs2 = registerNumber(args[2]);
+    }
+    return instruction;
+  }
+  const LOGIC_OPS = ["andi", "and", "ori", "or", "xori", "xor", "orc.b"];
+  /** FusionDecoder.scala의 isValid 식을 옮긴 28개 규칙. 맞으면 fusionName, 아니면 null. */
+  function matchFusion(first, second) {
+    const isSameDest = first.rd === second.rd;
+    const isDestToRs1 = first.rd === second.rs1;
+    const isDestToRs2 = first.rd === second.rs2;
+    const isRs1ToRs2 = second.rs1 === second.rs2;
+    const isShift = (instruction, op, amount) => instruction.op === op && instruction.imm === amount;
+    const shiftAddBase = isSameDest && (isDestToRs1 || isDestToRs2) && second.op === "add" && !isRs1ToRs2;
+    const rules = [
+      ["slli32_srli32", isShift(first, "slli", 32) && isShift(second, "srli", 32) && isSameDest && isDestToRs1],
+      ["slli48_srli48", isShift(first, "slli", 48) && isShift(second, "srli", 48) && isSameDest && isDestToRs1],
+      ["slliw16_srliw16", isShift(first, "slliw", 16) && isShift(second, "srliw", 16) && isSameDest && isDestToRs1],
+      ["slliw16_sraiw16", isShift(first, "slliw", 16) && isShift(second, "sraiw", 16) && isSameDest && isDestToRs1],
+      ["slli1_add", isShift(first, "slli", 1) && shiftAddBase],
+      ["slli2_add", isShift(first, "slli", 2) && shiftAddBase],
+      ["slli3_add", isShift(first, "slli", 3) && shiftAddBase],
+      ["slli32_srli31", isShift(first, "slli", 32) && isShift(second, "srli", 31) && isSameDest && isDestToRs1],
+      ["slli32_srli30", isShift(first, "slli", 32) && isShift(second, "srli", 30) && isSameDest && isDestToRs1],
+      ["slli32_srli29", isShift(first, "slli", 32) && isShift(second, "srli", 29) && isSameDest && isDestToRs1],
+      ["srli8_andi255", isShift(first, "srli", 8) && isShift(second, "andi", 255) && isSameDest && isDestToRs1],
+      ["slli4_add", isShift(first, "slli", 4) && shiftAddBase],
+      ["srli29_add", isShift(first, "srli", 29) && shiftAddBase],
+      ["srli30_add", isShift(first, "srli", 30) && shiftAddBase],
+      ["srli31_add", isShift(first, "srli", 31) && shiftAddBase],
+      ["srli32_add", isShift(first, "srli", 32) && shiftAddBase],
+      ["andi1_add", isShift(first, "andi", 1) && shiftAddBase],
+      ["andi1_addw", isShift(first, "andi", 1) && second.op === "addw" && !isRs1ToRs2 && isSameDest && (isDestToRs1 || isDestToRs2)],
+      ["addw_andi255", ["addiw", "addw"].includes(first.op) && isShift(second, "andi", 255) && isSameDest && isDestToRs1],
+      ["addw_andi1", ["addiw", "addw"].includes(first.op) && isShift(second, "andi", 1) && isSameDest && isDestToRs1],
+      ["addw_zexth", ["addiw", "addw"].includes(first.op) && second.op === "zext.h" && isSameDest && isDestToRs1],
+      ["addw_sexth", ["addiw", "addw"].includes(first.op) && second.op === "sext.h" && isSameDest && isDestToRs1],
+      ["logic_andi1", LOGIC_OPS.includes(first.op) && isShift(second, "andi", 1) && isSameDest && isDestToRs1],
+      ["logic_zexth", LOGIC_OPS.includes(first.op) && second.op === "zext.h" && isSameDest && isDestToRs1],
+      ["andi_f00_or", isShift(first, "andi", -256) && second.op === "or" && !isRs1ToRs2 && isSameDest && (isDestToRs1 || isDestToRs2)],
+      ["andi127_mulw", isShift(first, "andi", 127) && second.op === "mulw" && !isRs1ToRs2 && isSameDest && (isDestToRs1 || isDestToRs2)],
+      ["lui_addi", first.op === "lui" && second.op === "addi" && isSameDest && isDestToRs1],
+      ["lui_addiw", first.op === "lui" && second.op === "addiw" && isSameDest && isDestToRs1],
+    ];
+    const isNotHint = first.rd > 0 && second.rd > 0;
+    const matched = rules.filter((rule) => rule[1]);
+    return isNotHint && matched.length ? matched[0][0] : null;
+  }
+  const FUSION_PRESETS = {
+    mix: "slli a0, a1, 32\nsrli a0, a0, 32\nslli t0, a2, 3\nadd t0, t0, a3\nlui a5, 0x12345\naddi a5, a5, 0x678\nadd a6, a6, a7\nsrli t1, t2, 8\nandi t1, t1, 255\naddw a1, a2, a3\nandi a1, a1, 1",
+    array: "slli t0, a1, 2\nadd t0, a0, t0\nlw t1, 0(t0)\nslli t2, a2, 3\nadd t2, t2, a3\nld t3, 0(t2)",
+    const: "lui a0, 0x80000\naddiw a0, a0, -1\nlui a1, 0xfffff\naddi a1, a1, 0x123\nlui a2, 0x1\naddi a3, a2, 1",
+    miss: "slli a0, a1, 32\nsrli a2, a0, 32\nslli t0, a2, 5\nadd t0, t0, a3\nslli t1, a1, 3\nadd t2, t1, a4\nslli zero, a1, 1\nadd zero, zero, a2",
+  };
+  const fusionInput = document.getElementById("fu-in");
+  function paintFusion() {
+    const lines = fusionInput.value.split("\n");
+    const instructions = lines.map(parseLine);
+    const valid = instructions.map((instruction, index) => ({ instruction, index })).filter((x) => x.instruction);
+    const isCleared = new Array(lines.length).fill(false), fusedName = new Array(lines.length).fill(null);
+    for (let k = 0; k + 1 < valid.length; k++) {
+      // 디코드 그룹 경계(8개)를 넘는 쌍은 보지 않는다.
+      if (Math.floor(k / RENAME_WIDTH) !== Math.floor((k + 1) / RENAME_WIDTH)) continue;
+      const first = valid[k], second = valid[k + 1];
+      if (isCleared[first.index]) continue;
+      const name = matchFusion(first.instruction, second.instruction);
+      if (name) { fusedName[first.index] = name; isCleared[second.index] = true; }
+    }
+    const output = lines.map((line, index) => {
+      if (!instructions[index]) return "";
+      const className = fusedName[index] ? "fused" : isCleared[index] ? "cleared" : "";
+      const tag = fusedName[index] ? `<span class="tag">⇐ ${fusedName[index]}</span>` : "";
+      return `<div class="${className}">${line.replace(/</g, "&lt;")}${tag}</div>`;
+    }).join("");
+    document.getElementById("fu-out").innerHTML = output || '<div class="dim">명령어를 입력하자.</div>';
+    const pairCount = fusedName.filter(Boolean).length;
+    MB.set("fu-count", String(valid.length));
+    MB.set("fu-pairs", String(pairCount), pairCount ? "good" : "");
+    MB.set("fu-uops", `${valid.length - pairCount}`);
+  }
+  fusionInput.addEventListener("input", paintFusion);
+  MB.seg("#fu-preset", (value) => { fusionInput.value = FUSION_PRESETS[value]; paintFusion(); });
+  fusionInput.value = FUSION_PRESETS.mix;
+  paintFusion();
+
+  /* ================================================================ 그림 6-3, 6-4: 리네임과 커밋 */
+  const PROGRAM = [
+    { text: "addi x5, x0, 10", rd: 5, sources: [0] },
+    { text: "add  x6, x5, x5", rd: 6, sources: [5, 5] },
+    { text: "mv   x7, x6", rd: 7, sources: [6], isMove: true },
+    { text: "add  x5, x7, x6", rd: 5, sources: [7, 6] },
+    { text: "sub  x8, x5, x7", rd: 8, sources: [5, 7] },
+    { text: "mv   x9, x5", rd: 9, sources: [5], isMove: true },
+    { text: "add  x6, x9, x8", rd: 6, sources: [9, 8] },
+    { text: "addi x5, x5, 1", rd: 5, sources: [5] },
+  ];
+  const SHOWN_REGISTERS = [0, 5, 6, 7, 8, 9];
+  const FIRST_FREE_REGISTER = 1;
+  /** 그룹 전체를 미리 리네임해 둔다(단계별 표시는 이 결과의 앞부분만 보여 준다). */
+  function renameGroup() {
+    const startTable = new Array(32).fill(0);
+    let freeHead = FIRST_FREE_REGISTER;
+    const results = [];
+    PROGRAM.forEach((instruction, i) => {
+      const sources = instruction.sources.map((register) => {
+        // 그룹 안에서 이 레지스터를 마지막으로 쓴 앞 명령어를 찾는다.
+        for (let k = i - 1; k >= 0; k--) if (PROGRAM[k].rd === register && register !== 0) return { register, physical: results[k].pdest, bypassFrom: k };
+        return { register, physical: startTable[register], bypassFrom: -1 };
+      });
+      const pdest = instruction.isMove ? sources[0].physical : freeHead++;
+      results.push({ sources, pdest, isMove: !!instruction.isMove });
+    });
+    return { startTable, results, freeHead };
+  }
+  const renamed = renameGroup();
+  let renameStep = 3; // 처음 화면에 바이패스 예가 보이도록 세 개까지 리네임한 상태로 시작한다
+  const programElement = document.getElementById("rn-program");
+  function paintProgram() {
+    programElement.innerHTML = PROGRAM.map((instruction, i) => `<div class="${i === renameStep - 1 ? "now" : i < renameStep - 1 ? "done" : ""}"><span class="n">${i}</span>${instruction.text}</div>`).join("");
+  }
+  const renameView = MB.canvas("#cv-rename", { aspect: 0.75, minHeight: 260, maxHeight: 360, draw: drawRename });
+  function drawRename(ctx, width, height) {
+    const rowHeight = Math.min(30, (height - 30) / RENAME_WIDTH);
+    const columns = [8, width * 0.4, width * 0.66, width * 0.86];
+    MB.text(ctx, "#", columns[0], 10, { size: 11, color: MB.css("text-faint") });
+    MB.text(ctx, "psrc (원천)", columns[1], 10, { size: 11, color: MB.css("text-faint"), align: "center" });
+    MB.text(ctx, "pdest", columns[2], 10, { size: 11, color: MB.css("text-faint"), align: "center" });
+    MB.text(ctx, "할당", columns[3], 10, { size: 11, color: MB.css("text-faint"), align: "center" });
+    for (let i = 0; i < renameStep; i++) {
+      const result = renamed.results[i], y = 28 + i * rowHeight;
+      MB.text(ctx, `${i} x${PROGRAM[i].rd}`, columns[0], y, { size: 12, mono: true, weight: 700 });
+      const sourceText = result.sources.map((s) => `p${s.physical}`).join(", ");
+      MB.text(ctx, sourceText, columns[1], y, { size: 12, mono: true, align: "center", color: result.sources.some((s) => s.bypassFrom >= 0) ? MB.css("warn") : MB.css("text") });
+      MB.text(ctx, `p${result.pdest}`, columns[2], y, { size: 12.5, mono: true, align: "center", weight: 700, color: result.isMove ? MB.css("accent-2") : MB.css("accent") });
+      MB.text(ctx, result.isMove ? "공유(이동)" : "프리 리스트", columns[3], y, { size: 11, align: "center", color: MB.css("text-dim") });
+      result.sources.forEach((source) => {
+        if (source.bypassFrom < 0) return;
+        const fromY = 28 + source.bypassFrom * rowHeight;
+        ctx.strokeStyle = MB.alpha(MB.css("warn"), 0.8); ctx.lineWidth = 1.3;
+        ctx.beginPath(); ctx.moveTo(columns[2] - 18, fromY); ctx.quadraticCurveTo(columns[1] + 34, (fromY + y) / 2, columns[1] + 26, y - 4); ctx.stroke();
+      });
+    }
+    const tableY = height - 22;
+    MB.text(ctx, "그룹 시작 RAT:", 8, tableY, { size: 11, color: MB.css("text-dim") });
+    MB.text(ctx, SHOWN_REGISTERS.map((r) => `x${r}→p${renamed.startTable[r]}`).join("  "), width * 0.28, tableY, { size: 11, mono: true });
+  }
+  function paintRename() {
+    paintProgram(); renameView.redraw();
+    if (renameStep === 0) { document.getElementById("rn-info").textContent = "'다음 명령어'를 눌러 하나씩 리네임해 보자."; return; }
+    const i = renameStep - 1, result = renamed.results[i];
+    const sourceText = result.sources.map((s) => (s.bypassFrom >= 0 ? `x${s.register} → p${s.physical} (그룹 안 #${s.bypassFrom}에서 바이패스)` : `x${s.register} → p${s.physical} (RAT)`)).join(", ");
+    document.getElementById("rn-info").innerHTML = `<b>#${i} ${PROGRAM[i].text}</b> · 원천 ${sourceText} · 목적지 x${PROGRAM[i].rd} → <b>p${result.pdest}</b> ${result.isMove ? "(이동: 원천 번호를 그대로 공유, 디스패치 생략)" : "(프리 리스트에서 새로 받음)"}`;
+  }
+  document.getElementById("rn-step").onclick = () => { renameStep = Math.min(RENAME_WIDTH, renameStep + 1); paintRename(); };
+  document.getElementById("rn-all").onclick = () => { renameStep = RENAME_WIDTH; paintRename(); };
+  document.getElementById("rn-reset").onclick = () => { renameStep = 0; paintRename(); };
+  paintRename();
+
+  // 커밋: 아키텍처 테이블을 갱신하고 옛 번호를 돌려줄지 판단한다.
+  let commitState;
+  function resetCommit() {
+    commitState = { archTable: new Array(32).fill(0), committed: 0, freeList: [], log: [], lastEvent: null };
+    for (let p = renamed.freeHead; p < renamed.freeHead + 6; p++) commitState.freeList.push({ physical: p, isReturned: false });
+  }
+  function commitOne() {
+    const s = commitState;
+    if (s.committed >= PROGRAM.length) return;
+    const i = s.committed, instruction = PROGRAM[i], result = renamed.results[i];
+    const oldPhysical = s.archTable[instruction.rd];
+    s.archTable[instruction.rd] = result.pdest;
+    const stillMapped = s.archTable.map((p, r) => (p === oldPhysical ? r : -1)).filter((r) => r >= 0);
+    const isFreed = stillMapped.length === 0;
+    if (isFreed) s.freeList.push({ physical: oldPhysical, isReturned: true });
+    s.lastEvent = { i, oldPhysical, isFreed, stillMapped };
+    s.committed++;
+  }
+  const freeView = MB.canvas("#cv-free", { aspect: 0.36, minHeight: 230, maxHeight: 300, draw: drawFree });
+  function drawFree(ctx, width, height) {
+    const s = commitState;
+    if (!s) return;
+    const left = 12, tableWidth = width * 0.42;
+    MB.text(ctx, "아키텍처 테이블(정수)", left, 12, { size: 11.5, color: MB.css("text-dim") });
+    const cellHeight = Math.min(28, (height - 40) / SHOWN_REGISTERS.length);
+    SHOWN_REGISTERS.forEach((register, k) => {
+      const y = 26 + k * cellHeight;
+      const isChanged = s.lastEvent && PROGRAM[s.lastEvent.i].rd === register;
+      const isSharing = s.lastEvent && s.lastEvent.stillMapped.includes(register) && !s.lastEvent.isFreed;
+      ctx.fillStyle = isChanged ? MB.alpha(MB.css("accent"), 0.2) : isSharing ? MB.alpha(MB.css("warn"), 0.25) : MB.css("surface");
+      ctx.fillRect(left, y, tableWidth, cellHeight - 3);
+      MB.text(ctx, `x${register}`, left + 8, y + cellHeight / 2 - 1, { size: 12, mono: true, weight: 700 });
+      MB.text(ctx, `p${s.archTable[register]}`, left + tableWidth - 10, y + cellHeight / 2 - 1, { size: 12, mono: true, align: "right" });
+    });
+    const listLeft = width * 0.5, listRight = width - 12;
+    MB.text(ctx, "프리 리스트 (머리 → 꼬리)", listLeft, 12, { size: 11.5, color: MB.css("text-dim") });
+    const shown = s.freeList.slice(0, 12);
+    const boxWidth = Math.min(46, (listRight - listLeft) / 6 - 4);
+    shown.forEach((entry, k) => {
+      const x = listLeft + (k % 6) * (boxWidth + 4), y = 30 + Math.floor(k / 6) * 40;
+      ctx.fillStyle = entry.isReturned ? MB.alpha(MB.css("ok"), 0.55) : MB.css("surface");
+      MB.roundRect(ctx, x, y, boxWidth, 30, 5); ctx.fill();
+      MB.text(ctx, `p${entry.physical}`, x + boxWidth / 2, y + 15, { align: "center", size: 11.5, mono: true, weight: 700 });
+    });
+    MB.text(ctx, "초록 = 커밋으로 돌아온 번호", listLeft, 120, { size: 11, color: MB.css("ok") });
+    MB.text(ctx, `커밋 ${s.committed} / ${PROGRAM.length}`, listLeft, 142, { size: 12, mono: true, color: MB.css("text-dim") });
+  }
+  function paintCommit() {
+    const s = commitState, event = s.lastEvent;
+    let message = "위 그룹을 모두 리네임한 상태에서 출발한다. '하나 커밋'을 눌러 보자.";
+    if (event) {
+      const instruction = PROGRAM[event.i];
+      message = `<b>#${event.i} ${instruction.text}</b> 커밋 · x${instruction.rd}: p${event.oldPhysical} → p${renamed.results[event.i].pdest} · 옛 번호 p${event.oldPhysical}은 ` +
+        (event.isFreed ? "<b style='color:var(--ok)'>프리 리스트로 돌아감</b>" : `<b style='color:var(--warn)'>${event.stillMapped.map((r) => "x" + r).join(", ")}이(가) 아직 가리키므로 남김</b>`);
+    }
+    document.getElementById("fr-info").innerHTML = message;
+    freeView.redraw();
+  }
+  document.getElementById("fr-step").onclick = () => { commitOne(); paintCommit(); };
+  document.getElementById("fr-reset").onclick = () => { resetCommit(); paintCommit(); };
+  resetCommit(); paintCommit();
+
+  /* ================================================================ 그림 6-5: 동시 진행 상한 */
+  const FREE_LIST_SIZE = { int: 223, fp: 224, vec: 81 };
+  const capacityInput = { int: 0.7, fp: 0.1, vec: 0, move: 0.05 };
+  function capacity() {
+    const intDemand = capacityInput.int * (1 - capacityInput.move);
+    const limits = [
+      ["ROB", ROB_SIZE],
+      ["정수 프리 리스트", intDemand > 0 ? FREE_LIST_SIZE.int / intDemand : Infinity],
+      ["부동소수 프리 리스트", capacityInput.fp > 0 ? FREE_LIST_SIZE.fp / capacityInput.fp : Infinity],
+      ["벡터 프리 리스트", capacityInput.vec > 0 ? FREE_LIST_SIZE.vec / capacityInput.vec : Infinity],
+    ];
+    const smallest = limits.reduce((a, b) => (b[1] < a[1] ? b : a));
+    return { limits, smallest };
+  }
+  const capacityView = MB.canvas("#cv-capacity", { aspect: 0.3, minHeight: 190, maxHeight: 250, draw(ctx, width, height) {
+    const result = capacity();
+    const colors = ["text-dim", "accent", "accent-2", "warn"];
+    MB.barChart(ctx, width, height, result.limits.map(([label, value], k) => ({ label, value: Math.min(value, 1200), color: label === result.smallest[0] ? MB.css("bad") : MB.alpha(MB.css(colors[k]), 0.6) })), {
+      min: 0, max: 1200, format: (v) => (v >= 1200 ? "∞" : Math.round(v)), pad: { l: 140, r: 50, t: 10, b: 10 },
+    });
+  } });
+  function paintCapacity() {
+    const result = capacity();
+    MB.set("cap-max", `${Math.round(Math.min(ROB_SIZE, result.smallest[1]))} <small>uop</small>`);
+    MB.set("cap-limit", result.smallest[0]);
+    capacityView.redraw();
+  }
+  MB.range("cap-int", (v) => { capacityInput.int = v; paintCapacity(); }, (v) => MB.pct(v, 0));
+  MB.range("cap-fp", (v) => { capacityInput.fp = v; paintCapacity(); }, (v) => MB.pct(v, 0));
+  MB.range("cap-vec", (v) => { capacityInput.vec = v; paintCapacity(); }, (v) => MB.pct(v, 0));
+  MB.range("cap-move", (v) => { capacityInput.move = v; paintCapacity(); }, (v) => MB.pct(v, 0));
+  paintCapacity();
+
+  /* ================================================================ 그림 6-6: 복구 비용 */
+  const recoveryInput = { gap: 8, position: 150, isSnapshotOn: true };
+  /** 분기 위치를 결정적으로 만들고(간격 ±50% 흔들림), 스냅샷 규칙을 적용한다. */
+  function recoveryLayout() {
+    const random = MB.rng(31);
+    const branches = [];
+    let position = Math.max(1, Math.round(recoveryInput.gap * (0.5 + random())));
+    while (position < ROB_SIZE) { branches.push(position); position += Math.max(1, Math.round(recoveryInput.gap * (0.5 + random()))); }
+    const snapshots = [];
+    let lastSnapshot = -Infinity;
+    branches.forEach((branch) => {
+      if (snapshots.length < SNAPSHOT_COUNT && branch - lastSnapshot >= SNAPSHOT_MIN_DISTANCE) { snapshots.push(branch); lastSnapshot = branch; }
+    });
+    return { branches, snapshots };
+  }
+  function walkCost(layout, mispredictPosition, isSnapshotOn) {
+    let start = 0;
+    if (isSnapshotOn) layout.snapshots.forEach((snapshot) => { if (snapshot <= mispredictPosition) start = snapshot; });
+    const length = mispredictPosition - start;
+    return { start, length, cycles: Math.ceil(length / RAB_WALK_WIDTH) };
+  }
+  const recoveryView = MB.canvas("#cv-recovery", { aspect: 0.42, minHeight: 250, maxHeight: 340, draw: drawRecovery });
+  function drawRecovery(ctx, width, height) {
+    const layout = recoveryLayout();
+    const left = 46, right = width - 14, scale = (v) => left + (v / ROB_SIZE) * (right - left);
+    const stripY = 22;
+    ctx.fillStyle = MB.css("surface"); ctx.fillRect(left, stripY, right - left, 22);
+    const cost = walkCost(layout, recoveryInput.position, recoveryInput.isSnapshotOn);
+    ctx.fillStyle = MB.alpha(MB.css("accent"), 0.35);
+    ctx.fillRect(scale(cost.start), stripY, scale(recoveryInput.position) - scale(cost.start), 22);
+    ctx.strokeStyle = MB.css("text-faint"); ctx.lineWidth = 1;
+    layout.branches.forEach((branch) => { ctx.beginPath(); ctx.moveTo(scale(branch), stripY + 14); ctx.lineTo(scale(branch), stripY + 22); ctx.stroke(); });
+    layout.snapshots.forEach((snapshot) => {
+      ctx.fillStyle = MB.css("ok");
+      ctx.beginPath(); ctx.moveTo(scale(snapshot), stripY - 2); ctx.lineTo(scale(snapshot), stripY - 14); ctx.lineTo(scale(snapshot) + 9, stripY - 10); ctx.lineTo(scale(snapshot), stripY - 6); ctx.fill();
+    });
+    ctx.fillStyle = MB.css("bad");
+    ctx.beginPath(); ctx.arc(scale(recoveryInput.position), stripY + 11, 5, 0, Math.PI * 2); ctx.fill();
+    MB.text(ctx, "커밋 지점", left, stripY + 34, { size: 10.5, color: MB.css("text-faint") });
+    MB.text(ctx, "ROB 꼬리", right, stripY + 34, { size: 10.5, color: MB.css("text-faint"), align: "right" });
+    // 아래: 모든 위치에 대한 walk 사이클
+    const chartTop = stripY + 54, chartBottom = height - 26;
+    const series = [false, true].map((isSnapshotOn) => {
+      const data = [];
+      for (let m = 1; m < ROB_SIZE; m++) data.push([m, walkCost(layout, m, isSnapshotOn).cycles]);
+      return data;
+    });
+    ctx.save(); ctx.translate(0, chartTop);
+    MB.lineChart(ctx, width, chartBottom - chartTop + 26, [
+      { name: "스냅샷 없이", color: MB.css("text-faint"), data: series[0], width: 1.6 },
+      { name: "스냅샷 사용", color: MB.css("accent"), data: series[1], width: 2 },
+    ], { xMin: 0, xMax: ROB_SIZE, yMin: 0, yMax: Math.ceil(ROB_SIZE / RAB_WALK_WIDTH), pad: { l: 46, r: 14, t: 18, b: 26 }, yFormat: (v) => Math.round(v), yLabel: "walk 사이클 (가로: 틀린 분기 위치)", marks: [{ x: recoveryInput.position }] });
+    ctx.restore();
+  }
+  function paintRecovery() {
+    const layout = recoveryLayout();
+    const cost = walkCost(layout, recoveryInput.position, recoveryInput.isSnapshotOn);
+    MB.set("rc-start", cost.start === 0 ? "아키텍처 테이블" : `스냅샷 @${cost.start}`);
+    MB.set("rc-len", `${cost.length} <small>uop</small>`);
+    MB.set("rc-cycles", `${cost.cycles} <small>사이클</small>`);
+    // 실제 분기 위치에서만 틀린다고 보고 평균을 낸다.
+    const average = layout.branches.reduce((sum, branch) => sum + walkCost(layout, branch, recoveryInput.isSnapshotOn).cycles, 0) / Math.max(1, layout.branches.length);
+    MB.set("rc-avg", `${average.toFixed(1)} <small>사이클</small>`);
+    recoveryView.redraw();
+  }
+  MB.range("rc-gap", (v) => { recoveryInput.gap = v; paintRecovery(); });
+  MB.range("rc-pos", (v) => { recoveryInput.position = v; paintRecovery(); });
+  document.getElementById("rc-snapshot").onchange = (event) => { recoveryInput.isSnapshotOn = event.target.checked; paintRecovery(); };
+  paintRecovery();
+  window.RenameChapterModels = { vectorUops, vectorInput, matchFusion, parseLine, renamed, recoveryLayout, walkCost, recoveryInput, capacity, capacityInput };
+})();
+</script>
+</body>
+</html>

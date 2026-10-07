@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>용어집 & 종합 퀴즈 · XiangShanBook</title>
+<meta name="description" content="XiangShan 곤명호 v3의 프런트엔드, 백엔드, 메모리, 시스템, 검증 도구 핵심 용어를 검색하고, 책 전체를 아우르는 15문항 종합 퀴즈로 점검한다.">
+<link rel="icon" type="image/svg+xml" href="../favicon.svg">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/common.js"></script>
+<style>
+  .gl-filter { margin-bottom: 14px; }
+  .gl-item h4 .chapter-tag { float: right; font-size: 11.5px; font-weight: 600; }
+  .gl-empty { color: var(--text-faint); padding: 18px; text-align: center; }
+  .gl-count { font-size: 13px; color: var(--text-faint); margin: -6px 0 12px; }
+  mark { background: var(--accent-soft); color: inherit; border-radius: 3px; padding: 0 1px; }
+  .score-board { position: sticky; top: calc(var(--nav-h) + 8px); z-index: 5; display: flex; flex-wrap: wrap; gap: 14px; align-items: center; padding: 12px 18px; margin-bottom: 16px; border-radius: var(--radius); border: 1px solid var(--border); background: color-mix(in srgb, var(--bg-elev) 92%, transparent); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); box-shadow: var(--shadow); }
+  .score-board .score { font-family: var(--mono); font-size: 20px; font-weight: 800; }
+  .score-board .bar { flex: 1; min-width: 140px; height: 8px; border-radius: 999px; background: var(--surface); overflow: hidden; display: flex; }
+  .score-board .bar span { height: 100%; transition: width .2s ease; }
+  .score-board .bar .right { background: var(--ok); }
+  .score-board .bar .wrong { background: var(--bad); }
+  .score-board .message { font-size: 14px; color: var(--text-dim); width: 100%; }
+  .quiz-q .chapter-link { font-size: 12px; font-weight: 600; margin-left: 6px; }
+  .letter-index { display: flex; flex-wrap: wrap; gap: 4px; margin: -4px 0 14px; }
+  .letter-index button { font: inherit; font-family: var(--mono); font-size: 12px; padding: 2px 8px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg-elev); color: var(--text-dim); cursor: pointer; }
+  .letter-index button:hover { border-color: var(--accent); color: var(--accent); }
+</style>
+</head>
+<body data-chapter="glossary">
+<main class="chapter">
+  <header class="chapter-hero">
+    <div class="eyebrow">Chapter 16</div>
+    <h1>용어집 & 종합 퀴즈</h1>
+    <p class="lead">코어 이야기에는 약어가 넘친다. FTQ, mBTB, RAB, MSHR, PTW, CHI, IMSIC… 이 장은 책에 나온 용어를 한곳에 모아 검색할 수 있게 했다. 각 용어에는 자세히 다룬 장으로 가는 링크를 달았다. 설명과 숫자는 kunminghu-v3(a13efc877) 소스를 따른다. 마지막에는 책 전체를 아우르는 15문항 종합 퀴즈가 있다.</p>
+    <ul class="objectives">
+      <li>프런트엔드·백엔드·메모리·시스템·검증 용어를 한 문장으로 설명할 수 있는지 확인한다.</li>
+      <li>헷갈리는 짝(FTQ와 IBuffer, ROB와 RAB, TileLink와 CHI, TLB와 PTW, HPM과 XSPerf)을 구별한다.</li>
+      <li>종합 퀴즈로 1~15장의 핵심 내용을 점검한다.</li>
+    </ul>
+  </header>
+
+  <!-- ============================================================ 1 -->
+  <section id="terms">
+    <h2>용어집</h2>
+    <input class="gl-search" type="search" id="glossary-search" placeholder="용어 검색: 예) FTQ, 웨이크업, MSHR, 페이지 테이블 …" aria-label="용어 검색">
+    <div class="gl-filter"><div class="seg" id="glossary-category"><button data-value="all" class="on">전체</button><button data-value="core">코어 전체</button><button data-value="frontend">프런트엔드</button><button data-value="backend">백엔드</button><button data-value="memory">메모리</button><button data-value="system">시스템</button><button data-value="method">검증·시뮬레이션</button></div></div>
+    <div class="letter-index" id="glossary-letters"></div>
+    <div class="gl-count" id="glossary-count"></div>
+    <div class="gl-list" id="glossary-list"></div>
+  </section>
+
+  <!-- ============================================================ 2 -->
+  <section id="final-quiz">
+    <h2>종합 퀴즈</h2>
+    <p>각 문항은 한 번만 고를 수 있다. 위쪽 점수판이 맞힌 개수를 센다. 문항 옆 링크는 그 내용을 다룬 장이다.</p>
+    <div class="score-board" id="score-board">
+      <span class="score" id="score-value">0 / 15</span>
+      <div class="bar"><span class="right" id="score-right"></span><span class="wrong" id="score-wrong"></span></div>
+      <button class="btn sm" id="score-reset">다시 풀기</button>
+      <div class="message" id="score-message">아직 푼 문항이 없다.</div>
+    </div>
+    <div class="quiz" id="final-quiz-list"></div>
+  </section>
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ======================================================== 용어 */
+  const CATEGORY_NAMES = { core: "코어 전체", frontend: "프런트엔드", backend: "백엔드", memory: "메모리", system: "시스템", method: "검증·시뮬레이션" };
+  const CHAPTER_TITLES = Object.fromEntries(MB.CHAPTERS.map((chapter) => [chapter.slug, `${chapter.num}장`]));
+  /** chapter는 그 용어를 자세히 다룬 장의 slug다. 내용은 kunminghu-v3(a13efc877) 소스를 따른다. */
+  const TERMS = [
+    // ---------------------------------------------------- 코어 전체
+    { term: "XiangShan", english: "香山", category: "core", chapter: "overview",
+      text: "Chisel로 작성한 오픈소스 RISC-V 64비트 고성능 비순차 코어. 1세대 Yanqihu, 2세대 Nanhu를 거쳐 3세대 Kunminghu가 개발 중이다." },
+    { term: "곤명호 v3", english: "Kunminghu-V3", category: "core", chapter: "overview",
+      text: "3세대 마이크로아키텍처 Kunminghu의 활발히 개발 중인 브랜치(kunminghu-v3). README는 아직 빠르게 바뀌는 중이라 안정성이 필요하면 kunminghu-v2를 권한다." },
+    { term: "Chisel", english: "Constructing Hardware In a Scala Embedded Language", category: "core", chapter: "overview",
+      text: "Scala 안에서 하드웨어를 기술하는 언어. 파라미터(Config)에 따라 같은 코드에서 다른 크기의 코어를 생성한다." },
+    { term: "DefaultConfig · MinimalConfig", english: "configurations", category: "core", chapter: "overview",
+      text: "src/main/scala/top/Configs.scala의 구성. DefaultConfig는 L1D 64KB 4웨이, L2 2MB(4뱅크), OpenLLC 32MB(16웨이, 4뱅크)를 쓴다. MinimalConfig는 시뮬레이션용으로 크게 줄인 구성이다." },
+    { term: "XSTop · SimTop", english: "top modules", category: "core", chapter: "method",
+      text: "XSTop은 make verilog가 만드는 칩용 최상위, SimTop은 make sim-verilog가 만드는 시뮬레이션용 최상위다. SimTop에는 DiffTest 프로브와 시뮬레이션 메모리가 붙는다." },
+    { term: "비순차 실행", english: "out-of-order execution", category: "core", chapter: "pipeline",
+      text: "피연산자가 준비된 명령부터 실행하고, 결과는 ROB에서 프로그램 순서대로 확정하는 방식." },
+    { term: "디코드 폭 · 리네임 폭 · 커밋 폭", english: "DecodeWidth / RenameWidth / CommitWidth", category: "core", chapter: "pipeline",
+      text: "한 사이클에 디코드·리네임·커밋할 수 있는 최대 명령 수. kunminghu-v3 기본값은 셋 다 8이다(Parameters.scala:81-83)." },
+    // ---------------------------------------------------- 프런트엔드
+    { term: "BPU", english: "Branch Prediction Unit", category: "frontend", chapter: "bpu",
+      text: "다음에 가져올 페치 블록의 주소와 블록 안 분기의 방향·목적지를 예측한다. s1~s3 여러 단계에 걸쳐 빠르지만 거친 예측을 느리지만 정확한 예측으로 덮어쓴다." },
+    { term: "페치 블록", english: "fetch block", category: "frontend", chapter: "fetch",
+      text: "BPU가 한 번에 예측하고 IFU가 한 번에 가져오는 명령어 묶음. FetchBlockSize는 64바이트다(FrontendParameters.scala:28)." },
+    { term: "FTQ", english: "Fetch Target Queue", category: "frontend", chapter: "bpu",
+      text: "BPU의 예측 결과(페치 블록)를 담아 IFU에 넘기고, 커밋·리다이렉트 때 예측기 학습 정보를 보관하는 큐. 64항목이다(ftq/FtqParameters.scala:23)." },
+    { term: "덮어쓰기 거품", english: "override bubble", category: "frontend", chapter: "bpu",
+      text: "뒤 단계의 정확한 예측이 앞 단계의 빠른 예측과 다를 때, 그 사이에 이미 낸 예측을 버리면서 생기는 빈 사이클." },
+    { term: "uBTB · aBTB · mBTB", english: "micro / ahead / main BTB", category: "frontend", chapter: "bpu",
+      text: "분기 목적지 버퍼의 세 계층. uBTB 32항목, aBTB 1,024항목(4웨이), mBTB 8,192항목으로, 작을수록 빨리 답한다." },
+    { term: "TAGE", english: "TAgged GEometric history length", category: "frontend", chapter: "predictors",
+      text: "길이가 기하급수로 늘어나는 전역 히스토리로 인덱싱하는 태그 테이블들로 방향을 예측한다. kunminghu-v3는 4,096항목 테이블 8개, 히스토리 길이 4~397을 쓴다." },
+    { term: "SC", english: "Statistical Corrector", category: "frontend", chapter: "predictors",
+      text: "여러 테이블의 부호 있는 카운터 합으로 TAGE의 예측을 통계적으로 바로잡는 보정기. Path, Global, Backward, IMLI, Bias 테이블을 쓴다." },
+    { term: "ITTAGE", english: "Indirect Target TAGE", category: "frontend", chapter: "predictors",
+      text: "간접 분기(jalr)의 목적지를 TAGE와 같은 원리로 예측하는 예측기." },
+    { term: "RAS", english: "Return Address Stack", category: "frontend", chapter: "predictors",
+      text: "함수 호출 때 복귀 주소를 쌓아 두고 return의 목적지를 예측한다. 커밋 스택 16항목과 투기 큐 32항목으로 나뉜다(ras/Parameters.scala:22-23)." },
+    { term: "IFU", english: "Instruction Fetch Unit", category: "frontend", chapter: "fetch",
+      text: "FTQ가 넘긴 페치 블록을 ICache에서 읽어 명령어 단위로 자르고, 미리 디코드해 예측과 실제 분기를 확인한다." },
+    { term: "ICache", english: "instruction cache", category: "frontend", chapter: "fetch",
+      text: "명령어 캐시. 기본 256세트 × 4웨이 × 64바이트 = 64KB다(icache/Parameters.scala:29-32)." },
+    { term: "IBuffer", english: "Instruction Buffer", category: "frontend", chapter: "fetch",
+      text: "IFU가 만든 명령어를 디코더로 넘기기 전에 쌓아 두는 버퍼. 48항목이다(ibuffer/Parameters.scala:23)." },
+    { term: "RVC", english: "RISC-V compressed instructions", category: "frontend", chapter: "fetch",
+      text: "16비트 압축 명령어. 32비트 명령어와 섞여 있어 명령어 경계를 찾는 일이 인출 단계의 숙제가 된다." },
+    // ---------------------------------------------------- 백엔드
+    { term: "마이크로 연산", english: "micro-op (uop)", category: "backend", chapter: "rename",
+      text: "디코더가 명령어를 실행 유닛이 처리할 수 있는 단위로 쪼갠 연산. 벡터 명령처럼 복잡한 명령은 여러 uop가 된다." },
+    { term: "레지스터 리네이밍", english: "register renaming", category: "backend", chapter: "rename",
+      text: "아키텍처 레지스터를 매번 새 물리 레지스터에 대응시켜 WAR·WAW 같은 거짓 의존을 없앤다. 정수 물리 레지스터는 224개다(Parameters.scala:121-122)." },
+    { term: "RAT · 프리 리스트", english: "Rename Alias Table · free list", category: "backend", chapter: "rename",
+      text: "RAT는 아키텍처 레지스터가 지금 어느 물리 레지스터를 가리키는지 기록하고, 프리 리스트는 비어 있는 물리 레지스터를 관리한다." },
+    { term: "이동 제거", english: "move elimination", category: "backend", chapter: "rename",
+      text: "mv 명령을 실행하지 않고 리네임 단계에서 목적지를 원본과 같은 물리 레지스터에 대응시켜 없앤다(Rename.scala의 isMove)." },
+    { term: "스냅숏", english: "rename snapshot", category: "backend", chapter: "rename",
+      text: "분기 등에서 리네임 상태를 저장해 두었다가, 리다이렉트 때 ROB를 한참 거슬러 걷지 않고 빠르게 복구하는 장치(rename/Snapshot.scala)." },
+    { term: "디스패치", english: "dispatch", category: "backend", chapter: "issue",
+      text: "리네임한 uop를 종류에 맞는 이슈 큐로 보내는 단계." },
+    { term: "이슈 큐", english: "issue queue", category: "backend", chapter: "issue",
+      text: "피연산자가 준비되기를 기다리는 uop를 모아 두었다가, 준비된 것부터 실행 유닛으로 내보내는 큐. 기본 IssueQueueSize는 20이다(Parameters.scala:117)." },
+    { term: "웨이크업", english: "wakeup", category: "backend", chapter: "issue",
+      text: "생산자 명령이 곧 결과를 낼 것을 알리면, 그 값을 기다리던 이슈 큐 항목을 준비 상태로 바꾸는 신호." },
+    { term: "실행 유닛", english: "execution unit (EXU)", category: "backend", chapter: "issue",
+      text: "ALU, 곱셈·나눗셈, 분기, 부동소수, 벡터, 메모리 주소 계산 등 실제 연산을 하는 하드웨어. 부동소수·벡터 연산 유닛은 yunsuan 서브모듈이 제공한다." },
+    { term: "ROB", english: "Reorder Buffer", category: "backend", chapter: "rob",
+      text: "비순차로 실행한 명령의 결과를 프로그램 순서대로 확정(커밋)하는 버퍼. 352항목이다(Parameters.scala:114)." },
+    { term: "RAB", english: "Rename Buffer", category: "backend", chapter: "rob",
+      text: "리네임 결과(아키텍처 → 물리 레지스터 대응)를 순서대로 보관해, 커밋 때 아키텍처 상태를 갱신하고 복구 때 되짚는 데 쓰는 버퍼. 크기는 ROB와 같은 352다(Parameters.scala:115, backend/rob/Rab.scala)." },
+    { term: "리다이렉트", english: "redirect", category: "backend", chapter: "rob",
+      text: "분기 오예측, 예외, 메모리 순서 위반 등으로 잘못된 길의 명령을 버리고 올바른 PC에서 인출을 다시 시작하게 하는 신호." },
+    { term: "정확한 예외", english: "precise exception", category: "backend", chapter: "rob",
+      text: "예외를 일으킨 명령보다 앞선 명령은 모두 확정되고, 그 뒤의 명령은 전혀 영향을 남기지 않은 상태에서 트랩을 받는 성질. ROB가 순서대로 커밋하기 때문에 보장된다." },
+    // ---------------------------------------------------- 메모리
+    { term: "로드 큐 · 스토어 큐", english: "load queue / store queue", category: "memory", chapter: "lsu",
+      text: "실행 중인 load·store를 순서대로 추적한다. 로드 큐는 가상 120항목이고, 순서 검사용 RAR 96항목과 RAW 56항목이 따로 있다(Parameters.scala:101-103)." },
+    { term: "스토어 포워딩", english: "store-to-load forwarding", category: "memory", chapter: "lsu",
+      text: "아직 메모리에 쓰지 않은 앞선 store의 데이터를, 같은 주소를 읽는 뒤의 load에 바로 넘겨주는 것." },
+    { term: "메모리 순서 위반", english: "memory ordering violation", category: "memory", chapter: "lsu",
+      text: "뒤의 load가 앞선 store보다 먼저 실행되어 옛 값을 읽은 경우. 발견하면 그 load부터 다시 실행한다." },
+    { term: "메모리 의존 예측 · Store Set", english: "memory dependence prediction", category: "memory", chapter: "lsu",
+      text: "과거에 순서 위반을 일으킨 load·store 쌍을 기억해, 그 load가 해당 store를 기다리게 한다. kunminghu-v3는 SSIT·LFST로 된 store set을 쓴다(mem/mdp/StoreSet.scala)." },
+    { term: "스토어 버퍼", english: "store buffer (Sbuffer)", category: "memory", chapter: "lsu",
+      text: "커밋된 store를 모아 캐시 줄 단위로 합친 뒤 DCache에 쓴다. 16항목이다(Parameters.scala:176)." },
+    { term: "로드·스토어 파이프라인 폭", english: "LoadPipelineWidth / StorePipelineWidth", category: "memory", chapter: "lsu",
+      text: "한 사이클에 주소를 계산하고 캐시를 접근할 수 있는 load·store 수. 기본 load 3개, store 2개다(Parameters.scala:166-167)." },
+    { term: "L1 DCache", english: "L1 data cache", category: "memory", chapter: "dcache",
+      text: "데이터 캐시. DefaultConfig에서 64KB 4웨이이고, 태그와 데이터에 SECDED ECC를 쓴다." },
+    { term: "MSHR", english: "Miss Status Holding Register", category: "memory", chapter: "dcache",
+      text: "캐시 미스 하나를 처리하는 동안 그 상태를 붙잡는 항목. 미스를 여러 개 동시에 처리할 수 있게 한다. DCache는 nMissEntries = 16이다(Parameters.scala:281)." },
+    { term: "프리페처", english: "prefetcher", category: "memory", chapter: "dcache",
+      text: "앞으로 접근할 주소를 짐작해 미리 캐시에 가져온다. 기본 구성은 Stream/Stride, Berti, SMS를 넣고 Stride를 켠다(Parameters.scala:163-164)." },
+    { term: "TLB", english: "Translation Lookaside Buffer", category: "memory", chapter: "mmu",
+      text: "가상 주소를 물리 주소로 바꾼 결과를 캐싱한다. 명령어·load·store용 L1 TLB가 따로 있다." },
+    { term: "PTW", english: "Page Table Walker", category: "memory", chapter: "mmu",
+      text: "TLB 미스 때 메모리의 페이지 테이블을 단계별로 읽어 변환을 찾는다. L2 TLB 안에 PTW, LLPTW, HPTW가 있다(cache/mmu/PageTableWalker.scala)." },
+    { term: "Sv39 · Sv48", english: "virtual memory schemes", category: "memory", chapter: "mmu",
+      text: "39비트·48비트 가상 주소를 3·4단계 페이지 테이블로 변환하는 RISC-V 방식. 둘 다 지원한다(Parameters.scala:65-67)." },
+    { term: "2단계 주소 변환", english: "two-stage translation", category: "memory", chapter: "mmu",
+      text: "하이퍼바이저 확장에서 게스트 가상 주소 → 게스트 물리 주소(VS 단계) → 호스트 물리 주소(G 단계)로 두 번 변환하는 것." },
+    { term: "CoupledL2", english: "L2 cache", category: "memory", chapter: "cache",
+      text: "코어별 L2 캐시. 위로는 TileLink로 L1과, 아래로는 CHI로 L3와 연결한다. DefaultConfig에서 2MB, 4뱅크, inclusive다." },
+    { term: "OpenLLC", english: "last-level cache", category: "memory", chapter: "cache",
+      text: "여러 코어가 공유하는 마지막 단계 캐시(L3). DefaultConfig에서 32MB, 16웨이, 4뱅크다. LLC=ZhuJiang으로 다른 구현을 고를 수도 있다." },
+    { term: "TileLink", english: "TileLink", category: "memory", chapter: "cache",
+      text: "칩 안의 캐시 일관성 버스 프로토콜. XiangShan의 L1과 L2 사이에 쓴다." },
+    { term: "CHI", english: "Coherent Hub Interface", category: "memory", chapter: "cache",
+      text: "Arm AMBA의 일관성 인터커넥트 프로토콜. L2 아래쪽에 쓰며, Makefile의 ISSUE 변수로 버전(B, C, E.b)을 고른다. 기본값은 E.b다." },
+    { term: "디렉터리 · 스누프", english: "directory / snoop", category: "memory", chapter: "cache",
+      text: "어느 캐시가 어떤 줄을 어떤 상태로 가졌는지 기록한 표가 디렉터리다. 스누프는 다른 캐시에 그 줄을 내놓거나 무효화하라고 묻는 요청이다." },
+    // ---------------------------------------------------- 시스템
+    { term: "특권 모드", english: "privilege modes (M/S/U)", category: "system", chapter: "system",
+      text: "M(머신), S(슈퍼바이저), U(사용자) 모드. 하이퍼바이저 확장이 켜져 있어(HasHExtension = true) HS, VS, VU 모드도 있다." },
+    { term: "CSR", english: "Control and Status Register", category: "system", chapter: "system",
+      text: "mstatus, mepc, satp처럼 코어의 상태와 동작을 제어하는 레지스터. kunminghu-v3는 NewCSR 모듈로 구현한다(backend/fu/NewCSR)." },
+    { term: "트랩", english: "trap (exception / interrupt)", category: "system", chapter: "system",
+      text: "예외와 인터럽트를 함께 이르는 말. 트랩이 일어나면 mtvec·stvec이 가리키는 처리기로 뛰고, 원인을 mcause·scause에 남긴다." },
+    { term: "AIA · IMSIC", english: "Advanced Interrupt Architecture", category: "system", chapter: "system",
+      text: "RISC-V의 확장 인터럽트 구조. IMSIC는 메시지 신호 인터럽트를 받는 장치이고, ChiselAIA 서브모듈이 IMSIC와 APLIC를 제공한다." },
+    { term: "HPM", english: "Hardware Performance Monitor", category: "system", chapter: "perf",
+      text: "mcycle, minstret과 mhpmcounter 레지스터로 사건 수를 세는 RISC-V 표준 성능 카운터. NewCSR은 mhpmcounter 29개를 둔다(NewCSR.scala:64)." },
+    { term: "Top-down 분석", english: "top-down analysis", category: "system", chapter: "perf",
+      text: "파이프라인 슬롯을 프런트엔드 부족, 잘못된 투기, 백엔드 부족, 일한 슬롯으로 나눠 병목을 찾는 방법(backend/TopDownGen.scala)." },
+    { term: "XSPerf", english: "XSPerfAccumulate 등", category: "system", chapter: "perf",
+      text: "시뮬레이션 전용 성능 카운터 도구. 사건을 누적·분포·최댓값으로 세어 emu가 끝날 때 출력한다(utility/PerfCounterUtils.scala)." },
+    // ---------------------------------------------------- 검증·시뮬레이션
+    { term: "firtool", english: "CIRCT FIRRTL compiler", category: "method", chapter: "method",
+      text: "Chisel이 만든 FIRRTL을 최적화해 SystemVerilog로 내리는 CIRCT의 컴파일러. Makefile의 MFC_ARGS로 옵션을 준다." },
+    { term: "mill", english: "Scala build tool", category: "method", chapter: "method",
+      text: "XiangShan이 쓰는 Scala 빌드 도구. make sim-verilog는 mill로 top.XiangShanSim을 실행한다." },
+    { term: "Verilator · emu", english: "Verilator / emu", category: "method", chapter: "method",
+      text: "Verilator는 SystemVerilog를 C++ 모델로 바꾸는 시뮬레이터이고, make emu가 만드는 실행 파일이 build/emu다. EMU_THREADS로 다중 스레드 시뮬레이션을 켠다." },
+    { term: "DiffTest", english: "differential testing", category: "method", chapter: "method",
+      text: "DUT가 명령을 커밋할 때마다 참조 모델도 같은 명령을 실행해 아키텍처 상태를 비교하는 공동 시뮬레이션 틀(difftest 서브모듈)." },
+    { term: "NEMU", english: "reference model", category: "method", chapter: "method",
+      text: "DiffTest의 기본 참조 모델(REF). 공유 라이브러리 riscv64-nemu-interpreter-so로 불러온다. Spike도 REF로 쓸 수 있다." },
+    { term: "프로브", english: "DiffXXX probe", category: "method", chapter: "method",
+      text: "DifftestModule(new DiffInstrCommit …)처럼 RTL 곳곳에 심어 비교할 값을 내보내는 장치. 필수는 ArchEvent, InstrCommit, TrapEvent, CSRState, PhyIntRegState다." },
+    { term: "LightSSS", english: "Light-weight Simulation SnapShot", category: "method", chapter: "method",
+      text: "시뮬레이션 프로세스를 주기적으로 fork해 스냅숏을 남겼다가, 실패하면 오래된 스냅숏을 깨워 파형과 함께 실패 지점까지 다시 돌린다(--enable-fork)." },
+    { term: "체크포인트 · SimPoint", english: "checkpoint / SimPoint", category: "method", chapter: "method",
+      text: "긴 프로그램에서 대표 구간을 골라 그 시작 상태를 저장하고, 대표 구간만 시뮬레이션해 가중 평균으로 전체 성능을 추정한다." },
+    { term: "ChiselDB", english: "ChiselDB", category: "method", chapter: "method",
+      text: "하드웨어 번들 하나를 표의 한 행으로 시뮬레이션 중에 데이터베이스에 기록하는 도구. WITH_CHISELDB=1로 빌드하고 --dump-db로 켠다." },
+    { term: "Constantin", english: "runtime constants", category: "method", chapter: "method",
+      text: "RTL 상수를 시뮬레이션할 때 파일에서 읽어 바꿀 수 있게 하는 도구. WITH_CONSTANTIN=1로 빌드한다. 예: Backend.scala의 EnableMdp." },
+    { term: "GOOD TRAP", english: "HIT GOOD TRAP", category: "method", chapter: "method",
+      text: "작업 부하가 끝까지 DiffTest 불일치 없이 종료 명령에 닿았을 때 emu가 출력하는 메시지. 종료 코드가 0이 아니면 BAD TRAP이다." },
+    { term: "IPC · CPI", english: "instructions per cycle / cycles per instruction", category: "method", chapter: "pipeline",
+      text: "사이클당 커밋한 명령 수와 그 역수. emu와 CI 성능 보고서가 IPC를 출력한다." },
+  ];
+
+  let query = "", category = "all";
+  function escapeRegExp(text) { return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+  function highlight(text) {
+    if (!query) return text;
+    return text.replace(new RegExp(`(${escapeRegExp(query)})`, "gi"), "<mark>$1</mark>");
+  }
+  function linkOf(item) {
+    if (item.link) return `<a class="chapter-tag" href="${item.link}">${item.linkLabel}</a>`;
+    return `<a class="chapter-tag" href="${item.chapter}.html">${CHAPTER_TITLES[item.chapter]} →</a>`;
+  }
+  function paintGlossary() {
+    const lowerQuery = query.toLowerCase();
+    const items = TERMS.filter((item) => (category === "all" || item.category === category) &&
+      (!lowerQuery || (item.term + " " + item.english + " " + item.text).toLowerCase().includes(lowerQuery)));
+    document.getElementById("glossary-list").innerHTML = items.map((item) =>
+      `<div class="gl-item"><h4>${highlight(item.term)}<span class="en">${highlight(item.english)}</span>${linkOf(item)}</h4>` +
+      `<p>${highlight(item.text)}</p><span class="pill">${CATEGORY_NAMES[item.category]}</span></div>`).join("") ||
+      `<div class="gl-empty">"${query.replace(/</g, "&lt;")}"에 맞는 용어가 없다.</div>`;
+    document.getElementById("glossary-count").textContent = `${items.length} / ${TERMS.length}개 용어`;
+  }
+  const searchBox = document.getElementById("glossary-search");
+  searchBox.addEventListener("input", (event) => { query = event.target.value.trim(); paintGlossary(); });
+  MB.seg("#glossary-category", (value) => { category = value; paintGlossary(); });
+
+  // 자주 찾는 약어 바로가기: 누르면 검색창에 채운다.
+  const QUICK_TERMS = ["FTQ", "BTB", "TAGE", "ROB", "MSHR", "TLB", "CHI", "CSR", "DiffTest", "LightSSS"];
+  document.getElementById("glossary-letters").innerHTML = QUICK_TERMS.map((term) => `<button data-term="${term}">${term}</button>`).join("");
+  document.getElementById("glossary-letters").addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-term]");
+    if (!button) return;
+    query = button.dataset.term; searchBox.value = query; paintGlossary();
+  });
+  paintGlossary();
+
+  /* ======================================================== 종합 퀴즈 */
+  const QUESTIONS = [
+    { chapter: "overview", question: "XiangShan README가 연구·검증·하위 응용처럼 안정성이 중요한 용도에 먼저 권하는 브랜치는?",
+      options: ["kunminghu-v3", "kunminghu-v2", "nanhu", "yanqihu"], answer: 1,
+      explanation: "README의 Branch Maintenance Status는 kunminghu-v3가 아직 빠르게 바뀌고 있어 기능이 안정적이지 않을 수 있으니 kunminghu-v2를 우선 고려하라고 한다." },
+    { chapter: "pipeline", question: "kunminghu-v3 기본 파라미터에서 디코드 폭·리네임 폭·커밋 폭은?",
+      options: ["4 · 4 · 4", "6 · 6 · 6", "8 · 8 · 8", "8 · 6 · 12"], answer: 2,
+      explanation: "Parameters.scala:81-83에서 DecodeWidth, RenameWidth, CommitWidth가 모두 8이다." },
+    { chapter: "bpu", question: "BPU의 예측 결과(페치 블록)를 담아 IFU에 넘기고 학습 정보를 보관하는 64항목 큐는?",
+      options: ["IBuffer", "FTQ", "ROB", "RAS"], answer: 1,
+      explanation: "Fetch Target Queue. FtqSize = 64(ftq/FtqParameters.scala:23)." },
+    { chapter: "predictors", question: "kunminghu-v3 TAGE 테이블 구성으로 옳은 것은?",
+      options: ["4,096항목 테이블 8개, 히스토리 길이 4~397", "1,024항목 테이블 4개, 히스토리 길이 8~64", "테이블 1개, 히스토리 길이 16", "4,096항목 테이블 2개, 히스토리 없음"], answer: 0,
+      explanation: "tage/Parameters.scala:27-34에 TageTableInfo(4096, 2, 길이)가 8개 있고, 길이는 4, 9, 17, 29, 56, 109, 211, 397이다." },
+    { chapter: "fetch", question: "ICache 기본 파라미터가 256세트 × 4웨이 × 64바이트 줄이라면 용량은?",
+      options: ["16KB", "32KB", "128KB", "64KB"], answer: 3,
+      explanation: "256 × 4 × 64B = 65,536B = 64KB(icache/Parameters.scala:29-32)." },
+    { chapter: "rename", question: "레지스터 리네이밍이 없애는 것은?",
+      options: ["진짜 데이터 의존(RAW)", "WAR·WAW 같은 거짓 의존", "분기 오예측", "캐시 미스"], answer: 1,
+      explanation: "같은 아키텍처 레지스터를 다시 쓸 때마다 새 물리 레지스터를 배정해 이름 충돌로 생긴 거짓 의존을 지운다. 진짜 데이터 의존은 남는다." },
+    { chapter: "issue", question: "이슈 큐에서 '웨이크업'이 하는 일은?",
+      options: ["잠든 코어를 깨운다", "생산자가 곧 결과를 낼 것을 알려, 그 값을 기다리던 항목을 준비 상태로 바꾼다", "캐시 줄을 다시 채운다", "ROB 머리를 커밋한다"], answer: 1,
+      explanation: "피연산자를 기다리던 uop는 웨이크업을 받아야 선택(select) 후보가 된다." },
+    { chapter: "rob", question: "ROB가 명령을 프로그램 순서대로 커밋해서 얻는 성질은?",
+      options: ["정확한 예외", "더 높은 클럭", "캐시 일관성", "분기 예측 정확도"], answer: 0,
+      explanation: "앞선 명령은 모두 확정되고 뒤의 명령은 흔적을 남기지 않은 상태에서 트랩을 받을 수 있다. ROB는 352항목이다." },
+    { chapter: "lsu", question: "Store Set(SSIT·LFST)의 목적은?",
+      options: ["스토어 데이터를 압축한다", "과거에 순서 위반을 일으킨 load가 해당 store를 기다리게 해 위반을 줄인다", "TLB 미스를 줄인다", "캐시 줄을 미리 가져온다"], answer: 1,
+      explanation: "메모리 의존 예측이다. 위반이 나면 그 load부터 다시 실행해야 하므로 비싸다(mem/mdp/StoreSet.scala)." },
+    { chapter: "dcache", question: "DCache의 MSHR(nMissEntries = 16)가 있어서 가능한 것은?",
+      options: ["캐시 줄 크기를 바꾼다", "미스 여러 개를 동시에 처리해, 한 미스를 기다리는 동안에도 다른 접근을 이어 간다", "ECC를 끈다", "TLB를 비운다"], answer: 1,
+      explanation: "미스마다 MSHR 항목 하나가 상태를 붙잡아, 최대 16개의 미스가 동시에 진행될 수 있다." },
+    { chapter: "mmu", question: "Sv48에서 페이지 테이블은 몇 단계인가?",
+      options: ["2단계", "3단계", "4단계", "5단계"], answer: 2,
+      explanation: "Sv39는 3단계, Sv48은 4단계 페이지 테이블을 쓴다. kunminghu-v3는 둘 다 지원한다." },
+    { chapter: "cache", question: "XiangShan에서 L2(CoupledL2)와 L3(OpenLLC) 사이에 쓰는 일관성 프로토콜은?",
+      options: ["TileLink", "AXI4", "CHI", "PCIe"], answer: 2,
+      explanation: "L1과 L2 사이는 TileLink, L2 아래쪽은 CHI다. Makefile의 ISSUE 변수(기본 E.b)가 CHI 버전을 고른다." },
+    { chapter: "system", question: "하이퍼바이저 확장이 켜져 있을 때(HasHExtension = true) 추가되는 실행 모드는?",
+      options: ["HS, VS, VU", "D 모드 하나", "S 모드가 사라진다", "N 모드"], answer: 0,
+      explanation: "하이퍼바이저가 도는 HS와, 게스트용 가상 슈퍼바이저 VS, 가상 사용자 VU가 생긴다. 주소 변환도 2단계가 된다." },
+    { chapter: "perf", question: "Top-down 분석에서 '슬롯'의 전체 수는?",
+      options: ["사이클 수", "커밋한 명령 수", "파이프라인 폭 × 사이클 수", "캐시 접근 수"], answer: 2,
+      explanation: "매 사이클 폭만큼의 슬롯이 있고, 슬롯마다 일했는지 아니면 어떤 이유로 비었는지를 센다." },
+    { chapter: "method", question: "DiffTest가 DUT와 참조 모델을 비교하는 시점은?",
+      options: ["매 사이클", "명령을 인출할 때", "명령을 커밋할 때", "프로그램이 끝났을 때 한 번"], answer: 2,
+      explanation: "ROB가 DiffInstrCommit으로 커밋을 알리면 REF가 같은 수만큼 실행하고 아키텍처 상태를 비교한다." },
+  ];
+  const quizList = document.getElementById("final-quiz-list");
+  quizList.innerHTML = QUESTIONS.map((item, index) =>
+    `<div class="quiz-q" data-answer="${item.answer}" data-index="${index}"><p>Q${index + 1}. ${item.question}<a class="chapter-link" href="${item.chapter}.html">${CHAPTER_TITLES[item.chapter]}</a></p>` +
+    `<div class="opts">${item.options.map((option) => `<button class="opt">${option}</button>`).join("")}</div>` +
+    `<div class="quiz-exp">${item.explanation}</div></div>`).join("");
+
+  const SCORE_MESSAGES = [
+    [15, "만점! 곤명호 v3를 인출부터 커밋, 캐시와 검증까지 설명할 수 있다."],
+    [12, "훌륭하다. 틀린 문항의 장 링크로 한 번만 더 짚어 보자."],
+    [8, "절반 넘게 맞혔다. 틀린 문항의 장에서 그림을 직접 만져 보면 많이 오른다."],
+    [0, "괜찮다. 문항 옆 장 링크에서 해당 그림을 직접 움직여 보자."],
+  ];
+  const answered = new Map();
+  function paintScore() {
+    const total = QUESTIONS.length;
+    const rightCount = Array.from(answered.values()).filter(Boolean).length;
+    const wrongCount = answered.size - rightCount;
+    document.getElementById("score-value").textContent = `${rightCount} / ${total}`;
+    document.getElementById("score-right").style.width = (100 * rightCount / total) + "%";
+    document.getElementById("score-wrong").style.width = (100 * wrongCount / total) + "%";
+    let message = "아직 푼 문항이 없다.";
+    if (answered.size === total) message = SCORE_MESSAGES.find(([minimum]) => rightCount >= minimum)[1];
+    else if (answered.size) message = `${answered.size}문항 풀었다. ${total - answered.size}문항 남았다.`;
+    document.getElementById("score-message").textContent = message;
+  }
+  // 정답 표시는 common.js(버튼마다 붙은 리스너)가 맡고, 여기서는 점수만 센다.
+  quizList.addEventListener("click", (event) => {
+    const button = event.target.closest("button.opt");
+    if (!button) return;
+    const question = button.closest(".quiz-q");
+    const index = +question.dataset.index;
+    if (answered.has(index)) return;
+    const optionIndex = Array.from(question.querySelectorAll("button.opt")).indexOf(button);
+    answered.set(index, optionIndex === +question.dataset.answer);
+    paintScore();
+  });
+  document.getElementById("score-reset").addEventListener("click", () => {
+    answered.clear();
+    quizList.querySelectorAll(".quiz-q").forEach((question) => {
+      question.classList.remove("done");
+      question.querySelectorAll("button.opt").forEach((button) => { button.disabled = false; button.classList.remove("right", "wrong"); });
+    });
+    paintScore();
+    document.getElementById("final-quiz").scrollIntoView({ behavior: "smooth" });
+  });
+  paintScore();
+})();
+</script>
+</body>
+</html>

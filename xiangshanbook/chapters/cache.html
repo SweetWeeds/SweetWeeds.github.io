@@ -1,0 +1,873 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>L2·L3 캐시와 일관성 · XiangShanBook</title>
+<meta name="description" content="XiangShan 곤명호 v3의 CoupledL2와 OpenLLC. TileLink와 CHI, L2의 INVALID/BRANCH/TRUNK/TIP 상태, LLC의 클라이언트 디렉터리와 스누프, MSHR 파이프라인을 두 코어 시뮬레이터로 따라간다.">
+<link rel="icon" type="image/svg+xml" href="../favicon.svg">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/common.js"></script>
+<style>
+  .address-input { font-family: var(--mono); font-size: 14px; padding: 6px 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg-elev); color: var(--text); width: 100%; }
+  .operation-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px 18px; }
+  .operation-grid .ctrl-row b { min-width: 46px; font-size: 13.5px; }
+  .message-log { max-height: 220px; overflow-y: auto; font-size: 13.5px; padding: 10px 18px; border-top: 1px solid var(--border); background: var(--surface); }
+  .message-log ol { margin: 0; padding-left: 20px; }
+  .message-log li { margin: 2px 0; }
+  .channel-tag { font-family: var(--mono); font-size: 11px; font-weight: 700; padding: 0 5px; border-radius: 4px; margin-right: 4px; }
+</style>
+</head>
+<body data-chapter="cache">
+<main class="chapter">
+  <header class="chapter-hero">
+    <div class="eyebrow">Chapter 12</div>
+    <h1>L2·L3 캐시와 일관성</h1>
+    <p class="lead">코어 하나에 붙은 L1 데이터 캐시는 64 KiB다. 프로그램이 다루는 데이터는 그보다 훨씬 크고, 코어가 여럿이면 같은 데이터를 여러 캐시가 나눠 갖는다. 곤명호 v3는 코어마다 사적인 2 MiB L2인 <b>CoupledL2</b>를 두고, 모든 코어가 함께 쓰는 마지막 단계 캐시인 <b>OpenLLC</b>를 그 아래에 둔다. 이 장에서는 두 캐시가 어떤 '말'로 대화하는지 다룬다. L1과 L2는 TileLink로, L2와 L3는 ARM의 CHI로 말한다. 그리고 같은 캐시 라인을 두 코어가 동시에 쓰려 할 때 누가 무엇을 버려야 하는지도 따라간다.</p>
+    <ul class="objectives">
+      <li>DefaultConfig의 L1D·L2·L3 크기, 웨이, 뱅크를 코드에서 읽고, 물리 주소를 뱅크·세트·태그로 나눈다.</li>
+      <li>CoupledL2의 상태(INVALID·BRANCH·TRUNK·TIP)와 CHI의 상태(I·SC·UC·UD)가 어떻게 대응하는지 이해한다.</li>
+      <li>TileLink 요청이 CHI 요청으로 바뀌는 규칙과, 두 코어가 같은 라인을 읽고 쓸 때 오가는 메시지를 단계별로 따라간다.</li>
+      <li>OpenLLC가 클라이언트 디렉터리로 '누구에게 스누프를 보낼지' 고르는 방식과, 디렉터리가 꽉 찰 때 벌어지는 역무효화를 실험한다.</li>
+      <li>CoupledL2 슬라이스의 파이프라인(s1~s5)과 MSHR 16개가 미스를 어떻게 겹쳐 처리하는지 본다.</li>
+    </ul>
+  </header>
+
+  <!-- ============================================================ 1 -->
+  <section id="hierarchy">
+    <h2>세 겹의 캐시</h2>
+    <p>곤명호 v3의 기본 구성(<code>DefaultConfig</code>)은 설정 조각 넷을 쌓아 만든다. L1D는 <code>WithNKBL1D</code>, L2는 <code>L2CacheConfig</code>, L3는 <code>OpenLLCConfig</code>가 정한다. 각 조각은 용량을 웨이·뱅크·라인 크기(64바이트)로 나눠 세트 수를 계산한다.</p>
+    <div class="callout code"><strong>DefaultConfig</strong>
+<pre><code><span class="c">// src/main/scala/top/Configs.scala:581-587</span>
+<span class="k">class</span> DefaultConfig(n: Int = 1) <span class="k">extends</span> Config(
+  OpenLLCConfig(<span class="s">"32MB"</span>, ways = 16, banks = 4)
+    ++ ZhuJiangConfig(<span class="s">"32MB"</span>, ways = 16)
+    ++ L2CacheConfig(<span class="s">"2MB"</span>, inclusive = true, banks = 4, tp = false)
+    ++ WithNKBL1D(64, ways = 4, numMemChannels = 2)
+    ++ <span class="k">new</span> BaseConfig(n)
+)</code></pre>
+    </div>
+    <div class="table-wrap"><table>
+      <tr><th>캐시</th><th>용량 · 웨이 · 뱅크</th><th class="num">세트 (뱅크당)</th><th>MSHR · 교체</th><th>위치</th></tr>
+      <tr><td>L1 DCache</td><td class="mono">64 KiB · 4웨이</td><td class="num">256</td><td class="mono">미스 16 · probe 8 · release 18 · setplru</td><td class="mono">Configs.scala:296-316</td></tr>
+      <tr><td>L2 (CoupledL2)</td><td class="mono">2 MiB · 8웨이 · 4뱅크(슬라이스), 포함형</td><td class="num">1,024</td><td class="mono">슬라이스당 16 · drrip</td><td class="mono">Configs.scala:318-375, L2Param.scala:70-80</td></tr>
+      <tr><td>L3 (OpenLLC)</td><td class="mono">32 MiB · 16웨이 · 4뱅크</td><td class="num">8,192</td><td class="mono">refill/response/snoop/memory 각 16 · plru</td><td class="mono">Configs.scala:377-404, openLLC/LLCParam.scala:30-42</td></tr>
+    </table></div>
+    <p>L2 세트 수는 2 MiB ÷ 4뱅크 ÷ 8웨이 ÷ 64 B = 1,024이고, L3는 32 MiB ÷ 4 ÷ 16 ÷ 64 = 8,192다. L2는 반드시 포함형<span class="en">(inclusive)</span>이다(<code>require(inclusive, "L2 must be inclusive")</code>). 곧 L1D에 있는 라인은 L2에도 반드시 있다. 그래서 L2 디렉터리는 L1D가 무엇을 갖고 있는지 따로 추적한다(<code>clientCaches</code>). L1D 쪽 디렉터리는 L1D 세트의 2배 크기에 웨이를 2개 더 둔다. L3도 같은 방식으로 '코어들의 L2가 무엇을 갖고 있는가'를 추적하는 <b>클라이언트 디렉터리</b>를 따로 둔다. 그 크기는 모든 L2 용량 합의 2배에 웨이 +2다(<code>Configs.scala:382-399</code>). 물리 주소는 48비트, CHI 버전은 Issue E.b가 기본이다(<code>Makefile:52</code>, <code>ISSUE ?= E.b</code>).</p>
+
+    <figure class="play" id="fig-ladder">
+      <div class="play-view"><canvas id="cv-ladder"></canvas></div>
+      <div class="play-ctrl">
+        <div class="seg" id="ladder-config"><button data-value="default" class="on">DefaultConfig</button><button data-value="minimal">MinimalConfig</button></div>
+        <label class="ctrl"><span>L1 적중률 <output id="ladder-l1-out"></output></span><input type="range" id="ladder-l1" min="0.5" max="0.99" step="0.01" value="0.95"></label>
+        <label class="ctrl"><span>L2 적중률 (L1 미스 중) <output id="ladder-l2-out"></output></span><input type="range" id="ladder-l2" min="0" max="0.99" step="0.01" value="0.7"></label>
+        <label class="ctrl"><span>L3 적중률 (L2 미스 중) <output id="ladder-l3-out"></output></span><input type="range" id="ladder-l3" min="0" max="0.99" step="0.01" value="0.5"></label>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">평균 접근 시간 (가정 지연)</span><span class="v" id="ladder-amat">—</span></div>
+        <div class="stat"><span class="k">DRAM까지 가는 비율</span><span class="v" id="ladder-dram">—</span></div>
+        <div class="stat"><span class="k">총 캐시 용량</span><span class="v" id="ladder-capacity">—</span></div>
+      </div>
+      <figcaption><span class="try">만져 보기</span>막대 길이는 각 단계의 용량(로그 눈금)이다. 오른쪽 숫자는 계단을 하나 내려갈 때마다 늘어나는 지연이다. 지연값 4·16·45·180 사이클은 계산 원리를 보이기 위한 <b>가정값</b>이고, 곤명호 v3에서 잰 값이 아니다. 적중률을 바꾸면 평균 접근 시간이 계산된다. L1 적중률이 95%에서 90%로 떨어질 때 평균 지연이 얼마나 뛰는지 보자. MinimalConfig는 L1D 32 KiB, L2 128 KiB(1뱅크), L3 4 MiB(8웨이)로 줄인 시뮬레이션용 구성이다(<code>Configs.scala:91-94</code>).</figcaption>
+    </figure>
+  </section>
+
+  <!-- ============================================================ 2 -->
+  <section id="address">
+    <h2>주소 하나가 가는 곳</h2>
+    <p>캐시는 물리 주소를 세 조각으로 나눠 쓴다. 맨 아래 6비트는 64바이트 라인 안의 위치(오프셋)다. 그 위 몇 비트가 <b>뱅크</b>(슬라이스)를 고르고, 다시 그 위가 <b>세트</b>, 나머지가 <b>태그</b>다. CoupledL2의 <code>parseAddress</code>는 오프셋과 뱅크 비트를 건너뛴 위치에서 세트를 자른다. OpenLLC도 주소를 <code>Cat(tag, set, bank, off)</code> 순서로 다시 조립한다(<code>openLLC/MainPipe.scala:320-324</code>). 연속한 라인이 뱅크 4개에 번갈아 흩어지므로, 순차 접근이 한 뱅크에 몰리지 않는다.</p>
+    <div class="callout code"><strong>CoupledL2 주소 분해</strong>
+<pre><code><span class="c">// XSCache/src/main/scala/coupledL2/CoupledL2.scala:226-231</span>
+<span class="k">def</span> parseAddress(x: UInt): (UInt, UInt, UInt) = {
+  <span class="k">val</span> offset = x
+  <span class="k">val</span> set    = offset >> (offsetBits + bankBits)
+  <span class="k">val</span> tag    = set >> setBits
+  (ZeroExt(tag, tagBits), set(setBits - 1, 0), offset(offsetBits - 1, 0))
+}</code></pre>
+    </div>
+    <figure class="play" id="fig-address">
+      <div class="play-ctrl" style="border-top:0;border-bottom:1px solid var(--border)">
+        <label class="ctrl"><span>물리 주소 (48비트, 16진수)</span><input class="address-input" id="address-input" value="0x0000_8123_4567"></label>
+        <div class="seg" id="address-config"><button data-value="default" class="on">DefaultConfig</button><button data-value="minimal">MinimalConfig</button></div>
+        <button class="btn sm" id="address-next">다음 라인 (+64 B)</button>
+      </div>
+      <div class="play-view"><canvas id="cv-address"></canvas></div>
+      <figcaption><span class="try">만져 보기</span>위에서부터 L1D, L2, L3가 같은 주소를 자르는 방식이다. '다음 라인'을 여러 번 누르면 L2·L3의 뱅크 번호가 0→1→2→3으로 돌고, 세트는 네 번에 한 번씩 오르는 것을 볼 수 있다. L1D의 64 KiB 4웨이는 웨이 하나가 16 KiB라서 세트 인덱스에 4 KiB 페이지 경계 위의 비트 2개가 섞인다. L1D는 가상 주소로 세트를 고르므로(VIPT), 같은 물리 라인이 다른 세트에 놓이는 '별칭'이 생길 수 있다. 그래서 곤명호 v3는 이 2비트를 <code>AliasKey</code>로 L2에 넘겨 L2가 별칭을 정리하게 한다(<code>MissQueue.scala:304</code>). 이 그림은 가상 주소와 물리 주소가 같다고 가정했다. 그래도 L1D는 단순 비트 분할이 아니다. 세트 상위 비트는 주소 [47:12]의 2비트 단위 XOR 해시에서, 하위 6비트는 [11:6]에서 얻는다. 물리 태그는 [47:12]다(<code>L1Cache.scala:81-105</code>). MinimalConfig는 세트가 128개라 해시 하위 1비트만 쓰고, 웨이는 8 KiB다.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ============================================================ 3 -->
+  <section id="states">
+    <h2>두 개의 언어: TileLink와 CHI</h2>
+    <p>L1D와 L2 사이는 <b>TileLink</b>다. TileLink의 캐시 일관성 프로토콜(TL-C)은 채널 다섯 개로 이루어진다. A(요청: Acquire), B(L2가 L1에게 내리는 Probe), C(L1의 응답과 쫓아내기: ProbeAck·Release), D(응답: Grant), E(마무리: GrantAck)다. 권한은 N(없음), B(Branch: 읽기 전용 공유), T(Trunk: 쓸 수 있는 유일본) 세 단계로 표현한다. L2와 L3 사이는 ARM의 <b>CHI</b>다. 채널은 REQ, RSP, DAT, SNP 넷이고, 라인 상태는 I(무효), SC(공유·깨끗), UC(유일·깨끗), UD(유일·더러움)다.</p>
+    <p>CoupledL2의 디렉터리는 라인마다 2비트 상태를 갖는다(<code>coupledL2/Consts.scala:26-31</code>). 주석을 그대로 옮기면 다음과 같다.</p>
+    <div class="table-wrap"><table>
+      <tr><th>L2 상태</th><th>코드 주석</th><th>뜻</th><th>CHI로 보면</th></tr>
+      <tr><td class="mono">INVALID</td><td class="mono">way is empty</td><td>라인 없음</td><td class="mono">I</td></tr>
+      <tr><td class="mono">BRANCH</td><td class="mono">outer slave cache is trunk</td><td>읽기 전용 사본. 쓰기 권한은 바깥(L3 쪽)에 있다</td><td class="mono">SC</td></tr>
+      <tr><td class="mono">TRUNK</td><td class="mono">unique inner master cache is trunk</td><td>쓰기 권한이 있고, 그 권한을 L1이 넘겨받아 갖고 있다</td><td class="mono">UC / UD</td></tr>
+      <tr><td class="mono">TIP</td><td class="mono">we are trunk, inner masters are branch</td><td>쓰기 권한이 L2에 있고, L1은 많아야 읽기 사본만 갖는다</td><td class="mono">UC / UD</td></tr>
+    </table></div>
+    <p>L2의 미스 처리기(MSHR)는 L1이 보낸 TileLink 요청을 CHI 요청으로 바꿔 L3에 보낸다. 변환 규칙은 코드 주석에 표로 적혀 있다.</p>
+    <div class="callout code"><strong>TileLink → CHI 요청 변환</strong>
+<pre><code><span class="c">// XSCache/src/main/scala/coupledL2/MSHR.scala:376-393</span>
+<span class="c">/**           TL                  CHI
+  *  Get                  |  ReadNotSharedDirty
+  *  AcquireBlock NtoB    |  ReadNotSharedDirty
+  *  AcquireBlock NtoT    |  ReadUnique
+  *  AcquirePerm NtoT     |  MakeUnique
+  *  AcquirePerm BtoT     |  MakeUnique
+  *  PrefetchRead         |  ReadNotSharedDirty
+  *  PrefetchWrite        |  ReadUnique              */</span>
+oa.opcode := ParallelPriorityMux(Seq(
+  release_valid2  -> req_released_chiOpcode,
+  req_cboClean    -> CleanShared,
+  req_cboFlush    -> CleanInvalid,
+  req_cboInval    -> MakeInvalid,
+  req_acquirePerm -> MakeUnique,
+  req_needT       -> ReadUnique,
+  req_needB       -> ReadNotSharedDirty))</code></pre>
+    </div>
+    <p>L1D는 적재 미스면 <code>AcquireBlock NtoB</code>를, 저장 미스면 <code>NtoT</code>를 보낸다. 이미 읽기 사본(B)을 가진 라인에 쓰려면 <code>BtoT</code>로 권한만 올려 달라고 한다. 라인 전체를 덮어쓸 때만 데이터 없이 권한만 받는 <code>AcquirePerm</code>을 쓴다(<code>MissQueue.scala:287-302</code>). 재미있는 최적화도 하나 있다. L1이 읽기(NtoB)만 요청해도 L2가 쓰기 권한(TIP)을 갖고 있으면, L2는 읽기 권한 대신 쓰기 권한(toT)을 준다(<code>req_promoteT</code>, <code>MSHR.scala:744</code>). 다른 코어가 갖고 있지 않은 라인이니, 나중에 쓰게 되더라도 다시 물을 필요가 없게 해 두는 것이다.</p>
+  </section>
+
+  <!-- ============================================================ 4 -->
+  <section id="coherence">
+    <h2>두 코어가 한 라인을 다툴 때</h2>
+    <p>OpenLLC는 CHI의 <b>홈 노드</b><span class="en">(Home Node)</span>다. 모든 요청이 홈 노드를 거치고, 홈 노드는 두 디렉터리를 본다. 하나는 자기 데이터 배열에 무엇이 있는지 적은 <b>자기 디렉터리</b>로, 라인마다 valid·dirty 비트를 둔다. 다른 하나는 어느 코어의 L2가 그 라인을 갖고 있는지 적은 <b>클라이언트 디렉터리</b>로, 코어마다 valid 비트 하나를 둔다(<code>openLLC/Directory.scala:38-60</code>). 요청이 오면 홈 노드는 요청 종류를 다섯 부류로 나눈다(<code>openLLC/MainPipe.scala:139-151</code>).</p>
+    <div class="table-wrap"><table>
+      <tr><th>부류</th><th>해당 요청</th><th>홈 노드가 하는 일</th><th>요청자 상태</th></tr>
+      <tr><td>배타</td><td class="mono">ReadUnique, MakeUnique, 다른 코어에 없는 ReadNotSharedDirty</td><td>다른 코어 사본을 스누프로 무효화하고, 자기 사본도 무효화한다(라인을 요청자에게 넘김)</td><td class="mono">UC (자기 사본이 더러웠으면 UD)</td></tr>
+      <tr><td>공유</td><td class="mono">다른 코어에 있는 ReadNotSharedDirty</td><td>그 코어를 SC로 내리고, 자기 사본이 없으면 받아 채운다</td><td class="mono">SC</td></tr>
+      <tr><td>반납</td><td class="mono">WriteBackFull, Evict, WriteEvictOrEvict</td><td>요청자의 클라이언트 비트를 지우고, 데이터를 자기 배열에 채운다</td><td class="mono">I</td></tr>
+      <tr><td>무효화 · 정리</td><td class="mono">MakeInvalid, CleanInvalid, CleanShared</td><td>캐시 관리 명령(CMO)을 처리한다</td><td class="mono">I / 그대로</td></tr>
+    </table></div>
+    <p>배타 요청이 홈 노드의 사본까지 무효화한다는 점이 흥미롭다. 라인이 어느 코어의 L2로 독점적으로 넘어가면 LLC는 그 사본을 버리고, L2가 라인을 쫓아낼 때(반납) 다시 받아 채운다. LLC가 L2에서 밀려난 라인을 받아 두는 '희생 캐시'처럼 동작하는 셈이다. 아래 시뮬레이터에서 이 규칙들이 실제 메시지로 어떻게 펼쳐지는지 따라가 보자.</p>
+
+    <div class="sim" id="sim-coherence">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>두 코어 일관성 시뮬레이터 (라인 X 하나)</h3>
+        <div class="seg" id="coherence-view"><button data-value="both" class="on">메시지 + 채널</button><button data-value="opcode">메시지만</button></div>
+      </div>
+      <div class="sim-view"><canvas id="cv-coherence"></canvas></div>
+      <div class="sim-controls">
+        <div class="operation-grid">
+          <div class="ctrl-row"><b>코어 0</b><button class="btn sm" data-core="0" data-operation="read">읽기</button><button class="btn sm" data-core="0" data-operation="write">쓰기</button><button class="btn sm" data-core="0" data-operation="evict">L2에서 쫓아내기</button></div>
+          <div class="ctrl-row"><b>코어 1</b><button class="btn sm" data-core="1" data-operation="read">읽기</button><button class="btn sm" data-core="1" data-operation="write">쓰기</button><button class="btn sm" data-core="1" data-operation="evict">L2에서 쫓아내기</button></div>
+          <div class="ctrl-row"><button class="btn sm" id="coherence-replay">⟲ 메시지 다시 보기</button><button class="btn sm" id="coherence-reset">⏮ 처음 상태</button></div>
+        </div>
+      </div>
+      <div class="message-log" id="coherence-log"></div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">이번 동작의 메시지 수</span><span class="v" id="coherence-count">0</span></div>
+        <div class="stat"><span class="k">누적 스누프</span><span class="v" id="coherence-snoops">0</span></div>
+        <div class="stat"><span class="k">DRAM 접근</span><span class="v" id="coherence-memory">0</span></div>
+      </div>
+      <figcaption><span class="try">따라가 보기</span>세로줄은 왼쪽부터 코어 0의 L1·L2, 홈 노드(L3), 코어 1의 L2·L1, DRAM이다. 버튼을 누르면 그 동작이 만드는 메시지가 화살표로 차례로 그려진다. 채널 색은 TileLink(A·B·C·D·E)와 CHI(REQ·RSP·DAT·SNP)를 구분한다. 맨 위 칸은 각 캐시의 현재 상태다. 이렇게 해 보자. ① 코어 0 읽기(메모리에서 가져와 UC, L1에는 toT로 승격) → ② 코어 1 읽기(코어 0을 SC로 내리고 둘 다 공유) → ③ 코어 1 쓰기(SC에서 ReadUnique, 코어 0 무효화) → ④ 코어 1 쫓아내기(더러운 데이터를 WriteBackFull로 LLC에 반납). 이 시뮬레이터는 실제 RTL의 요청 종류와 상태 전이 규칙을 따르지만, 응답 메시지는 대표적인 것만 그린 간략판이다. 예를 들어 CHI의 CompData와 CompAck, DBID 핸드셰이크 일부를 합쳐 그렸다.</figcaption>
+    </div>
+
+    <div class="predict"><strong>공유 상태에서 쓰기</strong>
+      <p>두 코어가 라인 X를 SC로 나눠 가진 상태에서 코어 0이 쓰려고 한다. L1은 이미 데이터를 갖고 있으니 권한만 올리면 된다. L2가 L3에 보내는 CHI 요청은 MakeUnique일까 ReadUnique일까?</p>
+      <details><summary>답 보기</summary><p>ReadUnique다. L1D는 권한 상승에도 <code>AcquireBlock BtoT</code>를 쓴다. <code>AcquirePerm</code>은 라인 전체를 덮어쓸 때만 쓴다. CoupledL2는 <code>req_acquirePerm</code>일 때만 MakeUnique를 고르므로, 일반 AcquireBlock의 BtoT는 <code>req_needT</code> → ReadUnique가 된다. 시뮬레이터에서 직접 확인해 보자.</p></details>
+    </div>
+  </section>
+
+  <!-- ============================================================ 5 -->
+  <section id="snoopfilter">
+    <h2>누구에게 물어볼 것인가: 클라이언트 디렉터리</h2>
+    <p>스누프를 모든 코어에 뿌리는 방식(브로드캐스트)은 코어가 늘면 감당할 수 없다. OpenLLC는 클라이언트 디렉터리에서 그 라인을 가진 코어만 골라 스누프를 보낸다. 대상은 요청자를 뺀 '동료 RN' 중 valid 비트가 켜진 코어들이다(<code>peerRNs_valids_vec</code>). 요청 종류에 따라 스누프의 종류도 달라진다(<code>openLLC/MainPipe.scala:340-355</code>). ReadUnique는 SnpUnique, ReadNotSharedDirty는 SnpNotSharedDirty, MakeUnique·MakeInvalid는 SnpMakeInvalid를 보낸다.</p>
+    <p>대가도 있다. 클라이언트 디렉터리도 유한한 캐시라서 꽉 차면 엔트리 하나를 내보내야 한다. 그 엔트리가 가리키던 라인을 아직 갖고 있는 코어가 있다면, 추적을 잃기 전에 그 사본을 거둬들여야 한다. 그래서 그 코어들에 SnpUnique를 보내 라인을 회수하고 LLC에 채운다(<code>replace_snoop</code>). 이것을 <span class="term">역무효화</span><span class="en">(back-invalidation)</span>라 부른다. 곤명호 v3가 클라이언트 디렉터리를 모든 L2 용량 합의 2배로 넉넉히 잡은 이유가 여기 있다.</p>
+    <div class="callout code"><strong>스누프 대상과 종류 고르기</strong>
+<pre><code><span class="c">// XSCache/src/main/scala/openLLC/MainPipe.scala:333-355</span>
+snp_task_s4.snpVec := VecInit(Mux(replace_snoop_s4,
+  clients_valids_vec_s4.asUInt,     <span class="c">// 역무효화: 가진 코어 전부</span>
+  peerRNs_valids_vec_s4.asUInt      <span class="c">// 보통: 요청자 외에 가진 코어</span>
+).asBools)
+snp_task_s4.chiOpcode := Mux(replace_snoop_s4, SnpUnique,
+  MuxLookup(Cat(readUnique_s4, readNotSharedDirty_s4,
+                makeUnique_s4 || makeInvalid_s4, cleanInvalid_s4, cleanShared_s4), SnpUnique)(Seq(
+    ... -> SnpCleanShared,  ... -> SnpCleanInvalid,  ... -> SnpMakeInvalid,
+    ... -> SnpNotSharedDirty,  ... -> SnpUnique)))</code></pre>
+    </div>
+
+    <div class="sim" id="sim-filter">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>클라이언트 디렉터리 대 브로드캐스트</h3>
+        <div class="seg" id="filter-sharing"><button data-value="private">대부분 사적</button><button data-value="mixed" class="on">섞임</button><button data-value="shared">대부분 공유</button></div>
+      </div>
+      <div class="sim-view"><canvas id="cv-filter"></canvas></div>
+      <div class="sim-controls">
+        <label class="ctrl"><span>코어 수 <output id="filter-cores-out"></output></span><input type="range" id="filter-cores" min="2" max="16" step="1" value="4"></label>
+        <label class="ctrl"><span>디렉터리 엔트리 (L2 라인 합 대비) <output id="filter-capacity-out"></output></span><input type="range" id="filter-capacity" min="0.25" max="2" step="0.25" value="2"></label>
+        <label class="ctrl"><span>쓰기 비율 <output id="filter-write-out"></output></span><input type="range" id="filter-write" min="0" max="0.6" step="0.05" value="0.2"></label>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">디렉터리 스누프</span><span class="v" id="filter-directory">—</span></div>
+        <div class="stat"><span class="k">브로드캐스트 스누프</span><span class="v" id="filter-broadcast">—</span></div>
+        <div class="stat"><span class="k">역무효화</span><span class="v" id="filter-backinvalidate">—</span></div>
+      </div>
+      <figcaption><span class="try">만져 보기</span>코어마다 L2 라인 64개짜리 축소 모델에 요청 2만 개를 흘린다. 막대 둘은 스누프 메시지 수다. 클라이언트 디렉터리는 라인을 가진 코어에만 보내고, 브로드캐스트는 요청자 외 모든 코어에 보낸다. 오른쪽 격자는 마지막 순간의 디렉터리 일부로, 행 하나가 라인 하나이고 칸이 코어별 valid 비트다. 디렉터리 크기를 L2 라인 합의 2배(곤명호 v3 설정)에서 0.25배로 줄이면 역무효화가 급격히 늘어난다. 공유가 많을수록 스누프 자체는 피할 수 없지만, 브로드캐스트와의 차이는 코어 수에 비례해 벌어진다. 모델은 완전 연관 디렉터리와 LRU 교체를 가정했다.</figcaption>
+    </div>
+  </section>
+
+  <!-- ============================================================ 6 -->
+  <section id="pipeline">
+    <h2>CoupledL2 슬라이스 안에서</h2>
+    <p>CoupledL2는 슬라이스(뱅크) 4개로 나뉘고, 슬라이스마다 독립된 파이프라인을 갖는다. 위쪽(L1)에서 들어오는 길은 <code>SinkA</code>(Acquire·Get), <code>SinkC</code>(Release·ProbeAck)다. 아래쪽(L3)으로 나가는 길은 <code>TXREQ</code>·<code>TXRSP</code>·<code>TXDAT</code>이고, 들어오는 길은 <code>RXSNP</code>·<code>RXRSP</code>·<code>RXDAT</code>이다(<code>coupledL2/Slice.scala:43-64</code>). 그 사이에서 요청은 <code>RequestBuffer</code>를 거쳐 <code>RequestArb</code>에서 순서를 받고, <code>MainPipe</code>를 지난다.</p>
+    <div class="table-wrap"><table>
+      <tr><th>단계</th><th>하는 일</th><th>위치</th></tr>
+      <tr><td class="mono">s0</td><td>MSHR이 다시 보내는 작업(리필, 응답 데이터 등)이 들어온다</td><td class="mono">RequestArb.scala:111</td></tr>
+      <tr><td class="mono">s1</td><td>채널 요청과 MSHR 작업 중 하나를 골라 디렉터리(태그·메타) 읽기를 시작한다</td><td class="mono">RequestArb.scala:121, Directory.scala:209-212</td></tr>
+      <tr><td class="mono">s2</td><td>태그·메타가 나온다</td><td class="mono">MainPipe.scala:148</td></tr>
+      <tr><td class="mono">s3</td><td>적중·웨이를 계산한다. 적중이면 바로 응답을 만들고, 미스면 MSHR을 할당한다. 데이터 배열 읽기·쓰기를 시작한다</td><td class="mono">MainPipe.scala:152, 309, 502-511</td></tr>
+      <tr><td class="mono">s4 · s5</td><td>데이터 배열 결과를 받아 L1(D 채널)이나 L3(TXDAT)로 내보낸다</td><td class="mono">MainPipe.scala:794, 848</td></tr>
+    </table></div>
+    <p>미스가 나면 MSHR 하나가 그 요청을 끝까지 책임진다. L3에 CHI 요청을 보내고, 필요하면 L1에 Probe를 보내고, 데이터가 오면 s0로 리필 작업을 다시 넣는다. 슬라이스마다 MSHR이 16개이므로, 한 슬라이스는 동시에 16개의 미스를 겹쳐 기다릴 수 있다. 메모리 지연이 길수록 이 '겹침'이 처리량을 정한다. 리틀의 법칙으로 보면 처리량은 MSHR 수를 미스 지연으로 나눈 값을 넘을 수 없다.</p>
+    <div class="formula">$$\text{미스 처리량}_{\max} \approx \frac{N_{\text{MSHR}}}{\text{미스 지연}}\quad\Rightarrow\quad \frac{16}{200\text{ 사이클}} = 0.08\ \text{미스/사이클}$$
+      <div class="where">200사이클은 예시값이다. 미스 지연이 두 배가 되면, 같은 처리량을 유지하는 데 MSHR도 두 배가 필요하다.</div></div>
+
+    <div class="sim" id="sim-pipe">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>슬라이스 파이프라인과 MSHR</h3>
+        <button class="btn sm" id="pipe-play">⏸ 멈춤</button>
+      </div>
+      <div class="sim-view"><canvas id="cv-pipe"></canvas></div>
+      <div class="sim-controls">
+        <label class="ctrl"><span>요청 도착률 (사이클당) <output id="pipe-rate-out"></output></span><input type="range" id="pipe-rate" min="0.05" max="1" step="0.05" value="0.5"></label>
+        <label class="ctrl"><span>미스 비율 <output id="pipe-miss-out"></output></span><input type="range" id="pipe-miss" min="0" max="1" step="0.05" value="0.3"></label>
+        <label class="ctrl"><span>미스 지연 (사이클) <output id="pipe-latency-out"></output></span><input type="range" id="pipe-latency" min="20" max="400" step="10" value="120"></label>
+        <label class="ctrl"><span>MSHR 수 <output id="pipe-mshr-out"></output></span><input type="range" id="pipe-mshr" min="2" max="32" step="1" value="16"></label>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">처리량 (요청/사이클)</span><span class="v" id="pipe-throughput">—</span></div>
+        <div class="stat"><span class="k">MSHR 가득 참</span><span class="v" id="pipe-full">—</span></div>
+        <div class="stat"><span class="k">요청 버퍼 대기</span><span class="v" id="pipe-waiting">—</span></div>
+        <div class="stat"><span class="k">리틀의 법칙 한계</span><span class="v" id="pipe-bound">—</span></div>
+      </div>
+      <figcaption><span class="try">만져 보기</span>점 하나가 요청 하나다. 요청은 요청 버퍼에서 s1~s3를 지나고, 적중이면 s4·s5를 거쳐 L1으로 나간다. 미스면 아래 MSHR 칸 하나를 차지한다. 칸의 막대는 남은 지연이다. 지연이 끝나면 리필 작업이 s0로 다시 들어와 파이프라인을 한 번 더 지난다. 미스 비율과 지연을 올려 MSHR이 꽉 차는 순간을 찾아보자. MSHR이 모두 차면 새 미스는 요청 버퍼에서 기다리고, 처리량이 '리틀의 법칙 한계'에 붙는다. 사이클 수준의 축소 모델이며, 실제 RTL의 같은 세트 충돌 차단과 Probe 중첩 처리는 넣지 않았다.</figcaption>
+    </div>
+
+    <div class="callout deep"><strong>L2의 프리페처들</strong>
+      <p>DefaultConfig의 L2는 프리페처를 셋 켠다. 이미 접근한 주소들 사이에서 가장 잘 맞는 간격을 찾아 그만큼 앞을 미리 가져오는 BOP(Best-Offset Prefetcher, <code>BestOffsetPrefetch.scala</code>)가 있다. 캐시 라인에 들어 있는 값 중 포인터처럼 보이는 것을 따라가는 CDP(Content-Directed Prefetcher, Cooksey 외의 내용 기반 프리페치, <code>CDP.scala</code>)도 켜진다. 그리고 L1 쪽 프리페처가 보낸 요청을 받는 <code>PrefetchReceiver</code>가 있다. 시간 기반 프리페처 TP는 DefaultConfig에서 꺼져 있다(<code>tp = false</code>). L2 디렉터리 교체 정책은 DRRIP다(<code>L2Param.scala:78</code>).</p>
+    </div>
+  </section>
+
+  <section class="keypoints">
+    <h2>핵심 정리</h2>
+    <ol>
+      <li>DefaultConfig는 L1D 64 KiB 4웨이, L2 2 MiB 8웨이 4슬라이스(포함형), L3 OpenLLC 32 MiB 16웨이 4뱅크다. 물리 주소는 48비트, CHI는 Issue E.b다.</li>
+      <li>L2·L3는 주소를 오프셋 6비트 → 뱅크 → 세트 → 태그 순으로 자른다. 연속 라인은 뱅크를 번갈아 쓴다.</li>
+      <li>L1–L2는 TileLink(A·B·C·D·E, 권한 N/B/T), L2–L3는 CHI(REQ·RSP·DAT·SNP, 상태 I/SC/UC/UD)다. L2 상태는 INVALID·BRANCH·TRUNK·TIP이다.</li>
+      <li>L2는 AcquireBlock NtoB를 ReadNotSharedDirty로, NtoT·BtoT를 ReadUnique로, AcquirePerm을 MakeUnique로 바꾼다. L2가 쓰기 권한을 가지면 읽기 요청에도 toT를 준다(promoteT).</li>
+      <li>OpenLLC는 클라이언트 디렉터리로 라인을 가진 코어에만 스누프를 보내고, 배타 요청이면 자기 사본도 버린다. 디렉터리 엔트리를 내보낼 때는 SnpUnique로 역무효화한다.</li>
+      <li>CoupledL2 슬라이스는 s0~s5 파이프라인과 MSHR 16개로 미스를 겹쳐 처리한다. 처리량 상한은 MSHR 수 ÷ 미스 지연이다.</li>
+    </ol>
+  </section>
+
+  <section id="quiz">
+    <h2>확인 퀴즈</h2>
+    <div class="quiz">
+      <div class="quiz-q" data-answer="1"><p>Q1. DefaultConfig에서 L2 슬라이스 하나의 세트 수는?</p><div class="opts">
+        <button class="opt">4,096</button><button class="opt">1,024</button><button class="opt">512</button><button class="opt">8,192</button></div>
+        <div class="quiz-exp">2 MiB ÷ 4뱅크 ÷ 8웨이 ÷ 64 B = 1,024. 8,192는 L3(32 MiB ÷ 4 ÷ 16 ÷ 64)의 뱅크당 세트 수다.</div></div>
+      <div class="quiz-q" data-answer="3"><p>Q2. L1D가 AcquireBlock NtoT를 보냈고 L2는 그 라인이 없다. L2가 L3에 보내는 CHI 요청은?</p><div class="opts">
+        <button class="opt">ReadNotSharedDirty</button><button class="opt">MakeUnique</button><button class="opt">WriteBackFull</button><button class="opt">ReadUnique</button></div>
+        <div class="quiz-exp">MSHR의 변환표에서 AcquireBlock NtoT는 ReadUnique다. MakeUnique는 데이터가 필요 없는 AcquirePerm일 때만 쓴다.</div></div>
+      <div class="quiz-q" data-answer="0"><p>Q3. CoupledL2 상태 중 'L2가 쓰기 권한을 갖고, L1은 많아야 읽기 사본만 가진' 상태는?</p><div class="opts">
+        <button class="opt">TIP</button><button class="opt">TRUNK</button><button class="opt">BRANCH</button><button class="opt">INVALID</button></div>
+        <div class="quiz-exp">코드 주석: TIP — "we are trunk, inner masters are branch". TRUNK는 쓰기 권한을 L1이 넘겨받아 가진 경우다.</div></div>
+      <div class="quiz-q" data-answer="2"><p>Q4. 코어 1만 라인 X를 가진 상태에서 코어 0이 ReadUnique를 보냈다. OpenLLC가 하는 일로 옳은 것은?</p><div class="opts">
+        <button class="opt">모든 코어에 SnpShared를 브로드캐스트한다</button><button class="opt">코어 1을 SC로 내리고 자기 사본을 유지한다</button><button class="opt">코어 1에 SnpUnique를 보내 무효화하고, 자기 사본도 무효화한 뒤 코어 0에 UC(또는 UD)로 준다</button><button class="opt">코어 0의 요청을 거절한다</button></div>
+        <div class="quiz-exp">ReadUnique는 배타 요청이다. 클라이언트 디렉터리로 고른 코어 1에만 SnpUnique를 보내고, <code>exclusiveReq_s3</code>이면 자기 메타의 valid도 내린다.</div></div>
+      <div class="quiz-q" data-answer="1"><p>Q5. 미스 지연이 200사이클일 때 슬라이스의 MSHR 16개가 낼 수 있는 미스 처리량의 상한에 가장 가까운 것은?</p><div class="opts">
+        <button class="opt">사이클당 16개</button><button class="opt">사이클당 0.08개</button><button class="opt">사이클당 1개</button><button class="opt">사이클당 0.8개</button></div>
+        <div class="quiz-exp">리틀의 법칙: 동시에 진행 중인 미스(16) = 처리량 × 지연(200). 처리량 ≤ 16/200 = 0.08.</div></div>
+    </div>
+  </section>
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ================================================================ 구성 상수 (Configs.scala) */
+  const LINE_BYTES = 64;
+  const OFFSET_BITS = 6;
+  const PHYSICAL_ADDRESS_BITS = 48;
+  const CONFIGS = {
+    default: {
+      l1: { bytes: 64 * 1024, ways: 4 },
+      l2: { bytes: 2 * 1024 * 1024, ways: 8, banks: 4 },
+      l3: { bytes: 32 * 1024 * 1024, ways: 16, banks: 4 },
+    },
+    minimal: {
+      l1: { bytes: 32 * 1024, ways: 4 },
+      l2: { bytes: 128 * 1024, ways: 8, banks: 1 },
+      l3: { bytes: 4 * 1024 * 1024, ways: 8, banks: 4 },
+    },
+  };
+  const log2 = (value) => Math.round(Math.log2(value));
+  function geometry(level) {
+    const banks = level.banks || 1;
+    const sets = level.bytes / banks / level.ways / LINE_BYTES;
+    return { banks, sets, bankBits: log2(banks), setBits: log2(sets) };
+  }
+  function formatBytes(bytes) {
+    if (bytes >= 1024 * 1024) return Number((bytes / 1024 / 1024).toFixed(2)) + " MiB";
+    return Number((bytes / 1024).toFixed(2)) + " KiB";
+  }
+
+  /* ================================================================ 그림 12-1: 지연 계단 */
+  const ASSUMED_LATENCY = { l1: 4, l2: 16, l3: 45, dram: 180 }; // 설명용 가정값
+  let ladderConfig = "default";
+  const ladderRates = { l1: 0.95, l2: 0.7, l3: 0.5 };
+  const ladderView = MB.canvas("#cv-ladder", { aspect: 0.36, minHeight: 210, maxHeight: 290, draw(ctx, width, height) {
+    const config = CONFIGS[ladderConfig];
+    const levels = [
+      { name: "L1 DCache", bytes: config.l1.bytes, latency: ASSUMED_LATENCY.l1, color: "accent" },
+      { name: "L2 CoupledL2", bytes: config.l2.bytes, latency: ASSUMED_LATENCY.l2, color: "accent-2" },
+      { name: "L3 OpenLLC", bytes: config.l3.bytes, latency: ASSUMED_LATENCY.l3, color: "ok" },
+      { name: "DRAM", bytes: 8 * 1024 * 1024 * 1024, latency: ASSUMED_LATENCY.dram, color: "warn" },
+    ];
+    const isNarrow = width < 520;
+    const left = isNarrow ? 92 : 128, right = width - (isNarrow ? 70 : 110), top = 18;
+    const rowHeight = (height - top - 14) / levels.length;
+    const minimumLog = Math.log2(16 * 1024), maximumLog = Math.log2(8 * 1024 * 1024 * 1024);
+    levels.forEach((level, k) => {
+      const y = top + k * rowHeight;
+      const span = ((Math.log2(level.bytes) - minimumLog) / (maximumLog - minimumLog)) * (right - left);
+      ctx.fillStyle = MB.alpha(MB.css(level.color), 0.75);
+      MB.roundRect(ctx, left, y + rowHeight * 0.18, Math.max(12, span), rowHeight * 0.64, 6); ctx.fill();
+      MB.text(ctx, level.name, left - 8, y + rowHeight / 2, { align: "right", size: isNarrow ? 10.5 : 12.5, weight: 700 });
+      const capacityLabel = level.name === "DRAM" ? "수 GiB 이상" : formatBytes(level.bytes);
+      const isInside = span > (right - left) * 0.7;
+      MB.text(ctx, capacityLabel, isInside ? left + 8 : left + Math.max(12, span) + 6, y + rowHeight / 2, { size: 11.5, mono: true, color: isInside ? "#fff" : MB.css("text-dim"), weight: isInside ? 700 : 400 });
+      MB.text(ctx, `+${level.latency} cyc`, width - 10, y + rowHeight / 2, { align: "right", size: isNarrow ? 10.5 : 12, mono: true, weight: 700, color: MB.css(level.color) });
+    });
+  } });
+  function paintLadder() {
+    const config = CONFIGS[ladderConfig];
+    const l1Miss = 1 - ladderRates.l1, l2Miss = 1 - ladderRates.l2, l3Miss = 1 - ladderRates.l3;
+    const averageCycles = ASSUMED_LATENCY.l1 + l1Miss * (ASSUMED_LATENCY.l2 + l2Miss * (ASSUMED_LATENCY.l3 + l3Miss * ASSUMED_LATENCY.dram));
+    MB.set("ladder-amat", `${MB.fmt(averageCycles, 2)} <small>사이클</small>`);
+    MB.set("ladder-dram", MB.pct(l1Miss * l2Miss * l3Miss, 2));
+    MB.set("ladder-capacity", formatBytes(config.l1.bytes + config.l2.bytes + config.l3.bytes));
+    ladderView.redraw();
+  }
+  MB.seg("#ladder-config", (value) => { ladderConfig = value; paintLadder(); });
+  ["l1", "l2", "l3"].forEach((key) => MB.range(`ladder-${key}`, (value) => { ladderRates[key] = value; paintLadder(); }, (value) => MB.pct(value, 0)));
+  paintLadder();
+
+  /* ================================================================ 그림 12-2: 주소 분해 */
+  let addressValue = 0x000081234567n;
+  let addressConfig = "default";
+  const bitsOf = (value, low, width) => Number((value >> BigInt(low)) & ((1n << BigInt(width)) - 1n));
+  // L1Cache.scala:81-105. 이 그림에서는 VA = PA로 둔다.
+  function decodeL1Address(address, setBits) {
+    let hash = 0;
+    for (let bit = 12; bit < 48; bit += 2) hash ^= bitsOf(address, bit, 2);
+    const aliasBits = Math.max(0, setBits - 6);
+    const alias = hash & ((1 << aliasBits) - 1);
+    return { set: (alias << 6) | bitsOf(address, 6, Math.min(setBits, 6)),
+      tag: address >> 12n, alias, aliasBits };
+  }
+  function addressRows() {
+    const config = CONFIGS[addressConfig];
+    const l1 = geometry(config.l1), l2 = geometry(config.l2), l3 = geometry(config.l3);
+    const row = (name, level) => {
+      const fields = [{ name: "오프셋", low: 0, width: OFFSET_BITS, color: "text-faint" }];
+      let low = OFFSET_BITS;
+      if (level.bankBits) { fields.push({ name: "뱅크", low, width: level.bankBits, color: "warn" }); low += level.bankBits; }
+      fields.push({ name: "세트", low, width: level.setBits, color: "accent-2" }); low += level.setBits;
+      fields.push({ name: "태그", low, width: PHYSICAL_ADDRESS_BITS - low, color: "accent" });
+      return { name, fields, level };
+    };
+    const l1Row = { name: "L1D", level: l1, fields: [
+      { name: "오프셋", low: 0, width: 6, color: "text-faint" },
+      { name: "세트 하위", low: 6, width: 6, color: "accent-2" },
+      { name: "해시 재료 / PA 태그", low: 12, width: 36, color: "accent" },
+    ] };
+    return [l1Row, row("L2", l2), row("L3", l3)];
+  }
+  const addressView = MB.canvas("#cv-address", { aspect: 0.4, minHeight: 250, maxHeight: 320, draw(ctx, width, height) {
+    const rows = addressRows();
+    const isNarrow = width < 560;
+    const left = isNarrow ? 44 : 60, right = width - 12;
+    const bitWidth = (right - left) / PHYSICAL_ADDRESS_BITS;
+    const rowHeight = (height - 20) / rows.length;
+    rows.forEach((row, k) => {
+      const y = 10 + k * rowHeight;
+      MB.text(ctx, row.name, 10, y + 22, { size: isNarrow ? 11 : 13, weight: 800 });
+      row.fields.forEach((field) => {
+        const x = left + (PHYSICAL_ADDRESS_BITS - field.low - field.width) * bitWidth;
+        const w = field.width * bitWidth;
+        const color = MB.css(field.color);
+        ctx.fillStyle = MB.alpha(color, 0.2);
+        MB.roundRect(ctx, x + 1, y + 6, w - 2, 34, 5); ctx.fill();
+        ctx.strokeStyle = color; ctx.lineWidth = 1; ctx.stroke();
+        const value = bitsOf(addressValue, field.low, field.width);
+        if (w > 34) {
+          MB.text(ctx, `${isNarrow && field.name === "세트 하위" ? "하위" : field.name} ${field.width}b`, x + w / 2, y + 16, { align: "center", size: isNarrow ? 9 : 11, weight: 700 });
+          MB.text(ctx, field.name.includes("태그") ? "0x" + value.toString(16) : String(value), x + w / 2, y + 31, { align: "center", size: isNarrow ? 9.5 : 11.5, mono: true, color: MB.css("text-dim") });
+        } else {
+          MB.text(ctx, String(value), x + w / 2, y + 23, { align: "center", size: 10, mono: true, weight: 700 });
+        }
+      });
+      const sets = row.level.sets, banks = row.level.banks;
+      MB.text(ctx, `${banks > 1 ? `뱅크 ${banks}개 × ` : ""}세트 ${sets.toLocaleString()} × 웨이 ${CONFIGS[addressConfig][["l1", "l2", "l3"][k]].ways}`, left, y + 54, { size: isNarrow ? 9.5 : 11.5, color: MB.css("text-dim") });
+      if (k === 0) {
+        const decoded = decodeL1Address(addressValue, row.level.setBits);
+        MB.text(ctx, `세트 ${decoded.set} · 해시 ${decoded.alias} (${decoded.aliasBits}b) · 태그 0x${decoded.tag.toString(16)}`, left, y + 70, { size: isNarrow ? 9 : 11, mono: true, color: MB.css("text") });
+      }
+    });
+  } });
+  function parseHex(text) { try { return BigInt(text.replace(/_/g, "").trim()) & ((1n << BigInt(PHYSICAL_ADDRESS_BITS)) - 1n); } catch (error) { return null; } }
+  const addressInput = document.getElementById("address-input");
+  addressInput.addEventListener("input", () => { const value = parseHex(addressInput.value); if (value !== null) { addressValue = value; addressView.redraw(); } });
+  document.getElementById("address-next").onclick = () => {
+    addressValue = (addressValue + BigInt(LINE_BYTES)) & ((1n << BigInt(PHYSICAL_ADDRESS_BITS)) - 1n);
+    const raw = addressValue.toString(16).padStart(12, "0");
+    addressInput.value = "0x" + raw.replace(/\B(?=(\w{4})+(?!\w))/g, "_");
+    addressView.redraw();
+  };
+  MB.seg("#address-config", (value) => { addressConfig = value; addressView.redraw(); });
+
+  /* ================================================================ 그림 12-3: 두 코어 일관성 */
+  const LIFELINES = [
+    { key: "c0l1", label: "코어0 L1" }, { key: "c0l2", label: "코어0 L2" }, { key: "home", label: "L3 홈 노드" },
+    { key: "c1l2", label: "코어1 L2" }, { key: "c1l1", label: "코어1 L1" }, { key: "memory", label: "DRAM" },
+  ];
+  const CHANNEL_COLORS = { A: "accent", B: "warn", C: "color-pink", D: "ok", E: "text-dim", REQ: "accent-2", RSP: "text-dim", DAT: "ok", SNP: "warn", MEM: "text-faint" };
+  let coherenceState, coherenceMessages = [], coherenceShown = 0, coherenceTitle = "", coherenceTotals, coherenceView = "both";
+  function resetCoherence() {
+    coherenceState = {
+      cores: [{ l1: "I", l2: "I" }, { l1: "I", l2: "I" }], // l1: I/B/T/D, l2: I/SC/UC/UD
+      home: { valid: false, dirty: false },
+      clients: [false, false],
+    };
+    coherenceMessages = []; coherenceShown = 0; coherenceTitle = "처음 상태: 라인 X는 DRAM에만 있다.";
+    coherenceTotals = { snoops: 0, memory: 0 };
+    paintCoherence();
+  }
+  const lifelineOf = (core, level) => (core === 0 ? (level === "l1" ? "c0l1" : "c0l2") : level === "l1" ? "c1l1" : "c1l2");
+  /** L2 상태(CHI 기준)와 L1 상태로 CoupledL2 메타 상태 이름을 만든다. */
+  function coupledName(core) {
+    const { l1, l2 } = coherenceState.cores[core];
+    if (l2 === "I") return "INVALID";
+    if (l2 === "SC") return "BRANCH";
+    return l1 === "T" || l1 === "D" ? "TRUNK" : "TIP";
+  }
+  /** 다른 코어의 L2에 스누프가 왔을 때: 상태를 내리고 응답 메시지를 만든다. toShared면 SC로, 아니면 I로. */
+  function snoopPeer(peer, opcode, toShared, messages) {
+    const state = coherenceState.cores[peer];
+    const peerL2 = lifelineOf(peer, "l2"), peerL1 = lifelineOf(peer, "l1");
+    messages.push({ from: "home", to: peerL2, label: opcode, channel: "SNP" });
+    coherenceTotals.snoops++;
+    let isDirty = state.l2 === "UD";
+    if (state.l1 !== "I" && (!toShared || state.l1 === "T" || state.l1 === "D")) {
+      messages.push({ from: peerL2, to: peerL1, label: toShared ? "Probe toB" : "Probe toN", channel: "B" });
+      const l1Dirty = state.l1 === "D";
+      messages.push({ from: peerL1, to: peerL2, label: l1Dirty ? "ProbeAckData" : "ProbeAck", channel: "C" });
+      isDirty = isDirty || l1Dirty;
+      state.l1 = toShared ? "B" : "I";
+    }
+    const newState = toShared ? "SC" : "I";
+    const response = isDirty ? `SnpRespData ${newState}_PD` : `SnpResp ${newState}`;
+    messages.push({ from: peerL2, to: "home", label: response, channel: isDirty ? "DAT" : "RSP" });
+    state.l2 = newState;
+    if (!toShared) coherenceState.clients[peer] = false;
+    return isDirty;
+  }
+  function operate(core, operation) {
+    const state = coherenceState.cores[core];
+    const peer = 1 - core;
+    const l1 = lifelineOf(core, "l1"), l2 = lifelineOf(core, "l2");
+    const messages = [];
+    const home = coherenceState.home;
+    if (operation === "read") {
+      coherenceTitle = `코어 ${core} 읽기`;
+      if (state.l1 !== "I") { coherenceTitle += " — L1 적중, 메시지 없음"; }
+      else {
+        messages.push({ from: l1, to: l2, label: "AcquireBlock NtoB", channel: "A" });
+        if (state.l2 === "I") {
+          messages.push({ from: l2, to: "home", label: "ReadNotSharedDirty", channel: "REQ" });
+          const peerHolds = coherenceState.clients[peer];
+          if (peerHolds) {
+            const passedDirty = snoopPeer(peer, "SnpNotSharedDirty", true, messages);
+            if (!home.valid) { home.valid = true; home.dirty = passedDirty; }
+            else home.dirty = home.dirty || passedDirty;
+            messages.push({ from: "home", to: l2, label: "CompData SC", channel: "DAT" });
+            state.l2 = "SC";
+            coherenceTitle += " — 공유 요청: 코어 " + peer + "를 SC로 내리고 LLC에도 채운다";
+          } else {
+            let response = "UC";
+            if (home.valid) { if (home.dirty) response = "UD_PD"; home.valid = false; home.dirty = false; coherenceTitle += " — 배타 요청: LLC 사본을 넘겨주고 LLC는 무효화"; }
+            else {
+              messages.push({ from: "home", to: "memory", label: "ReadNoSnp", channel: "MEM" });
+              messages.push({ from: "memory", to: "home", label: "CompData", channel: "MEM" });
+              coherenceTotals.memory++;
+              coherenceTitle += " — 아무도 없음: DRAM에서 읽어 UC로 준다";
+            }
+            messages.push({ from: "home", to: l2, label: `CompData ${response}`, channel: "DAT" });
+            state.l2 = response === "UD_PD" ? "UD" : "UC";
+          }
+          messages.push({ from: l2, to: "home", label: "CompAck", channel: "RSP" });
+          coherenceState.clients[core] = true;
+        }
+        const promote = state.l2 === "UC" || state.l2 === "UD";
+        messages.push({ from: l2, to: l1, label: promote ? "GrantData toT (promoteT)" : "GrantData toB", channel: "D" });
+        messages.push({ from: l1, to: l2, label: "GrantAck", channel: "E" });
+        state.l1 = promote ? "T" : "B";
+      }
+    } else if (operation === "write") {
+      coherenceTitle = `코어 ${core} 쓰기`;
+      if (state.l1 === "T" || state.l1 === "D") { state.l1 = "D"; coherenceTitle += " — L1이 이미 T: 조용히 D로 (메시지 없음)"; }
+      else {
+        messages.push({ from: l1, to: l2, label: state.l1 === "B" ? "AcquireBlock BtoT" : "AcquireBlock NtoT", channel: "A" });
+        if (state.l2 === "UC" || state.l2 === "UD") { coherenceTitle += " — L2가 이미 쓰기 권한: L2 안에서 해결"; }
+        else {
+          messages.push({ from: l2, to: "home", label: "ReadUnique", channel: "REQ" });
+          let passedDirty = false;
+          if (coherenceState.clients[peer]) passedDirty = snoopPeer(peer, "SnpUnique", false, messages);
+          let dirtyResponse = passedDirty;
+          if (home.valid) { dirtyResponse = dirtyResponse || home.dirty; home.valid = false; home.dirty = false; }
+          else if (!passedDirty && state.l2 === "I") {
+            messages.push({ from: "home", to: "memory", label: "ReadNoSnp", channel: "MEM" });
+            messages.push({ from: "memory", to: "home", label: "CompData", channel: "MEM" });
+            coherenceTotals.memory++;
+          }
+          messages.push({ from: "home", to: l2, label: dirtyResponse ? "CompData UD_PD" : "CompData UC", channel: "DAT" });
+          messages.push({ from: l2, to: "home", label: "CompAck", channel: "RSP" });
+          state.l2 = dirtyResponse ? "UD" : "UC";
+          coherenceState.clients[core] = true;
+          coherenceTitle += " — 배타 요청: 다른 사본과 LLC 사본을 모두 무효화";
+        }
+        messages.push({ from: l2, to: l1, label: "GrantData toT", channel: "D" });
+        messages.push({ from: l1, to: l2, label: "GrantAck", channel: "E" });
+        state.l1 = "D";
+      }
+    } else {
+      coherenceTitle = `코어 ${core} L2에서 쫓아내기`;
+      if (state.l2 === "I") { coherenceTitle += " — 이미 없음"; }
+      else {
+        let isDirty = state.l2 === "UD";
+        if (state.l1 !== "I") {
+          messages.push({ from: l2, to: l1, label: "Probe toN (포함성 유지)", channel: "B" });
+          const l1Dirty = state.l1 === "D";
+          messages.push({ from: l1, to: l2, label: l1Dirty ? "ProbeAckData" : "ProbeAck", channel: "C" });
+          isDirty = isDirty || l1Dirty;
+          state.l1 = "I";
+        }
+        const isUnique = state.l2 === "UC" || state.l2 === "UD";
+        if (isDirty && isUnique) {
+          messages.push({ from: l2, to: "home", label: "WriteBackFull", channel: "REQ" });
+          messages.push({ from: "home", to: l2, label: "CompDBIDResp", channel: "RSP" });
+          messages.push({ from: l2, to: "home", label: "CopyBackWrData UD_PD", channel: "DAT" });
+          home.valid = true; home.dirty = true;
+          coherenceTitle += " — 더러운 데이터를 WriteBackFull로 LLC에 반납";
+        } else {
+          messages.push({ from: l2, to: "home", label: "WriteEvictOrEvict", channel: "REQ" });
+          if (!home.valid) {
+            // LLC에 사본이 없으면 데이터를 받아 채운다(refill). 있으면 Comp만 돌려준다.
+            messages.push({ from: "home", to: l2, label: "CompDBIDResp", channel: "RSP" });
+            messages.push({ from: l2, to: "home", label: `CopyBackWrData ${state.l2}`, channel: "DAT" });
+            home.valid = true; home.dirty = false;
+          } else messages.push({ from: "home", to: l2, label: "Comp", channel: "RSP" });
+          coherenceTitle += " — 깨끗한 라인을 WriteEvictOrEvict로 반납(Issue E.b)";
+        }
+        state.l2 = "I";
+        coherenceState.clients[core] = false;
+      }
+    }
+    coherenceMessages = messages;
+    coherenceShown = 0;
+    paintCoherence();
+    coherenceLoop.running = true;
+  }
+  const coherenceCanvas = MB.canvas("#cv-coherence", { aspect: 0.6, minHeight: 360, maxHeight: 520, draw(ctx, width, height) {
+    if (!coherenceState) return;
+    const isNarrow = width < 560;
+    const columnWidth = (width - 20) / LIFELINES.length;
+    const xOf = (key) => 10 + LIFELINES.findIndex((l) => l.key === key) * columnWidth + columnWidth / 2;
+    const headerHeight = 78;
+    LIFELINES.forEach((lifeline) => {
+      const x = xOf(lifeline.key);
+      let stateText = "", stateColor = MB.css("text-dim");
+      const core = lifeline.key.startsWith("c0") ? 0 : lifeline.key.startsWith("c1") ? 1 : -1;
+      if (core >= 0 && lifeline.key.endsWith("l1")) { const s = coherenceState.cores[core].l1; stateText = { I: "N (없음)", B: "B 읽기", T: "T 쓰기권", D: "T + dirty" }[s]; stateColor = s === "I" ? MB.css("text-faint") : s === "B" ? MB.css("accent-2") : MB.css("accent"); }
+      if (core >= 0 && lifeline.key.endsWith("l2")) { const s = coherenceState.cores[core].l2; stateText = `${s} · ${coupledName(core)}`; stateColor = s === "I" ? MB.css("text-faint") : s === "SC" ? MB.css("accent-2") : MB.css("accent"); }
+      if (lifeline.key === "home") { const h = coherenceState.home; stateText = `자기 ${h.valid ? (h.dirty ? "V·dirty" : "V") : "—"} · 코어[${coherenceState.clients.map((c) => (c ? 1 : 0)).join("")}]`; stateColor = MB.css("ok"); }
+      if (lifeline.key === "memory") stateText = "원본";
+      ctx.fillStyle = MB.css("surface");
+      MB.roundRect(ctx, x - columnWidth / 2 + 3, 8, columnWidth - 6, headerHeight - 14, 8); ctx.fill();
+      MB.text(ctx, lifeline.label, x, 24, { align: "center", size: isNarrow ? 9.5 : 12, weight: 800 });
+      MB.text(ctx, stateText, x, 48, { align: "center", size: isNarrow ? 8 : 10.5, mono: true, weight: 700, color: stateColor });
+      ctx.strokeStyle = MB.css("border"); ctx.setLineDash([4, 4]); ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x, headerHeight); ctx.lineTo(x, height - 26); ctx.stroke(); ctx.setLineDash([]);
+    });
+    const visible = coherenceMessages.slice(0, coherenceShown);
+    const rowHeight = Math.min(30, (height - headerHeight - 40) / Math.max(1, coherenceMessages.length));
+    visible.forEach((message, k) => {
+      const y = headerHeight + 14 + k * rowHeight;
+      const x1 = xOf(message.from), x2 = xOf(message.to);
+      const color = MB.css(CHANNEL_COLORS[message.channel]);
+      MB.arrow(ctx, x1, y, x2, y, color, 1.8, 7);
+      const label = coherenceView === "both" ? `[${message.channel}] ${message.label}` : message.label;
+      const middle = (x1 + x2) / 2;
+      ctx.font = `700 ${isNarrow ? 8.5 : 11}px ${MB.css("font")}`;
+      const textWidth = ctx.measureText(label).width + 8;
+      ctx.fillStyle = MB.css("bg-elev");
+      ctx.fillRect(middle - textWidth / 2, y - 15, textWidth, 13);
+      MB.text(ctx, label, middle, y - 8, { align: "center", size: isNarrow ? 8.5 : 11, weight: 700, color });
+    });
+    MB.text(ctx, coherenceTitle, 10, height - 12, { size: isNarrow ? 10 : 12.5, weight: 700, color: MB.css("text") });
+  } });
+  function paintCoherence() {
+    MB.set("coherence-count", String(coherenceMessages.length));
+    MB.set("coherence-snoops", String(coherenceTotals.snoops));
+    MB.set("coherence-memory", String(coherenceTotals.memory));
+    const log = document.getElementById("coherence-log");
+    if (!coherenceMessages.length) log.innerHTML = `<span class="dim">${coherenceTitle}</span>`;
+    else log.innerHTML = `<b>${coherenceTitle}</b><ol>` + coherenceMessages.map((message, k) => {
+      const from = LIFELINES.find((l) => l.key === message.from).label, to = LIFELINES.find((l) => l.key === message.to).label;
+      return `<li style="opacity:${k < coherenceShown ? 1 : 0.35}"><span class="channel-tag" style="color:var(--${CHANNEL_COLORS[message.channel]});border:1px solid var(--${CHANNEL_COLORS[message.channel]})">${message.channel}</span>${message.label} <span class="dim small">(${from} → ${to})</span></li>`;
+    }).join("") + "</ol>";
+    coherenceCanvas.redraw();
+  }
+  const coherenceLoop = MB.loop(document.getElementById("sim-coherence"), (() => {
+    let accumulated = 0;
+    return (dt) => {
+      accumulated += dt;
+      if (accumulated < 0.45) return;
+      accumulated = 0;
+      if (coherenceShown < coherenceMessages.length) { coherenceShown++; paintCoherence(); }
+      else coherenceLoop.running = false;
+    };
+  })());
+  document.getElementById("sim-coherence").addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-operation]");
+    if (button) operate(+button.dataset.core, button.dataset.operation);
+  });
+  document.getElementById("coherence-replay").onclick = () => { coherenceShown = 0; paintCoherence(); coherenceLoop.running = true; };
+  document.getElementById("coherence-reset").onclick = resetCoherence;
+  MB.seg("#coherence-view", (value) => { coherenceView = value; coherenceCanvas.redraw(); });
+  resetCoherence();
+
+  /* ================================================================ 그림 12-4: 클라이언트 디렉터리 */
+  const FILTER_REQUEST_COUNT = 20000;
+  const FILTER_L2_LINES_PER_CORE = 64;
+  let filterCores = 4, filterCapacity = 2, filterWrite = 0.2, filterSharing = "mixed";
+  const SHARING_FRACTION = { private: 0.05, mixed: 0.3, shared: 0.7 };
+  /** 코어별 L2(LRU)와 완전 연관 클라이언트 디렉터리(LRU)를 함께 돌린다. */
+  function simulateFilter() {
+    const random = MB.rng(41);
+    const coreCaches = Array.from({ length: filterCores }, () => new Map()); // 라인 → true (LRU 순서)
+    const directory = new Map(); // 라인 → Set(코어)
+    const directoryCapacity = Math.max(4, Math.round(filterCapacity * FILTER_L2_LINES_PER_CORE * filterCores));
+    const sharedLines = 96, privateLines = 400;
+    let directorySnoops = 0, broadcastSnoops = 0, backInvalidations = 0;
+    const touchCore = (core, line) => {
+      const cache = coreCaches[core];
+      if (cache.has(line)) cache.delete(line);
+      else if (cache.size >= FILTER_L2_LINES_PER_CORE) {
+        const victim = cache.keys().next().value;
+        cache.delete(victim);
+        const holders = directory.get(victim);
+        if (holders) { holders.delete(core); if (!holders.size) directory.delete(victim); }
+      }
+      cache.set(line, true);
+    };
+    for (let i = 0; i < FILTER_REQUEST_COUNT; i++) {
+      const core = Math.floor(random() * filterCores);
+      const isShared = random() < SHARING_FRACTION[filterSharing];
+      const line = isShared ? Math.floor(random() * sharedLines) : 1000 + core * privateLines + Math.floor(random() * privateLines);
+      const isWrite = random() < filterWrite;
+      if (coreCaches[core].has(line) && !isWrite) { touchCore(core, line); continue; } // L2 적중이면 LLC까지 안 간다
+      let holders = directory.get(line);
+      if (!holders) {
+        if (directory.size >= directoryCapacity) {
+          const victimLine = directory.keys().next().value;
+          const victimHolders = directory.get(victimLine);
+          directory.delete(victimLine);
+          victimHolders.forEach((holder) => { coreCaches[holder].delete(victimLine); backInvalidations++; });
+        }
+        holders = new Set();
+      } else directory.delete(line);
+      directory.set(line, holders); // LRU 갱신
+      const peers = [...holders].filter((holder) => holder !== core);
+      directorySnoops += peers.length;
+      broadcastSnoops += filterCores - 1;
+      if (isWrite) peers.forEach((peer) => { coreCaches[peer].delete(line); holders.delete(peer); });
+      holders.add(core);
+      touchCore(core, line);
+    }
+    const snapshot = [...directory.entries()].slice(-14).map(([line, holders]) => ({ line, holders: new Set(holders) }));
+    return { directorySnoops, broadcastSnoops, backInvalidations, snapshot };
+  }
+  let filterResult = null;
+  const filterView = MB.canvas("#cv-filter", { aspect: 0.42, minHeight: 240, maxHeight: 320, draw(ctx, width, height) {
+    if (!filterResult) return;
+    const isNarrow = width < 560;
+    const chartWidth = isNarrow ? width * 0.5 : width * 0.46;
+    const maximum = Math.max(filterResult.broadcastSnoops, 1);
+    const bars = [
+      { label: "디렉터리", value: filterResult.directorySnoops, color: "ok" },
+      { label: "브로드캐스트", value: filterResult.broadcastSnoops, color: "bad" },
+      { label: "역무효화", value: filterResult.backInvalidations, color: "warn" },
+    ];
+    const barArea = height - 50;
+    const barWidth = (chartWidth - 30) / bars.length;
+    bars.forEach((bar, k) => {
+      const barHeight = (bar.value / maximum) * barArea;
+      const x = 16 + k * barWidth;
+      ctx.fillStyle = MB.css(bar.color);
+      MB.roundRect(ctx, x + 6, height - 28 - barHeight, barWidth - 12, Math.max(1, barHeight), 5); ctx.fill();
+      MB.text(ctx, bar.value.toLocaleString(), x + barWidth / 2, height - 34 - barHeight, { align: "center", size: isNarrow ? 9.5 : 11.5, mono: true, weight: 700 });
+      MB.text(ctx, bar.label, x + barWidth / 2, height - 14, { align: "center", size: isNarrow ? 9.5 : 11.5, color: MB.css("text-dim") });
+    });
+    // 디렉터리 일부
+    const gridLeft = chartWidth + 20, gridRight = width - 12;
+    const shownCores = Math.min(filterCores, 16);
+    const cellWidth = (gridRight - gridLeft - 46) / shownCores;
+    const rows = filterResult.snapshot;
+    const cellHeight = Math.min(16, (height - 34) / Math.max(1, rows.length));
+    MB.text(ctx, "디렉터리 엔트리 (최근)", gridLeft, 10, { size: 11, color: MB.css("text-dim"), weight: 700 });
+    rows.forEach((row, r) => {
+      const y = 22 + r * cellHeight;
+      MB.text(ctx, row.line < 1000 ? `S${row.line}` : `P${row.line - 1000}`, gridLeft, y + cellHeight / 2, { size: 9, mono: true, color: MB.css("text-faint") });
+      for (let c = 0; c < shownCores; c++) {
+        ctx.fillStyle = row.holders.has(c) ? MB.css("accent") : MB.css("surface");
+        ctx.fillRect(gridLeft + 46 + c * cellWidth, y + 1, cellWidth - 2, cellHeight - 2);
+      }
+    });
+  } });
+  function paintFilter() {
+    filterResult = simulateFilter();
+    MB.set("filter-directory", filterResult.directorySnoops.toLocaleString());
+    MB.set("filter-broadcast", filterResult.broadcastSnoops.toLocaleString());
+    MB.set("filter-backinvalidate", filterResult.backInvalidations.toLocaleString());
+    filterView.redraw();
+  }
+  MB.range("filter-cores", (value) => { filterCores = value; paintFilter(); }, (value) => `${value}개`);
+  MB.range("filter-capacity", (value) => { filterCapacity = value; paintFilter(); }, (value) => `${value}배`);
+  MB.range("filter-write", (value) => { filterWrite = value; paintFilter(); }, (value) => MB.pct(value, 0));
+  MB.seg("#filter-sharing", (value) => { filterSharing = value; paintFilter(); });
+  paintFilter();
+
+  /* ================================================================ 그림 12-5: 슬라이스 파이프라인과 MSHR */
+  const PIPE_STAGES = ["s1", "s2", "s3", "s4", "s5"];
+  const REQUEST_BUFFER_SIZE = 8;
+  let pipeRate = 0.5, pipeMiss = 0.3, pipeLatency = 120, pipeMshrCount = 16;
+  let pipe;
+  function resetPipe() {
+    pipe = { cycle: 0, buffer: [], stages: [null, null, null, null, null], mshrs: [], refillQueue: [], completed: 0, fullCycles: 0, waitingCycles: 0, random: MB.rng(53), history: [] };
+  }
+  /** 한 사이클 진행. 단계는 뒤에서부터 민다. */
+  function stepPipe() {
+    pipe.cycle++;
+    const stages = pipe.stages;
+    // s5를 떠나는 요청은 완료
+    if (stages[4]) { if (!stages[4].isRefillEntry || stages[4].isFinal) pipe.completed++; stages[4] = null; }
+    for (let k = 4; k > 0; k--) {
+      if (!stages[k] && stages[k - 1]) {
+        const request = stages[k - 1];
+        // s3에서 미스면 MSHR을 할당하고 파이프라인을 떠난다.
+        if (k - 1 === 2 && request.isMiss && !request.isRefillEntry) {
+          pipe.mshrs.push({ remaining: pipeLatency, total: pipeLatency });
+          stages[k - 1] = null;
+          continue;
+        }
+        stages[k] = request; stages[k - 1] = null;
+      }
+    }
+    // MSHR 진행: 지연이 끝나면 리필 작업이 s0 → s1로 다시 들어온다.
+    pipe.mshrs.forEach((mshr) => mshr.remaining--);
+    const finished = pipe.mshrs.filter((mshr) => mshr.remaining <= 0);
+    pipe.mshrs = pipe.mshrs.filter((mshr) => mshr.remaining > 0);
+    finished.forEach(() => pipe.refillQueue.push({ isRefillEntry: true, isFinal: true }));
+    // 도착
+    if (pipe.random() < pipeRate) {
+      if (pipe.buffer.length < REQUEST_BUFFER_SIZE) pipe.buffer.push({ isMiss: pipe.random() < pipeMiss, arrived: pipe.cycle });
+    }
+    // s1 입구: MSHR 작업(리필)이 우선. 새 미스는 MSHR이 꽉 차면 들어가지 못한다.
+    const inFlightMisses = pipe.mshrs.length + stages.filter((s) => s && s.isMiss && !s.isRefillEntry).length;
+    const isMshrFull = inFlightMisses >= pipeMshrCount;
+    if (isMshrFull) pipe.fullCycles++;
+    if (!stages[0]) {
+      if (pipe.refillQueue.length) stages[0] = pipe.refillQueue.shift();
+      else if (pipe.buffer.length) {
+        const index = pipe.buffer.findIndex((request) => !request.isMiss || !isMshrFull);
+        if (index >= 0) stages[0] = pipe.buffer.splice(index, 1)[0];
+      }
+    }
+    if (pipe.buffer.length) pipe.waitingCycles++;
+    if (pipe.cycle % 20 === 0) pipe.history.push(pipe.completed / pipe.cycle);
+  }
+  const pipeView = MB.canvas("#cv-pipe", { aspect: 0.5, minHeight: 290, maxHeight: 380, draw(ctx, width, height) {
+    if (!pipe) return;
+    const isNarrow = width < 560;
+    const top = 26, stageHeight = 44;
+    const bufferWidth = isNarrow ? 70 : 110;
+    const stageWidth = (width - bufferWidth - 40) / PIPE_STAGES.length;
+    MB.text(ctx, "요청 버퍼", 12, top - 12, { size: 11, color: MB.css("text-dim"), weight: 700 });
+    ctx.fillStyle = MB.css("surface"); MB.roundRect(ctx, 12, top, bufferWidth - 8, stageHeight, 8); ctx.fill();
+    pipe.buffer.forEach((request, k) => {
+      ctx.fillStyle = request.isMiss ? MB.css("warn") : MB.css("ok");
+      ctx.beginPath(); ctx.arc(22 + (k % 4) * ((bufferWidth - 26) / 4), top + 14 + Math.floor(k / 4) * 16, 5, 0, Math.PI * 2); ctx.fill();
+    });
+    PIPE_STAGES.forEach((name, k) => {
+      const x = bufferWidth + 12 + k * stageWidth;
+      ctx.fillStyle = MB.css("surface"); MB.roundRect(ctx, x + 3, top, stageWidth - 6, stageHeight, 8); ctx.fill();
+      ctx.strokeStyle = MB.css("border"); ctx.stroke();
+      MB.text(ctx, name, x + stageWidth / 2, top - 10, { align: "center", size: 11, mono: true, color: MB.css("text-dim"), weight: 700 });
+      const request = pipe.stages[k];
+      if (request) {
+        ctx.fillStyle = request.isRefillEntry ? MB.css("accent-2") : request.isMiss ? MB.css("warn") : MB.css("ok");
+        ctx.beginPath(); ctx.arc(x + stageWidth / 2, top + stageHeight / 2, 9, 0, Math.PI * 2); ctx.fill();
+      }
+    });
+    // MSHR 칸
+    const mshrTop = top + stageHeight + 34;
+    MB.text(ctx, `MSHR ${pipe.mshrs.length} / ${pipeMshrCount}`, 12, mshrTop - 12, { size: 11.5, weight: 700, color: pipe.mshrs.length >= pipeMshrCount ? MB.css("bad") : MB.css("text-dim") });
+    const perRow = 16, cellWidth = (width - 24) / perRow, cellHeight = 20;
+    for (let k = 0; k < pipeMshrCount; k++) {
+      const x = 12 + (k % perRow) * cellWidth, y = mshrTop + Math.floor(k / perRow) * (cellHeight + 4);
+      ctx.fillStyle = MB.css("surface"); ctx.fillRect(x + 1, y, cellWidth - 2, cellHeight);
+      const mshr = pipe.mshrs[k];
+      if (mshr) { ctx.fillStyle = MB.css("warn"); ctx.fillRect(x + 1, y, (cellWidth - 2) * (mshr.remaining / mshr.total), cellHeight); }
+    }
+    // 처리량 추이
+    const chartTop = mshrTop + 2 * (cellHeight + 4) + 16;
+    if (height - chartTop > 50) {
+      const history = pipe.history.slice(-120);
+      MB.lineChart(ctx, width, height - chartTop, [{ color: MB.css("accent"), data: history }], { pad: { l: 44, r: 12, t: chartTop + 12, b: 4 }, yMin: 0, yMax: Math.max(0.2, pipeRate * 1.1), yFormat: (v) => v.toFixed(2), xFormat: () => "" });
+      MB.text(ctx, "누적 처리량", 48, chartTop + 4, { size: 11, color: MB.css("text-dim") });
+    }
+  } });
+  function paintPipeReadout() {
+    MB.set("pipe-throughput", MB.fmt(pipe.completed / Math.max(1, pipe.cycle), 3));
+    MB.set("pipe-full", MB.pct(pipe.fullCycles / Math.max(1, pipe.cycle), 0));
+    MB.set("pipe-waiting", MB.pct(pipe.waitingCycles / Math.max(1, pipe.cycle), 0));
+    const bound = pipeMiss > 0 ? Math.min(1, pipeMshrCount / pipeLatency / pipeMiss) : 1;
+    MB.set("pipe-bound", MB.fmt(bound, 3));
+  }
+  resetPipe();
+  const pipeLoop = MB.loop(document.getElementById("sim-pipe"), (() => {
+    let accumulated = 0;
+    return (dt) => {
+      accumulated += dt;
+      const cyclesPerFrame = Math.max(1, Math.round(accumulated * 60));
+      accumulated = 0;
+      for (let k = 0; k < cyclesPerFrame; k++) stepPipe();
+      paintPipeReadout();
+      pipeView.redraw();
+    };
+  })());
+  MB.playButton("pipe-play", pipeLoop);
+  const restartPipe = () => { resetPipe(); paintPipeReadout(); pipeView.redraw(); };
+  MB.range("pipe-rate", (value) => { pipeRate = value; restartPipe(); }, (value) => value.toFixed(2));
+  MB.range("pipe-miss", (value) => { pipeMiss = value; restartPipe(); }, (value) => MB.pct(value, 0));
+  MB.range("pipe-latency", (value) => { pipeLatency = value; restartPipe(); });
+  MB.range("pipe-mshr", (value) => { pipeMshrCount = value; restartPipe(); });
+  paintPipeReadout();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,767 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ROB와 커밋, 리다이렉트 · XiangShanBook</title>
+<meta name="description" content="XiangShan 곤명호 v3의 재정렬 버퍼(ROB). 352칸 원형 큐와 줄 단위 8폭 커밋, 정밀 예외와 인터럽트, 가장 오래된 리다이렉트 고르기, 스냅샷과 워크로 리네임 상태를 되돌리는 과정.">
+<link rel="icon" type="image/svg+xml" href="../favicon.svg">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/common.js"></script>
+<style>
+  .rob-list { display: grid; gap: 4px; padding: 14px 18px; font-family: var(--mono); font-size: 13px; }
+  .rob-row { display: grid; grid-template-columns: 44px minmax(0, 1fr) 92px; gap: 8px; align-items: center; padding: 5px 10px; border-radius: 7px; background: var(--surface); border: 1.5px solid transparent; }
+  .rob-row.head { border-color: var(--accent); }
+  .rob-row.done { background: color-mix(in srgb, var(--ok) 13%, transparent); }
+  .rob-row.committed { opacity: .45; }
+  .rob-row.flushed { background: color-mix(in srgb, var(--bad) 13%, transparent); text-decoration: line-through; opacity: .7; }
+  .rob-row .state { text-align: right; font-size: 12px; color: var(--text-dim); }
+  .rob-row .tag { font-size: 11px; color: var(--warn); margin-left: 6px; }
+  .redirect-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); padding: 14px 18px; }
+  .redirect-card { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; background: var(--bg); font-size: 14px; }
+  .redirect-card.off { opacity: .45; }
+  .redirect-card h5 { margin: 0 0 6px; font-size: 13.5px; display: flex; justify-content: space-between; align-items: center; gap: 6px; }
+  .redirect-card label { display: grid; gap: 2px; font-size: 13px; color: var(--text-dim); margin-top: 4px; }
+  .rat-table { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; padding: 0 18px 14px; font-family: var(--mono); font-size: 13px; }
+  .rat-table div { background: var(--surface); border-radius: 8px; padding: 8px 10px; }
+  .rat-table b { color: var(--accent-2); }
+  .rat-table .wrong { color: var(--bad); }
+</style>
+</head>
+<body data-chapter="rob">
+<main class="chapter">
+  <header class="chapter-hero">
+    <div class="eyebrow">Chapter 08</div>
+    <h1>ROB와 커밋, 리다이렉트</h1>
+    <p class="lead">비순차 코어는 명령어를 뒤죽박죽 실행한다. 그래도 프로그램은 한 줄씩 차례로 실행된 것처럼 보여야 한다. 예외가 나면 그 앞 명령까지만 끝나 있어야 하고, 분기를 잘못 예측했다면 그 뒤에 실행한 일은 흔적 없이 지워야 한다. 이 약속을 지키는 장치가 <span class="term">재정렬 버퍼</span><span class="en">(ROB, Reorder Buffer)</span>다. XiangShan 곤명호 v3의 ROB는 352칸짜리 원형 큐로, 매 사이클 최대 8개 명령을 순서대로 확정(커밋)하고, 무엇을 버리고 어디서 다시 시작할지를 정한다.</p>
+    <ul class="objectives">
+      <li>ROB 엔트리에 무엇이 저장되는지, 왜 결과 값은 저장하지 않는지 설명한다.</li>
+      <li>"정렬된 8칸 줄 안에서만" 커밋하는 규칙과, 오래 걸리는 적재가 머리를 막을 때의 영향을 시뮬레이터로 잰다.</li>
+      <li>예외와 인터럽트가 ROB 머리에서만 처리되어 정밀해지는 과정을 사이클 단위로 따라간다.</li>
+      <li>동시에 들어온 리다이렉트 중 가장 오래된 것을 원형 포인터의 flag 비트로 고르는 방법을 직접 계산한다.</li>
+      <li>리다이렉트 뒤 리네임 상태를 스냅샷과 워크로 되돌리는 데 걸리는 사이클을 비교한다.</li>
+    </ul>
+  </header>
+
+  <!-- ============================================================ 1 -->
+  <section id="entry">
+    <h2>ROB는 무엇을 기억하나</h2>
+    <p>리네임 단계는 명령어마다 ROB 칸 하나를 차례로 배정하고, 그 칸 번호 <code>robIdx</code>를 명령어에 붙여 보낸다. 이후 이슈 큐, 실행 유닛, 메모리 블록 어디에서든 "이 명령이 저 명령보다 오래되었나?"는 robIdx만 비교하면 된다. 실행을 마친 명령은 쓰기 단계에서 자기 칸에 "끝났음"을 표시한다. ROB는 머리<span class="en">(deqPtr)</span>부터 끝난 명령을 순서대로 확정한다.</p>
+    <p>곤명호 v3의 ROB 칸에는 <b>결과 값이 없다</b>. 값은 이미 리네임 단계에서 배정된 물리 레지스터에 쓰였다. ROB가 커밋할 때 하는 일은 "이 물리 레지스터가 이제 아키텍처 상태다"라고 선언하고, 덮어쓰인 옛 물리 레지스터를 해제 목록에 돌려주는 것이다. 그래서 칸 하나는 작다. 아래는 <code>RobEntryBundle</code>(<code>RobBundles.scala:55-83</code>)의 주요 필드다.</p>
+    <div class="table-wrap"><table>
+      <tr><th>필드</th><th>뜻</th></tr>
+      <tr><td class="mono">valid</td><td>칸이 쓰이고 있는가</td></tr>
+      <tr><td class="mono">uopNum</td><td>아직 쓰기를 마치지 않은 마이크로 연산 수. 0이 되면 커밋 가능(<code>commit_w</code>)</td></tr>
+      <tr><td class="mono">rfWen · fpWen · dirtyVs</td><td>정수·부동소수·벡터 레지스터를 쓰는가. 커밋 때 해제와 상태 비트 갱신에 쓴다</td></tr>
+      <tr><td class="mono">commitType</td><td>적재·스토어·분기 등 커밋할 때 다르게 다뤄야 하는 종류</td></tr>
+      <tr><td class="mono">ftqIdx · ftqOffset · isRVC</td><td>명령어 PC를 FTQ에서 되찾기 위한 위치(PC 자체는 저장하지 않는다)</td></tr>
+      <tr><td class="mono">interrupt_safe</td><td>이 명령이 머리에 있을 때 인터럽트를 받아도 되는가</td></tr>
+      <tr><td class="mono">needFlush</td><td>예외·flushPipe 등 커밋 때 파이프라인을 비워야 하는 명령인가</td></tr>
+      <tr><td class="mono">fflags · vxsat · mmio</td><td>부동소수 예외 플래그, 벡터 포화, MMIO 접근 여부</td></tr>
+    </table></div>
+    <div class="table-wrap"><table>
+      <tr><th>파라미터</th><th class="num">값</th><th>위치</th></tr>
+      <tr><td>RobSize</td><td class="num">352</td><td class="mono">Parameters.scala:114</td></tr>
+      <tr><td>CommitWidth · RobCommitWidth</td><td class="num">8 · 8</td><td class="mono">Parameters.scala:83-84</td></tr>
+      <tr><td>RabSize (리네임 버퍼)</td><td class="num">352</td><td class="mono">Parameters.scala:115</td></tr>
+      <tr><td>RenameSnapshotNum</td><td class="num">4</td><td class="mono">Parameters.scala:88</td></tr>
+      <tr><td>VTypeBufferSize</td><td class="num">64</td><td class="mono">Parameters.scala:116</td></tr>
+    </table></div>
+  </section>
+
+  <!-- ============================================================ 2 -->
+  <section id="commit">
+    <h2>8칸 줄 단위로 커밋하기</h2>
+    <p>ROB 352칸은 8개 뱅크에 번갈아 나뉘어 있다(<code>Rob.scala:173, 214</code>). 그래서 연속한 8칸이 뱅크마다 하나씩, 한 '줄'을 이룬다(모두 44줄). 커밋은 머리가 속한 <b>정렬된 줄 하나 안에서만</b> 일어난다. <code>RobDeqPtrWrapper</code>는 머리 줄의 8칸에 대해 "커밋 가능하거나 이미 커밋함" 비트를 만든다. 그리고 앞에서부터 처음으로 0이 나오는 위치까지를 이번 사이클 커밋 수로 정한다. 그래서 머리가 줄 끝 근처에 있으면, 뒤 줄에 끝난 명령이 쌓여 있어도 이번 사이클에는 몇 개밖에 커밋하지 못한다. 대신 한 사이클에 한 줄만 읽으면 되니 ROB를 여러 포트로 만들 필요가 없다.</p>
+    <div class="callout code"><strong>줄 안에서의 커밋 수</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/backend/rob/RobDeqPtrWrapper.scala:71-78</span>
+<span class="k">val</span> realCommitLast = deqPtrVec(0).lineHeadPtr + Fill(bankAddrWidth, 1.U)
+<span class="k">val</span> commit_exception = io.exception_state.valid &amp;&amp; !isAfter(io.exception_state.bits.robIdx, realCommitLast)
+<span class="k">val</span> canCommit = VecInit((0 until CommitWidth).map(i =&gt; io.deq_v(i) &amp;&amp; io.deq_w(i) || io.hasCommitted(i)))
+<span class="k">val</span> normalCommitCnt = PriorityEncoder(canCommit.map(c =&gt; !c) :+ true.B) - PopCount(io.hasCommitted)
+<span class="k">val</span> allowOnlyOne = io.allowOnlyOneCommit
+<span class="k">val</span> commitCnt = Mux(allowOnlyOne, canCommit(realCommitLast.value), normalCommitCnt)</code></pre>
+    </div>
+    <div class="sim" id="sim-ring">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>원형 ROB 돌려 보기</h3>
+        <div class="seg" id="ring-rule"><button data-value="line" class="on">줄 단위 커밋 (XS)</button><button data-value="free">아무 8칸 (비교용)</button></div>
+      </div>
+      <div class="sim-view"><canvas id="cv-ring"></canvas></div>
+      <div class="sim-controls">
+        <label class="ctrl"><span>ROB 크기 (그림용 축소) <output id="ring-size-out"></output></span><input type="range" id="ring-size" min="16" max="96" step="8" value="64"></label>
+        <label class="ctrl"><span>캐시 미스 비율 <output id="ring-miss-out"></output></span><input type="range" id="ring-miss" min="0" max="0.1" step="0.005" value="0.02"></label>
+        <label class="ctrl"><span>미스 지연 <output id="ring-lat-out"></output></span><input type="range" id="ring-lat" min="10" max="200" step="10" value="60"></label>
+        <div class="ctrl-row"><button class="btn sm" id="ring-reset">⏮ 처음부터</button><button class="btn sm" id="ring-play">⏸ 멈춤</button><button class="btn sm" id="ring-step">한 사이클 →</button></div>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">커밋 IPC</span><span class="v" id="ring-ipc">—</span></div>
+        <div class="stat"><span class="k">ROB 가득 참</span><span class="v" id="ring-full">—</span></div>
+        <div class="stat"><span class="k">머리가 안 끝나 멈춤</span><span class="v" id="ring-head">—</span></div>
+        <div class="stat"><span class="k">줄 끝에 걸려 덜 커밋</span><span class="v" id="ring-line">—</span></div>
+      </div>
+      <figcaption><span class="try">돌려 보기</span>원 둘레의 칸이 ROB 엔트리다. 회색은 빈 칸, 파랑은 실행 중, 초록은 쓰기를 마친 칸, 주황은 캐시 미스로 오래 걸리는 적재다. 바깥 눈금은 8칸 줄의 경계다. 빨간 삼각형이 머리(deqPtr), 파란 삼각형이 꼬리(enqPtr)다. 매 사이클 최대 8개가 들어오고 8개가 커밋된다. 미스 하나가 머리에 오면 뒤의 칸이 다 끝나 초록이어도 커밋이 멈추고, 곧 ROB가 가득 차 리네임까지 멈춘다. '줄 끝에 걸려 덜 커밋'은 줄 경계 때문에 8개보다 적게 커밋한 사이클 비율이다. 웹 모델의 명령은 서로 독립이고, 미스가 아니면 1~4사이클에 끝난다. 기본값(64칸, 미스 2%, 지연 60)으로 3,000사이클을 node에서 돌렸다. 커밋 IPC는 줄 단위 1.74, 아무 8칸 1.77로 차이가 작았다. 이 모델에서 성능을 정한 것은 줄 경계가 아니라 머리를 막은 미스였다(머리 막힘 사이클 77%).</figcaption>
+    </div>
+    <p>ROB가 클수록 머리를 막은 미스 하나를 견디는 시간이 길어진다. 미스 지연 동안 뒤에서 들어온 명령을 계속 받아 실행해 두면, 미스가 풀리는 순간 한꺼번에 커밋할 수 있다. 이 효과를 크기별로 그려 보자.</p>
+    <div class="formula">$$\text{필요한 ROB 크기} \approx \text{원하는 IPC} \times \text{머리를 막는 지연}$$
+      <div class="where">리틀의 법칙. 미스 지연 60사이클 동안 IPC 4를 유지하려면 그 사이 들어올 240개 명령을 담을 칸이 필요하다.</div></div>
+    <figure class="play" id="fig-sweep">
+      <div class="play-view"><canvas id="cv-sweep"></canvas></div>
+      <div class="play-ctrl">
+        <label class="ctrl"><span>미스 지연 <output id="sw-lat-out"></output></span><input type="range" id="sw-lat" min="20" max="300" step="10" value="60"></label>
+      </div>
+      <figcaption><span class="try">바꿔 보기</span>같은 웹 모델로 ROB 크기를 16칸에서 352칸까지 바꾸며 3,000사이클씩 돌린 커밋 IPC다. 곡선은 미스 비율 0%, 0.2%, 0.5%, 2%다. 미스가 없으면 작은 ROB로도 8에 가깝다. 미스가 있으면 ROB를 키울수록 IPC가 오른다. 예를 들어 지연 60, 미스 0.5%에서 64칸은 2.57, 352칸은 6.27이었다. 미스 지연을 늘리면 포화점이 오른쪽으로 밀린다. 실제 코어에서는 명령 사이 의존과 다른 큐(로드·스토어 큐, 물리 레지스터, 이슈 큐)가 먼저 차기도 하므로, 이 그림은 ROB만 따로 떼어 본 상한이다.</figcaption>
+    </figure>
+    <p>커밋을 막는 이유는 "머리가 안 끝났다" 말고도 여럿이다. <code>Rob.scala:822-823</code>의 <code>blockCommit</code>이 모아 둔 조건은 다음과 같다.</p>
+    <div class="table-wrap"><table>
+      <tr><th>조건</th><th>뜻</th></tr>
+      <tr><td class="mono">misPredBlock</td><td>분기 오예측 결과가 쓰기 단계에 도착하면, 3비트 카운터를 111로 채우고 한 비트씩 밀어 몇 사이클 동안 커밋을 멈춘다(리다이렉트가 ROB에 닿기 전에 커밋이 앞서 나가지 않게)</td></tr>
+      <tr><td class="mono">lastCycleFlush · io.redirect.valid</td><td>지난 사이클에 파이프라인을 비웠거나, 이번 사이클에 리다이렉트가 들어왔다</td></tr>
+      <tr><td class="mono">hasWFI</td><td>WFI(인터럽트 대기) 명령으로 잠들어 있다</td></tr>
+      <tr><td class="mono">deqNeedFlush &amp;&amp; !deqHasFlushed</td><td>머리 명령이 비움이 필요한데 아직 비우지 않았다</td></tr>
+      <tr><td class="mono">criticalErrorState · traceBlock</td><td>치명적 오류 상태이거나, 트레이스 출력이 밀려 있다</td></tr>
+    </table></div>
+  </section>
+
+  <!-- ============================================================ 3 -->
+  <section id="exception">
+    <h2>정밀한 예외와 인터럽트</h2>
+    <p>적재가 페이지 폴트를 냈다고 하자. 이 사실은 적재 파이프라인에서 일찍 알 수 있지만, XiangShan은 그때 바로 트랩으로 뛰지 않는다. 그 적재보다 오래된 명령이 아직 끝나지 않았을 수 있고, 그 명령이 또 다른 예외를 낼 수도 있기 때문이다. 대신 예외 정보를 <code>ExceptionGen</code>에 맡긴다. <code>ExceptionGen</code>은 들어온 예외들 중 robIdx가 가장 오래된 하나만 기억한다(<code>ExceptionGen.scala:53-79</code>의 <code>getOldest</code>). 예외 난 명령이 ROB 머리에 도착하면, 그제야 ROB는 <code>flushOut</code>으로 파이프라인 전체를 비우고 트랩을 일으킨다. 그 앞 명령은 모두 커밋되었고 그 뒤 명령은 하나도 커밋되지 않았으므로, 상태가 정확히 "예외 직전"이 된다. 이것이 <span class="term">정밀 예외</span><span class="en">(precise exception)</span>다.</p>
+    <p>인터럽트는 바깥에서 아무 때나 온다. ROB는 인터럽트 비트가 서 있으면 한 사이클에 하나씩만 커밋하며 기회를 본다. 그리고 머리에 있는 명령이 <code>interrupt_safe</code>일 때 그 명령을 커밋하지 않고 비운 뒤 인터럽트를 받는다. 적재·스토어·Fence·CSR·vset·AMO는 안전하지 않은 명령으로 표시된다. 적재·스토어는 MMIO일 수 있어 이미 바깥 장치에 요청이 나갔을지 모르기 때문이다.</p>
+    <div class="callout code"><strong>인터럽트를 받아도 되는 명령</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/backend/rob/Rob.scala:1184-1189</span>
+<span class="k">val</span> allow_interrupts = !CommitType.isLoadStore(io.enq.req(i).bits.commitType) &amp;&amp;
+                       !FuType.isFence(io.enq.req(i).bits.fuType) &amp;&amp;
+                       !FuType.isCsr(io.enq.req(i).bits.fuType) &amp;&amp;
+                       !FuType.isVset(io.enq.req(i).bits.fuType) &amp;&amp;
+                       !FuType.isAMO(io.enq.req(i).bits.fuType)
+robEntries(allocatePtrVec(i).value).interrupt_safe := allow_interrupts</code></pre>
+    </div>
+    <div class="sim" id="sim-excp">
+      <div class="sim-head"><span class="sim-tag">STEP</span><h3>머리에서 일어나는 일</h3>
+        <div class="seg" id="ex-scene"><button data-value="none" class="on">예외 없음</button><button data-value="fault">5번 적재 페이지 폴트</button><button data-value="intr">인터럽트 도착</button></div>
+      </div>
+      <div class="rob-list" id="ex-list"></div>
+      <div class="sim-controls" style="grid-template-columns:1fr">
+        <div class="ctrl-row"><button class="btn sm" id="ex-reset">⏮ 처음</button><button class="btn sm primary" id="ex-step">한 사이클 →</button><button class="btn sm" id="ex-run">끝까지 ⏭</button></div>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">사이클</span><span class="v" id="ex-cycle">0</span></div>
+        <div class="stat"><span class="k">커밋된 명령</span><span class="v" id="ex-committed">0</span></div>
+        <div class="stat"><span class="k">버려진 명령</span><span class="v" id="ex-flushed">0</span></div>
+        <div class="stat"><span class="k">트랩 CSR</span><span class="v" id="ex-csr">—</span></div>
+      </div>
+      <div class="info-panel" id="ex-info">한 사이클씩 진행해 보자.</div>
+      <figcaption><span class="try">따라가 보기</span>12개 명령이 ROB 0~11번 칸에 있고, 오른쪽 숫자는 쓰기를 마치는 사이클이다. 0~7번이 한 줄, 8~11번이 다음 줄이다. '페이지 폴트'에서는 5번 적재가 예외를 들고 있으므로, 그 줄은 한 사이클에 하나씩만 커밋한다(<code>allowOnlyOneCommit</code>). 5번이 머리에 오면 커밋하지 않고 비운다. 5번 자신과 뒤의 모든 명령이 버려지고 sepc·scause가 기록된다. '인터럽트 도착'에서는 2사이클에 인터럽트가 걸린다. 머리가 적재나 스토어(안전하지 않음)인 동안은 기다리다가, 안전한 명령이 머리에 오면 그 명령부터 버리고 트랩으로 간다. 웹 모델의 CSR 값은 S 모드 트랩을 가정한 예시다.</figcaption>
+    </div>
+  </section>
+
+  <!-- ============================================================ 4 -->
+  <section id="redirect">
+    <h2>리다이렉트: 누가 가장 오래되었나</h2>
+    <p>파이프라인을 되감는 요청<span class="en">(Redirect)</span>은 세 곳에서 온다.</p>
+    <ol>
+      <li><b>실행 유닛</b>: 분기 유닛이 예측과 다른 방향·목적지를 발견했다. 여러 분기 유닛의 요청 중 가장 오래된 하나가 <code>oldestExuRedirect</code>로 모인다.</li>
+      <li><b>메모리 블록</b>: 적재가 아직 주소를 모르던 더 오래된 스토어의 데이터를 놓쳤다(메모리 순서 위반). 그 적재부터 다시 실행해야 한다(<code>loadReplay</code>).</li>
+      <li><b>ROB</b>: 머리에서 예외·인터럽트·flushPipe·재실행이 발생했다(<code>robFlush</code>).</li>
+    </ol>
+    <p><code>RedirectGenerator</code>는 실행 유닛과 메모리 블록의 요청 중 robIdx가 <b>가장 오래된</b> 것을 고른다. 더 오래된 요청이 어차피 뒤쪽을 모두 지우기 때문이다. ROB의 요청은 머리에서 오므로 늘 가장 오래되었고, 같은 사이클에 오면 다른 요청을 무시한다(<code>io.stage2Redirect.valid := s1_redirect_valid_reg &amp;&amp; !robFlush.valid</code>). 요청마다 <code>level</code> 비트도 있다. <code>flushAfter</code>는 그 명령 뒤만 지우고(분기 오예측: 분기 자신은 맞게 실행됨), <code>flush</code>는 그 명령까지 지운다(예외, 메모리 순서 위반으로 다시 실행할 적재).</p>
+    <p>"더 오래됨"의 비교가 까다롭다. robIdx는 352칸을 도는 원형 포인터라서, 값만 비교하면 한 바퀴 돈 포인터가 작아 보인다. 그래서 포인터에 <b>flag</b> 비트를 하나 붙여 바퀴 수의 홀짝을 기억한다. 두 포인터의 flag가 같으면 값이 큰 쪽이 젊고, 다르면 반대다.</p>
+    <div class="formula">$$\text{isAfter}(a, b) = (a.\text{flag} \oplus b.\text{flag}) \oplus (a.\text{value} &gt; b.\text{value})$$
+      <div class="where"><code>utility/CircularQueuePtr.scala:65-69</code>. isAfter(a, b)가 참이면 a가 b보다 젊다(나중에 들어왔다). 엔트리가 지워져야 하는지는 <code>RobPtr.needFlush</code>가 "리다이렉트보다 젊은가, 또는 flush 수준이고 자기 자신인가"로 판단한다(<code>RobBundles.scala:248-251</code>).</div></div>
+    <div class="callout code"><strong>가장 오래된 리다이렉트 고르기</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/Bundle.scala:248-256</span>
+<span class="k">def</span> selectOldestRedirect(xs: Seq[Valid[Redirect]]): Vec[Bool] = {
+  <span class="k">val</span> compareVec = (0 until xs.length).map(i =&gt; (0 until i).map(j =&gt; isAfter(xs(j).bits.robIdx, xs(i).bits.robIdx)))
+  <span class="k">val</span> resultOnehot = VecInit((0 until xs.length).map(i =&gt; Cat((0 until xs.length).map(j =&gt;
+    (<span class="k">if</span> (j &lt; i) !xs(j).valid || compareVec(i)(j)
+    <span class="k">else if</span> (j == i) xs(i).valid
+    <span class="k">else</span> !xs(j).valid || !compareVec(j)(i))
+  )).andR))
+  resultOnehot
+}</code></pre>
+    </div>
+    <div class="sim" id="sim-redirect">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>동시에 온 리다이렉트 고르기</h3>
+        <div class="seg" id="rd-preset"><button data-value="same" class="on">같은 바퀴</button><button data-value="wrap">바퀴 경계 걸침</button><button data-value="rob">ROB 요청 포함</button></div>
+      </div>
+      <div class="redirect-grid" id="rd-cards"></div>
+      <div class="sim-view"><canvas id="cv-redirect"></canvas></div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">선택된 리다이렉트</span><span class="v" id="rd-winner">—</span></div>
+        <div class="stat"><span class="k">지워지는 칸 수</span><span class="v" id="rd-count">—</span></div>
+        <div class="stat"><span class="k">값만 비교했다면</span><span class="v" id="rd-naive">—</span></div>
+      </div>
+      <figcaption><span class="try">바꿔 보기</span>카드마다 요청의 robIdx 값(0~351)과 flag를 정한다. 원은 ROB 352칸이고, 머리(deqPtr, 빨강)에서 시계 방향으로 꼬리(enqPtr, 파랑)까지가 살아 있는 명령이다. 머리는 flag 0의 300번, 꼬리는 flag 1의 120번이다. 고른 요청부터 꼬리까지의 붉은 호가 지워질 영역이다. '바퀴 경계 걸침'에서는 flag 0의 340번 분기와 flag 1의 10번 적재가 경쟁한다. 값만 보면 10이 작아 오래돼 보이지만, flag가 다르므로 실제로는 340번이 더 오래되었다. 오른쪽 아래 '값만 비교했다면'이 이 함정을 보여 준다.</figcaption>
+    </div>
+  </section>
+
+  <!-- ============================================================ 5 -->
+  <section id="walk">
+    <h2>되감기: 스냅샷과 워크</h2>
+    <p>리다이렉트로 명령을 지웠다면, 그 명령들이 바꿔 놓은 리네임 테이블<span class="en">(RAT)</span>도 되돌려야 한다. 곤명호 v3는 두 단계로 한다. 먼저 투기적 RAT를 <b>복구 기준점</b>으로 덮어쓴다. 기준점은 리다이렉트보다 오래된 스냅샷이 있으면 그 스냅샷이고, 없으면 커밋된 상태인 아키텍처 RAT다(<code>RenameTable.scala:131-136</code>). 다음으로 기준점과 리다이렉트 지점 사이에 있는, 지워지지 않은 명령들의 매핑을 ROB(정확히는 리네임 버퍼 RAB) 순서대로 다시 적용한다. 이것이 <span class="term">워크</span><span class="en">(walk)</span>다. 워크는 커밋과 같은 폭(사이클당 8칸)으로 진행된다(<code>Rob.scala:732-745</code>).</p>
+    <p>워크 길이는 기준점에서 리다이렉트 지점까지의 거리다. 머리부터 걸으면 ROB가 거의 찬 상태에서 수백 칸을 걸어야 할 수도 있다. 그래서 리네임 단계가 가끔 RAT 사진을 찍어 둔다. 점프 계열(<code>FuType.jmp</code>) 명령이 있는 리네임 묶음에서, 마지막 스냅샷과 ROB 거리가 32칸(<code>RobCommitWidth × 4</code>) 이상 떨어져 있을 때 찍는다. 최대 4장까지 보관한다.</p>
+    <div class="callout code"><strong>스냅샷을 찍는 조건</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/backend/rename/Rename.scala:767-771</span>
+<span class="k">val</span> sameSnptDistance = (RobCommitWidth * 4).U
+<span class="c">// notInSameSnpt: 1.robidxHead - snapLastEnq &gt;= sameSnptDistance 2.no snap</span>
+<span class="k">val</span> notInSameSnpt = GatedValidRegNext(distanceBetween(robIdxHeadNext, io.snptLastEnq.bits) &gt;= sameSnptDistance || !io.snptLastEnq.valid)
+<span class="k">val</span> allowSnpt = <span class="k">if</span> (EnableRenameSnapshot) notInSameSnpt &amp;&amp; !lastCycleCreateSnpt &amp;&amp; io.in.head.bits.firstUop <span class="k">else</span> false.B
+uops.zip(io.in).foreach{ <span class="k">case</span> (uop, in) =&gt; uop.snapshot := allowSnpt &amp;&amp; FuType.isJump(in.bits.fuType) &amp;&amp; in.fire }</code></pre>
+    </div>
+    <div class="sim" id="sim-walk">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>RAT 되돌리기</h3>
+        <div class="seg" id="wl-snap"><button data-value="on" class="on">스냅샷 사용 (XS)</button><button data-value="off">머리부터 워크</button></div>
+      </div>
+      <div class="sim-view"><canvas id="cv-walk"></canvas></div>
+      <div class="rat-table" id="wl-rat"></div>
+      <div class="sim-controls">
+        <label class="ctrl"><span>오예측 분기의 robIdx <output id="wl-point-out"></output></span><input type="range" id="wl-point" min="0" max="95" step="1" value="78"></label>
+        <div class="ctrl-row"><button class="btn sm primary" id="wl-go">▶ 리다이렉트!</button><button class="btn sm" id="wl-reset">⏮ 처음</button></div>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">복구 기준점</span><span class="v" id="wl-base">—</span></div>
+        <div class="stat"><span class="k">걸어야 할 줄 수</span><span class="v" id="wl-rows">—</span></div>
+        <div class="stat"><span class="k">리다이렉트부터 복구 끝까지</span><span class="v" id="wl-cycles">—</span></div>
+      </div>
+      <figcaption><span class="try">눌러 보기</span>막대는 커밋되지 않은 ROB 96칸(그림용 축소)이고, 칸마다 그 명령이 쓰는 아키텍처 레지스터(x1~x4)를 색으로 표시했다. 점프 명령(J)에서 32칸 간격 규칙에 따라 찍힌 스냅샷이 노란 깃발이다. 슬라이더로 오예측 분기 위치를 정하고 리다이렉트를 누르자. RTL은 리다이렉트 다음 사이클에 ROB를 읽고 그다음 사이클부터 걷는다(T+2). 그래서 웹 모델도 2사이클을 더한다. 그 뒤 정렬된 8칸 줄 하나씩 다시 적용한다. 아래 표는 각 레지스터의 매핑이고, 워크가 끝나면 '정답'(리다이렉트 지점까지 순서대로 적용한 매핑)과 일치한다.</figcaption>
+    </div>
+    <div class="predict"><strong>스냅샷을 더 자주 찍으면 어떨까?</strong>
+      <p>스냅샷을 모든 분기에서 찍으면 워크가 거의 필요 없을 것이다. 왜 32칸 간격, 4장으로 제한했을까?</p>
+      <details><summary>답 보기</summary><p>스냅샷 한 장은 정수·부동소수·벡터 RAT 전체의 사본이다. 장수만큼 레지스터가 늘고, 복구할 때 고르는 멀티플렉서도 커진다. 32칸은 스냅샷 생성의 최소 간격이며, 복구 거리의 상한이 아니다. 점프가 드물거나 스냅샷 네 칸이 모두 차면 다음 스냅샷까지의 간격은 더 길어진다. 따라서 마지막 스냅샷보다 훨씬 뒤에서 리다이렉트가 나면 32칸보다 많이 걸을 수 있다. 스냅샷이 없으면 머리부터 걷는다. 6장의 ROB 352칸 모델은 스냅샷 네 개가 앞쪽에 몰려 긴 walk가 남는 경우도 보여 준다. 위 시뮬레이터에서 두 모드의 '걸어야 할 줄 수'를 비교해 보자.</p></details>
+    </div>
+  </section>
+
+  <section class="keypoints">
+    <h2>핵심 정리</h2>
+    <ol>
+      <li>ROB는 352칸 원형 큐이며 결과 값 대신 커밋에 필요한 정보(쓰기 여부, FTQ 위치, 인터럽트 안전 여부, 비움 필요 여부)만 담는다.</li>
+      <li>커밋은 머리가 속한 정렬된 8칸 줄 안에서, 처음 안 끝난 칸 앞까지 진행된다. 비움이 필요한 명령이나 인터럽트가 있으면 한 사이클에 하나만 커밋한다.</li>
+      <li>예외는 <code>ExceptionGen</code>이 가장 오래된 것 하나만 기억하다가 머리에 왔을 때 처리하므로 정밀하다. 인터럽트는 머리가 <code>interrupt_safe</code>인 명령일 때 받는다.</li>
+      <li>실행 유닛·메모리 블록의 리다이렉트 중 가장 오래된 것을 flag 비트가 붙은 원형 포인터 비교로 고르고, ROB 요청은 그보다 앞선다.</li>
+      <li>RAT는 스냅샷이나 아키텍처 RAT로 덮어쓴 뒤, 리다이렉트 지점까지 사이클당 8칸씩 워크하며 되돌린다.</li>
+    </ol>
+  </section>
+
+  <section id="quiz">
+    <h2>확인 퀴즈</h2>
+    <div class="quiz">
+      <div class="quiz-q" data-answer="1"><p>Q1. 머리가 줄 안 6번 위치에 있고, 6·7번과 다음 줄 0~5번이 모두 끝났다. 이번 사이클 커밋 수는?</p><div class="opts">
+        <button class="opt">8개</button><button class="opt">2개</button><button class="opt">6개</button><button class="opt">0개</button></div>
+        <div class="quiz-exp">커밋은 머리가 속한 정렬된 줄 안에서만 일어난다. 6·7번 둘만 커밋하고, 다음 줄은 다음 사이클에 처리한다.</div></div>
+      <div class="quiz-q" data-answer="3"><p>Q2. 인터럽트가 걸렸을 때 머리 명령이 적재라면?</p><div class="opts">
+        <button class="opt">적재를 즉시 버리고 트랩으로 간다</button><button class="opt">적재를 커밋하지 않고 영원히 기다린다</button><button class="opt">인터럽트를 무시한다</button><button class="opt">적재는 interrupt_safe가 아니므로, 안전한 명령이 머리에 올 때까지 하나씩 커밋하며 기다린다</button></div>
+        <div class="quiz-exp">적재·스토어는 MMIO일 수 있어 안전하지 않다. 인터럽트 비트가 서 있으면 ROB는 한 사이클에 하나씩 커밋하며, 안전한 명령이 머리에 오면 그 명령을 버리고 인터럽트를 받는다.</div></div>
+      <div class="quiz-q" data-answer="0"><p>Q3. 포인터 a = (flag 1, value 5), b = (flag 0, value 340)일 때 isAfter(a, b)는?</p><div class="opts">
+        <button class="opt">참: a가 b보다 젊다</button><button class="opt">거짓: a가 b보다 오래되었다</button><button class="opt">같다</button><button class="opt">비교할 수 없다</button></div>
+        <div class="quiz-exp">flag가 다르므로 (1⊕0) ⊕ (5 &gt; 340) = 1 ⊕ 0 = 1. a는 한 바퀴 돈 뒤의 5번이라 b보다 젊다.</div></div>
+      <div class="quiz-q" data-answer="2"><p>Q4. 분기 오예측 리다이렉트의 level이 flushAfter인 이유는?</p><div class="opts">
+        <button class="opt">분기 자신이 예외를 냈기 때문</button><button class="opt">분기를 다시 실행해야 하기 때문</button><button class="opt">분기 자신은 올바르게 실행되었고, 그 뒤에 잘못 가져온 명령만 지우면 되기 때문</button><button class="opt">ROB가 분기를 기억하지 않기 때문</button></div>
+        <div class="quiz-exp">분기 명령의 실행 결과(방향과 목적지)는 맞다. 틀린 것은 그 뒤를 예측해 가져온 명령들이다. 반면 메모리 순서 위반은 적재 자신을 다시 실행해야 하므로 flush 수준이다.</div></div>
+      <div class="quiz-q" data-answer="1"><p>Q5. 리다이렉트 지점보다 오래된 스냅샷이 하나도 없으면 RAT 복구의 기준점은?</p><div class="opts">
+        <button class="opt">가장 최근 스냅샷</button><button class="opt">커밋된 상태인 아키텍처 RAT (그 뒤 머리부터 워크)</button><button class="opt">초기값</button><button class="opt">복구하지 않는다</button></div>
+        <div class="quiz-exp"><code>RenameTable.scala:134</code>: <code>Mux(t2_snpt.useSnpt, snapshots(...), arch_table(i))</code>. 스냅샷을 쓸 수 없으면 아키텍처 RAT에서 출발해 머리부터 걷는다.</div></div>
+    </div>
+  </section>
+</main>
+
+<script>
+(function () {
+  "use strict";
+  const COMMIT_WIDTH = 8;
+  const RENAME_WIDTH = 8;
+
+  /* ================================================================ 그림 8-1: 원형 ROB */
+  let ringSize = 64, missRate = 0.02, missLatency = 60, commitRule = "line";
+  let ring;
+  const MIN_HIT_LATENCY = 1, MAX_HIT_LATENCY = 4, RANDOM_DISCARD_COUNT = 16;
+  /** 웹 모델: 서로 독립인 명령. 미스가 아니면 1~4사이클, 미스면 missLatency. */
+  function createRobModel(options) {
+    const random = MB.rng(options.seed || 5);
+    // 작은 시드에서 첫 난수가 0에 가깝게 나오는 것을 피하려고 몇 개 버린다.
+    for (let k = 0; k < RANDOM_DISCARD_COUNT; k++) random();
+    return {
+      size: options.size, missRate: options.missRate, missLatency: options.missLatency, rule: options.rule,
+      random, entries: new Array(options.size).fill(null),
+      head: 0, count: 0, cycle: 0, committed: 0,
+      fullCycles: 0, headBlockedCycles: 0, lineLimitedCycles: 0, history: [],
+    };
+  }
+  function stepRobModel(model) {
+    // 1) 커밋
+    let commitCount = 0;
+    const rowEnd = model.rule === "line" ? (Math.floor(model.head / COMMIT_WIDTH) + 1) * COMMIT_WIDTH : Infinity;
+    let position = model.head, isLineLimited = false;
+    while (commitCount < COMMIT_WIDTH && model.count > 0) {
+      const entry = model.entries[position];
+      if (!entry || entry.doneCycle > model.cycle) break;
+      if (model.rule === "line" && position >= rowEnd) { isLineLimited = true; break; }
+      model.entries[position] = null;
+      position = (position + 1) % model.size;
+      model.count--; commitCount++;
+      if (model.rule === "line" && position % COMMIT_WIDTH === 0 && position !== 0) {
+        // 줄 끝에 닿았다: 이번 사이클은 여기까지
+        if (commitCount < COMMIT_WIDTH && model.count > 0 && model.entries[position] && model.entries[position].doneCycle <= model.cycle) isLineLimited = true;
+        break;
+      }
+      if (model.rule === "line" && position === 0) {
+        if (commitCount < COMMIT_WIDTH && model.count > 0 && model.entries[0] && model.entries[0].doneCycle <= model.cycle) isLineLimited = true;
+        break;
+      }
+    }
+    model.head = position;
+    model.committed += commitCount;
+    if (isLineLimited) model.lineLimitedCycles++;
+    if (model.count > 0 && commitCount === 0) model.headBlockedCycles++;
+    // 2) 리네임에서 최대 8개 들어온다
+    const free = model.size - model.count;
+    if (free < RENAME_WIDTH) model.fullCycles++;
+    const enqueueCount = Math.min(RENAME_WIDTH, free);
+    for (let k = 0; k < enqueueCount; k++) {
+      const tail = (model.head + model.count) % model.size;
+      const isMiss = model.random() < model.missRate;
+      const latency = isMiss ? model.missLatency : MIN_HIT_LATENCY + Math.floor(model.random() * (MAX_HIT_LATENCY - MIN_HIT_LATENCY + 1));
+      model.entries[tail] = { doneCycle: model.cycle + latency, isMiss };
+      model.count++;
+    }
+    model.history.push(commitCount);
+    if (model.history.length > 80) model.history.shift();
+    model.cycle++;
+  }
+  function resetRing() { ring = createRobModel({ size: ringSize, missRate, missLatency, rule: commitRule, seed: 5 }); }
+  resetRing();
+  const ringView = MB.canvas("#cv-ring", { aspect: 0.5, minHeight: 300, maxHeight: 420, draw: drawRing });
+  function drawRing(ctx, width, height) {
+    const isNarrow = width < 600;
+    const centerX = isNarrow ? width / 2 : width * 0.32, centerY = isNarrow ? height * 0.42 : height / 2;
+    const radius = Math.min(isNarrow ? width * 0.36 : width * 0.26, height * (isNarrow ? 0.36 : 0.42));
+    const thickness = Math.max(10, radius * 0.18);
+    const step = (Math.PI * 2) / ring.size;
+    for (let index = 0; index < ring.size; index++) {
+      const start = -Math.PI / 2 + index * step, end = start + step * 0.9;
+      const entry = ring.entries[index];
+      let token = "surface-2";
+      if (entry) token = entry.doneCycle <= ring.cycle ? "ok" : entry.isMiss ? "warn" : "accent-2";
+      ctx.strokeStyle = MB.css(token); ctx.lineWidth = thickness;
+      ctx.beginPath(); ctx.arc(centerX, centerY, radius, start, end); ctx.stroke();
+      if (index % COMMIT_WIDTH === 0) {
+        ctx.strokeStyle = MB.css("axis"); ctx.lineWidth = 1.2;
+        const angle = -Math.PI / 2 + index * step;
+        ctx.beginPath();
+        ctx.moveTo(centerX + Math.cos(angle) * (radius + thickness * 0.5), centerY + Math.sin(angle) * (radius + thickness * 0.5));
+        ctx.lineTo(centerX + Math.cos(angle) * (radius + thickness * 0.5 + 8), centerY + Math.sin(angle) * (radius + thickness * 0.5 + 8));
+        ctx.stroke();
+      }
+    }
+    const marker = (index, token, label, isOutside) => {
+      const angle = -Math.PI / 2 + (index + 0.45) * step;
+      const distance = isOutside ? radius + thickness + 12 : radius - thickness - 10;
+      const x = centerX + Math.cos(angle) * distance, y = centerY + Math.sin(angle) * distance;
+      ctx.fillStyle = MB.css(token);
+      ctx.beginPath(); ctx.arc(x, y, 6, 0, Math.PI * 2); ctx.fill();
+      MB.text(ctx, label, x + (isOutside ? 0 : 0), y + (isOutside ? -13 : 14), { align: "center", size: 10.5, weight: 700, color: MB.css(token) });
+    };
+    marker(ring.head, "bad", "deq", true);
+    marker((ring.head + ring.count) % ring.size, "accent-2", "enq", false);
+    MB.text(ctx, `${ring.count}/${ring.size}`, centerX, centerY - 6, { align: "center", size: 18, weight: 800, mono: true });
+    MB.text(ctx, "사용 중", centerX, centerY + 14, { align: "center", size: 11, color: MB.css("text-dim") });
+    // 커밋 수 막대
+    const chartLeft = isNarrow ? 20 : width * 0.62, chartRight = width - 14;
+    const chartTop = isNarrow ? height * 0.82 : height * 0.2, chartBottom = isNarrow ? height - 16 : height * 0.8;
+    MB.text(ctx, "사이클별 커밋 수 (최근 80)", chartLeft, chartTop - 6, { size: 11, color: MB.css("text-dim"), baseline: "bottom" });
+    ctx.strokeStyle = MB.css("grid"); ctx.strokeRect(chartLeft, chartTop, chartRight - chartLeft, chartBottom - chartTop);
+    const barWidth = (chartRight - chartLeft) / 80;
+    ring.history.forEach((value, k) => {
+      const barHeight = (value / COMMIT_WIDTH) * (chartBottom - chartTop);
+      ctx.fillStyle = value === 0 ? MB.css("bad") : MB.css("ok");
+      ctx.fillRect(chartLeft + k * barWidth, chartBottom - Math.max(1.5, barHeight), Math.max(1, barWidth - 0.5), Math.max(1.5, barHeight));
+    });
+    MB.text(ctx, "8", chartLeft - 4, chartTop, { align: "right", size: 10, mono: true, color: MB.css("text-faint") });
+    MB.text(ctx, "0", chartLeft - 4, chartBottom, { align: "right", size: 10, mono: true, color: MB.css("text-faint") });
+  }
+  function paintRing() {
+    const cycles = Math.max(1, ring.cycle);
+    MB.set("ring-ipc", MB.fmt(ring.committed / cycles, 2));
+    MB.set("ring-full", MB.pct(ring.fullCycles / cycles));
+    MB.set("ring-head", MB.pct(ring.headBlockedCycles / cycles));
+    MB.set("ring-line", ring.rule === "line" ? MB.pct(ring.lineLimitedCycles / cycles) : "해당 없음");
+    ringView.redraw();
+  }
+  MB.seg("#ring-rule", (value) => { commitRule = value; resetRing(); paintRing(); });
+  MB.range("ring-size", (value) => { ringSize = value; resetRing(); paintRing(); }, (value) => `${value}칸`);
+  MB.range("ring-miss", (value) => { missRate = value; resetRing(); paintRing(); }, (value) => MB.pct(value, 1));
+  MB.range("ring-lat", (value) => { missLatency = value; resetRing(); paintRing(); }, (value) => `${value}사이클`);
+  document.getElementById("ring-reset").onclick = () => { resetRing(); paintRing(); };
+  document.getElementById("ring-step").onclick = () => { stepRobModel(ring); paintRing(); };
+  const RING_STEPS_PER_SECOND = 12;
+  let ringAccumulator = 0;
+  const ringLoop = MB.loop(document.getElementById("sim-ring"), (dt) => {
+    ringAccumulator += dt * RING_STEPS_PER_SECOND;
+    while (ringAccumulator >= 1) { stepRobModel(ring); ringAccumulator -= 1; }
+    paintRing();
+  });
+  MB.playButton("ring-play", ringLoop, ["⏸ 멈춤", "▶ 재생"]);
+  paintRing();
+
+  /* ================================================================ 그림 8-2: ROB 크기별 IPC */
+  const SWEEP_SIZES = [16, 32, 48, 64, 96, 128, 192, 256, 352];
+  const SWEEP_MISS_RATES = [0, 0.002, 0.005, 0.02];
+  const SWEEP_CYCLES = 3000;
+  let sweepLatency = 60;
+  const sweepCache = {};
+  function sweepCurves() {
+    const key = String(sweepLatency);
+    if (!sweepCache[key]) {
+      sweepCache[key] = SWEEP_MISS_RATES.map((rate) => SWEEP_SIZES.map((size) => {
+        const model = createRobModel({ size, missRate: rate, missLatency: sweepLatency, rule: "line", seed: 9 });
+        for (let k = 0; k < SWEEP_CYCLES; k++) stepRobModel(model);
+        return [size, model.committed / model.cycle];
+      }));
+    }
+    return sweepCache[key];
+  }
+  const sweepView = MB.canvas("#cv-sweep", { aspect: 0.45, minHeight: 240, maxHeight: 340, draw(ctx, width, height) {
+    const curves = sweepCurves();
+    const colors = ["text-faint", "accent-2", "warn", "bad"];
+    const axes = MB.lineChart(ctx, width, height, curves.map((data, index) => ({ name: `${(SWEEP_MISS_RATES[index] * 100).toFixed(1)}%`, color: MB.css(colors[index]), data, width: 2.2 })),
+      { xMin: 0, xMax: 352, yMin: 0, yMax: 8, xLabel: "ROB 크기 (칸)", yLabel: "커밋 IPC", yFormat: (value) => value.toFixed(0), xFormat: (value) => value.toFixed(0), marks: [{ x: 352, label: "XS 352" }] });
+    curves.forEach((data, index) => {
+      const legendX = axes.left + 14 + index * 92;
+      ctx.fillStyle = MB.css(colors[index]); ctx.fillRect(legendX, axes.bottom - 22, 14, 4);
+      MB.text(ctx, `미스 ${(SWEEP_MISS_RATES[index] * 100).toFixed(1)}%`, legendX + 18, axes.bottom - 20, { size: 11, weight: 700, color: MB.css(colors[index]) });
+    });
+  } });
+  MB.range("sw-lat", (value) => { sweepLatency = value; sweepView.redraw(); }, (value) => `${value}사이클`);
+
+  /* ================================================================ 그림 8-3: 예외와 인터럽트 */
+  const EXCEPTION_PROGRAM = [
+    { text: "add  a0, a1, a2", kind: "alu", done: 1 },
+    { text: "ld   t0, 0(sp)", kind: "load", done: 3 },
+    { text: "addi t1, t0, 4", kind: "alu", done: 4 },
+    { text: "sd   t1, 8(sp)", kind: "store", done: 4 },
+    { text: "mul  a3, a0, a0", kind: "alu", done: 3 },
+    { text: "ld   t2, 0(a4)", kind: "load", done: 3 },
+    { text: "add  t3, t2, a3", kind: "alu", done: 5 },
+    { text: "slli t4, t3, 2", kind: "alu", done: 6 },
+    { text: "beq  t4, zero, L", kind: "alu", done: 6 },
+    { text: "addi a5, a5, 1", kind: "alu", done: 2 },
+    { text: "sw   a5, 0(a6)", kind: "store", done: 5 },
+    { text: "add  a7, a5, a0", kind: "alu", done: 4 },
+  ];
+  const FAULT_INDEX = 5, INTERRUPT_ARRIVAL_CYCLE = 2;
+  const PROGRAM_BASE_PC = 0x80001000;
+  let exceptionScene = "none", exceptionState;
+  function resetException() {
+    exceptionState = {
+      cycle: 0, head: 0, status: EXCEPTION_PROGRAM.map(() => "wait"), trap: null, log: "한 사이클씩 진행해 보자.",
+      isInterruptPending: false, isDone: false,
+    };
+  }
+  function isInterruptSafe(instruction) { return instruction.kind !== "load" && instruction.kind !== "store"; }
+  function stepException() {
+    const state = exceptionState;
+    if (state.isDone) return;
+    state.cycle++;
+    const cycle = state.cycle;
+    EXCEPTION_PROGRAM.forEach((instruction, index) => { if (state.status[index] === "wait" && instruction.done <= cycle) state.status[index] = "done"; });
+    if (exceptionScene === "intr" && cycle >= INTERRUPT_ARRIVAL_CYCLE) state.isInterruptPending = true;
+    const head = state.head;
+    if (head >= EXCEPTION_PROGRAM.length) { state.isDone = true; state.log = "모든 명령이 커밋되었다."; return; }
+    const headInstruction = EXCEPTION_PROGRAM[head];
+    const flushFrom = (start) => { for (let k = start; k < EXCEPTION_PROGRAM.length; k++) if (state.status[k] !== "committed") state.status[k] = "flushed"; };
+    // 인터럽트: 머리가 안전한 명령이면 그 명령부터 버리고 트랩
+    if (state.isInterruptPending && isInterruptSafe(headInstruction)) {
+      flushFrom(head);
+      state.trap = { cause: "인터럽트", epc: PROGRAM_BASE_PC + head * 4 };
+      state.isDone = true;
+      state.log = `사이클 ${cycle}: 머리 #${head}(${headInstruction.text.split(" ")[0]})는 interrupt_safe다. 커밋하지 않고 #${head}부터 모두 버린 뒤 인터럽트 트랩으로 간다. sepc = #${head}의 PC.`;
+      return;
+    }
+    // 예외: 머리가 예외를 든 명령이고 쓰기를 마쳤다
+    if (exceptionScene === "fault" && head === FAULT_INDEX && state.status[head] === "done") {
+      flushFrom(head);
+      state.trap = { cause: "적재 페이지 폴트(13)", epc: PROGRAM_BASE_PC + head * 4 };
+      state.isDone = true;
+      state.log = `사이클 ${cycle}: 예외를 든 #${head}가 머리에 왔다. flushOut(level = flush)으로 #${head} 자신과 뒤의 명령을 모두 버리고, sepc·scause를 쓴 뒤 트랩 벡터로 리다이렉트한다.`;
+      return;
+    }
+    // 정상 커밋: 머리 줄 안에서만, 필요하면 하나씩
+    const rowEnd = (Math.floor(head / COMMIT_WIDTH) + 1) * COMMIT_WIDTH;
+    const rowHasNeedFlush = exceptionScene === "fault" && FAULT_INDEX >= Math.floor(head / COMMIT_WIDTH) * COMMIT_WIDTH && FAULT_INDEX < rowEnd && state.status[FAULT_INDEX] !== "committed";
+    const isOnlyOne = rowHasNeedFlush || state.isInterruptPending;
+    let committedNow = 0, position = head;
+    while (position < Math.min(rowEnd, EXCEPTION_PROGRAM.length) && state.status[position] === "done" && committedNow < COMMIT_WIDTH) {
+      if (exceptionScene === "fault" && position === FAULT_INDEX) break;
+      state.status[position] = "committed"; committedNow++; position++;
+      if (isOnlyOne) break;
+    }
+    state.head = position;
+    let reason = "";
+    if (committedNow === 0) reason = state.isInterruptPending && !isInterruptSafe(headInstruction) && state.status[head] === "done"
+      ? ` 인터럽트가 기다리지만 머리 #${head}는 ${headInstruction.kind === "load" ? "적재" : "스토어"}라 받을 수 없다.`
+      : ` 머리 #${head}가 아직 쓰기를 마치지 않았다.`;
+    if (state.isInterruptPending && !isInterruptSafe(headInstruction) && committedNow > 0) reason = ` 머리가 안전하지 않은 #${head}라 인터럽트를 미루고 하나만 커밋했다.`;
+    state.log = `사이클 ${cycle}: ${committedNow}개 커밋${isOnlyOne ? " (한 사이클에 하나만 허용)" : ""}.${reason}`;
+    if (state.head >= EXCEPTION_PROGRAM.length) { state.isDone = true; state.log += " 모든 명령이 커밋되었다."; }
+  }
+  function paintException() {
+    const state = exceptionState;
+    const list = document.getElementById("ex-list");
+    list.innerHTML = EXCEPTION_PROGRAM.map((instruction, index) => {
+      const status = state.status[index];
+      const classes = ["rob-row", status === "done" ? "done" : "", status === "committed" ? "committed" : "", status === "flushed" ? "flushed" : "", index === state.head && !state.isDone ? "head" : ""].join(" ");
+      const label = { wait: "실행 중", done: "쓰기 완료", committed: "커밋", flushed: "버림" }[status];
+      const tags = (exceptionScene === "fault" && index === FAULT_INDEX ? "<span class=\"tag\">예외</span>" : "") + (!isInterruptSafe(instruction) ? "<span class=\"tag\" style=\"color:var(--text-faint)\">unsafe</span>" : "");
+      return `<div class="${classes}"><span>#${index}</span><span>${instruction.text}${tags}</span><span class="state">${label} · ${instruction.done}</span></div>`;
+    }).join("");
+    MB.set("ex-cycle", String(state.cycle));
+    MB.set("ex-committed", String(state.status.filter((status) => status === "committed").length));
+    const flushedCount = state.status.filter((status) => status === "flushed").length;
+    MB.set("ex-flushed", String(flushedCount), flushedCount ? "bad" : "");
+    MB.set("ex-csr", state.trap ? `sepc=0x${state.trap.epc.toString(16)}<small>${state.trap.cause}</small>` : "—");
+    document.getElementById("ex-info").innerHTML = state.log;
+  }
+  MB.seg("#ex-scene", (value) => { exceptionScene = value; resetException(); paintException(); });
+  document.getElementById("ex-reset").onclick = () => { resetException(); paintException(); };
+  document.getElementById("ex-step").onclick = () => { stepException(); paintException(); };
+  document.getElementById("ex-run").onclick = () => { for (let k = 0; k < 40 && !exceptionState.isDone; k++) stepException(); paintException(); };
+  resetException(); paintException();
+
+  /* ================================================================ 그림 8-4: 리다이렉트 고르기 */
+  const ROB_SIZE = 352;
+  const DEQ_POINTER = { flag: 0, value: 300 }, ENQ_POINTER = { flag: 1, value: 120 };
+  const REDIRECT_SOURCES = [
+    { key: "exu", name: "실행 유닛 (분기 오예측)", level: "flushAfter", token: "accent-2" },
+    { key: "load", name: "메모리 순서 위반 (loadReplay)", level: "flush", token: "warn" },
+    { key: "rob", name: "ROB (예외·인터럽트)", level: "flush", token: "bad" },
+  ];
+  const REDIRECT_PRESETS = {
+    same: [{ isValid: true, flag: 0, value: 330 }, { isValid: true, flag: 0, value: 318 }, { isValid: false, flag: 0, value: 300 }],
+    wrap: [{ isValid: true, flag: 0, value: 340 }, { isValid: true, flag: 1, value: 10 }, { isValid: false, flag: 0, value: 300 }],
+    rob:  [{ isValid: true, flag: 1, value: 40 }, { isValid: true, flag: 0, value: 345 }, { isValid: true, flag: 0, value: 300 }],
+  };
+  let redirectInputs = JSON.parse(JSON.stringify(REDIRECT_PRESETS.same));
+  /** CircularQueuePtr.scala:65-69 */
+  function isAfter(left, right) { return ((left.flag ^ right.flag) ^ (left.value > right.value ? 1 : 0)) === 1; }
+  /** Bundle.scala:248-256 selectOldestRedirect */
+  function selectOldest(candidates) {
+    return candidates.map((candidate, i) => candidate.isValid && candidates.every((other, j) => {
+      if (j === i) return true;
+      if (!other.isValid) return true;
+      // j < i: j가 i보다 젊어야 한다, j > i: i가 j보다 젊지 않아야 한다 (같으면 앞 번호가 이긴다)
+      return j < i ? isAfter(other, candidate) : !isAfter(candidate, other);
+    }));
+  }
+  function arbitrate() {
+    const robFlush = redirectInputs[2];
+    if (robFlush.isValid) return { winner: 2 };
+    const oneHot = selectOldest(redirectInputs.slice(0, 2));
+    const winner = oneHot.findIndex((bit) => bit);
+    return { winner };
+  }
+  function distanceFromDeq(pointer) {
+    return pointer.flag === DEQ_POINTER.flag ? pointer.value - DEQ_POINTER.value : ROB_SIZE + pointer.value - DEQ_POINTER.value;
+  }
+  const cards = document.getElementById("rd-cards");
+  function renderCards() {
+    cards.innerHTML = REDIRECT_SOURCES.map((source, index) => {
+      const input = redirectInputs[index];
+      return `<div class="redirect-card ${input.isValid ? "" : "off"}" data-index="${index}">
+        <h5><span style="color:var(--${source.token})">● ${source.name}</span><label class="check" style="margin:0"><input type="checkbox" data-field="isValid" ${input.isValid ? "checked" : ""}>유효</label></h5>
+        <label>robIdx 값 <span class="mono" data-show="value">${input.value}</span><input type="range" min="0" max="351" value="${input.value}" data-field="value"></label>
+        <label>flag <select data-field="flag" class="mono"><option value="0" ${input.flag === 0 ? "selected" : ""}>0</option><option value="1" ${input.flag === 1 ? "selected" : ""}>1</option></select></label>
+        <div class="small dim" style="margin-top:4px">level: ${source.level}</div></div>`;
+    }).join("");
+  }
+  cards.addEventListener("input", (event) => {
+    const card = event.target.closest(".redirect-card"); if (!card) return;
+    const index = +card.dataset.index, field = event.target.dataset.field;
+    if (field === "isValid") redirectInputs[index].isValid = event.target.checked;
+    if (field === "value") { redirectInputs[index].value = +event.target.value; card.querySelector("[data-show=value]").textContent = event.target.value; }
+    if (field === "flag") redirectInputs[index].flag = +event.target.value;
+    card.classList.toggle("off", !redirectInputs[index].isValid);
+    paintRedirect();
+  });
+  const redirectView = MB.canvas("#cv-redirect", { aspect: 0.42, minHeight: 260, maxHeight: 360, draw: drawRedirect });
+  function pointerAngle(pointer) { return -Math.PI / 2 + (pointer.value / ROB_SIZE) * Math.PI * 2; }
+  function drawRedirect(ctx, width, height) {
+    const centerX = width / 2, centerY = height / 2 + 4;
+    const radius = Math.min(width * 0.32, height * 0.36);
+    const { winner } = arbitrate();
+    // 바탕 원
+    ctx.strokeStyle = MB.css("surface-2"); ctx.lineWidth = 16;
+    ctx.beginPath(); ctx.arc(centerX, centerY, radius, 0, Math.PI * 2); ctx.stroke();
+    // 살아 있는 구간: deq → enq (시계 방향)
+    ctx.strokeStyle = MB.alpha(MB.css("accent-2"), 0.35);
+    ctx.beginPath(); ctx.arc(centerX, centerY, radius, pointerAngle(DEQ_POINTER), pointerAngle(ENQ_POINTER)); ctx.stroke();
+    if (winner >= 0) {
+      const chosen = redirectInputs[winner];
+      const isFlushItself = REDIRECT_SOURCES[winner].level === "flush";
+      const startValue = isFlushItself ? chosen.value : (chosen.value + 1) % ROB_SIZE;
+      ctx.strokeStyle = MB.alpha(MB.css("bad"), 0.75);
+      ctx.beginPath(); ctx.arc(centerX, centerY, radius, -Math.PI / 2 + (startValue / ROB_SIZE) * Math.PI * 2, pointerAngle(ENQ_POINTER)); ctx.stroke();
+    }
+    const tick = (pointer, token, label, offset) => {
+      const angle = pointerAngle(pointer);
+      const x1 = centerX + Math.cos(angle) * (radius - 14), y1 = centerY + Math.sin(angle) * (radius - 14);
+      const x2 = centerX + Math.cos(angle) * (radius + 14 + offset), y2 = centerY + Math.sin(angle) * (radius + 14 + offset);
+      ctx.strokeStyle = MB.css(token); ctx.lineWidth = 2.5;
+      ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+      const labelX = centerX + Math.cos(angle) * (radius + 26 + offset), labelY = centerY + Math.sin(angle) * (radius + 26 + offset);
+      MB.text(ctx, label, labelX, labelY, { align: Math.cos(angle) > 0.2 ? "left" : Math.cos(angle) < -0.2 ? "right" : "center", size: 11, weight: 700, mono: true, color: MB.css(token) });
+    };
+    tick(DEQ_POINTER, "bad", `deq f0:300`, 0);
+    tick(ENQ_POINTER, "accent-2", `enq f1:120`, 0);
+    redirectInputs.forEach((input, index) => {
+      if (!input.isValid) return;
+      tick(input, REDIRECT_SOURCES[index].token, `${["EXU", "LD", "ROB"][index]} f${input.flag}:${input.value}${index === winner ? " ★" : ""}`, 14 + index * 4);
+    });
+    MB.text(ctx, "시계 방향 = 젊어지는 방향", centerX, centerY, { align: "center", size: 11, color: MB.css("text-dim") });
+  }
+  function paintRedirect() {
+    const { winner } = arbitrate();
+    const isLive = (pointer) => distanceFromDeq(pointer) >= 0 && distanceFromDeq(pointer) < distanceFromDeq(ENQ_POINTER);
+    if (winner < 0) {
+      MB.set("rd-winner", "없음"); MB.set("rd-count", "0"); MB.set("rd-naive", "—");
+    } else {
+      const chosen = redirectInputs[winner];
+      const isFlushItself = REDIRECT_SOURCES[winner].level === "flush";
+      const removed = distanceFromDeq(ENQ_POINTER) - distanceFromDeq(chosen) - (isFlushItself ? 0 : 1);
+      MB.set("rd-winner", `${["실행 유닛", "메모리 순서 위반", "ROB"][winner]}<small>f${chosen.flag}:${chosen.value}</small>`);
+      MB.set("rd-count", isLive(chosen) ? String(removed) : "살아 있는 구간 밖!", isLive(chosen) ? "" : "bad");
+      const pair = redirectInputs.slice(0, 2).filter((input) => input.isValid);
+      if (pair.length === 2 && !redirectInputs[2].isValid) {
+        const naiveWinner = redirectInputs[0].value <= redirectInputs[1].value ? 0 : 1;
+        const isSame = naiveWinner === winner;
+        MB.set("rd-naive", isSame ? "같은 답" : `${["실행 유닛", "메모리 순서 위반"][naiveWinner]} (틀림)`, isSame ? "good" : "bad");
+      } else MB.set("rd-naive", "—");
+    }
+    redirectView.redraw();
+  }
+  MB.seg("#rd-preset", (value) => { redirectInputs = JSON.parse(JSON.stringify(REDIRECT_PRESETS[value])); renderCards(); paintRedirect(); });
+  renderCards(); paintRedirect();
+
+  /* ================================================================ 그림 8-5: 스냅샷과 워크 */
+  const WALK_ROB_LENGTH = 96, ARCH_REGISTERS = ["x1", "x2", "x3", "x4"];
+  const SNAPSHOT_DISTANCE = COMMIT_WIDTH * 4, SNAPSHOT_LIMIT = 4, WALK_START_DELAY = 2;
+  const REGISTER_TOKENS = ["accent", "accent-2", "ok", "color-purple"];
+  const walkProgram = (() => {
+    const random = MB.rng(31);
+    const list = [];
+    let nextPhysical = 40;
+    for (let index = 0; index < WALK_ROB_LENGTH; index++) {
+      const isJump = index % 9 === 4;
+      const destination = isJump ? Math.floor(random() * 4) : Math.floor(random() * 4);
+      list.push({ isJump, destination, physical: nextPhysical++ });
+    }
+    // 스냅샷: 점프에서, 마지막 스냅샷과 32칸 이상 떨어져 있을 때, 최대 4장
+    const snapshots = [];
+    list.forEach((entry, index) => {
+      if (!entry.isJump || snapshots.length >= SNAPSHOT_LIMIT) return;
+      const last = snapshots[snapshots.length - 1];
+      if (last === undefined || index - last >= SNAPSHOT_DISTANCE) snapshots.push(index);
+    });
+    return { list, snapshots };
+  })();
+  const ARCH_TABLE = [1, 2, 3, 4];
+  /** robIdx 'end' 전까지(포함 여부는 inclusive) 순서대로 적용한 RAT */
+  function mappingUpTo(endInclusive) {
+    const table = ARCH_TABLE.slice();
+    for (let index = 0; index <= endInclusive; index++) table[walkProgram.list[index].destination] = walkProgram.list[index].physical;
+    return table;
+  }
+  let isSnapshotEnabled = true, redirectPoint = 78, walkAnimation = null;
+  function walkPlan() {
+    // 분기 오예측은 flushAfter: 분기 자신까지는 유지 → lastWalkPtr = redirectPoint
+    const usable = walkProgram.snapshots.filter((snapshot) => snapshot <= redirectPoint);
+    const snapshot = isSnapshotEnabled && usable.length ? usable[usable.length - 1] : null;
+    const start = snapshot === null ? 0 : snapshot;
+    const baseTable = snapshot === null ? ARCH_TABLE.slice() : mappingUpTo(snapshot - 1);
+    const firstRow = Math.floor(start / COMMIT_WIDTH), lastRow = Math.floor(redirectPoint / COMMIT_WIDTH);
+    const rows = lastRow - firstRow + 1;
+    return { snapshot, start, baseTable, rows, cycles: WALK_START_DELAY + rows };
+  }
+  const walkView = MB.canvas("#cv-walk", { aspect: 0.26, minHeight: 170, maxHeight: 230, draw: drawWalk });
+  function drawWalk(ctx, width, height) {
+    const left = 10, right = width - 10;
+    const cell = (right - left) / WALK_ROB_LENGTH;
+    const barTop = height * 0.34, barHeight = height * 0.3;
+    const plan = walkPlan();
+    const walkedUpTo = walkAnimation ? walkAnimation.walkedUpTo : -1;
+    walkProgram.list.forEach((entry, index) => {
+      const x = left + index * cell;
+      const isFlushed = index > redirectPoint;
+      ctx.globalAlpha = isFlushed ? 0.25 : 1;
+      ctx.fillStyle = MB.css(REGISTER_TOKENS[entry.destination]);
+      ctx.fillRect(x + 0.5, barTop, Math.max(1, cell - 1), barHeight);
+      ctx.globalAlpha = 1;
+      if (walkAnimation && index >= plan.start && index <= walkedUpTo) {
+        ctx.fillStyle = MB.alpha(MB.css("text"), 0.35);
+        ctx.fillRect(x + 0.5, barTop + barHeight + 3, Math.max(1, cell - 1), 5);
+      }
+      if (entry.isJump && cell > 5) MB.text(ctx, "J", x + cell / 2, barTop + barHeight / 2, { align: "center", size: 9, weight: 800, color: "#fff" });
+      if (index % COMMIT_WIDTH === 0) {
+        ctx.strokeStyle = MB.css("axis"); ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(x, barTop - 4); ctx.lineTo(x, barTop + barHeight + 4); ctx.stroke();
+      }
+    });
+    walkProgram.snapshots.forEach((snapshot) => {
+      const x = left + snapshot * cell + cell / 2;
+      ctx.fillStyle = MB.css("warn");
+      ctx.beginPath(); ctx.moveTo(x, barTop - 2); ctx.lineTo(x, barTop - 22); ctx.lineTo(x + 10, barTop - 17); ctx.lineTo(x, barTop - 12); ctx.fill();
+      ctx.strokeStyle = MB.css("warn"); ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(x, barTop - 2); ctx.lineTo(x, barTop - 22); ctx.stroke();
+    });
+    const pointX = left + (redirectPoint + 1) * cell;
+    ctx.strokeStyle = MB.css("bad"); ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(pointX, barTop - 8); ctx.lineTo(pointX, barTop + barHeight + 12); ctx.stroke();
+    MB.text(ctx, "리다이렉트", pointX + 4, barTop + barHeight + 18, { size: 11, weight: 700, color: MB.css("bad") });
+    const startX = left + plan.start * cell;
+    MB.arrow(ctx, startX, height - 8, Math.max(startX + 8, pointX), height - 8, MB.css("text-dim"), 1.4, 6);
+    MB.text(ctx, plan.snapshot === null ? "머리(deqPtr)부터" : `스냅샷 #${plan.snapshot}부터`, startX, height - 20, { size: 11, color: MB.css("text-dim") });
+    ARCH_REGISTERS.forEach((name, index) => {
+      ctx.fillStyle = MB.css(REGISTER_TOKENS[index]); ctx.fillRect(left + index * 54, 6, 10, 10);
+      MB.text(ctx, name, left + index * 54 + 14, 11, { size: 11, mono: true });
+    });
+  }
+  function paintWalk() {
+    const plan = walkPlan();
+    const truth = mappingUpTo(redirectPoint);
+    let table = plan.baseTable.slice();
+    if (walkAnimation) {
+      for (let index = plan.start; index <= walkAnimation.walkedUpTo; index++) table[walkProgram.list[index].destination] = walkProgram.list[index].physical;
+    } else table = null;
+    document.getElementById("wl-rat").innerHTML = ARCH_REGISTERS.map((name, index) => {
+      const current = table ? table[index] : null;
+      const isCorrect = current === truth[index];
+      return `<div>${name} → <b class="${table && !isCorrect ? "wrong" : ""}">${table ? "p" + current : "?"}</b><br><span class="small dim">정답 p${truth[index]}</span></div>`;
+    }).join("");
+    MB.set("wl-base", plan.snapshot === null ? "아키텍처 RAT" : `스냅샷 #${plan.snapshot}`);
+    MB.set("wl-rows", `${plan.rows}<small>줄 (${plan.rows * COMMIT_WIDTH}칸 이하)</small>`);
+    MB.set("wl-cycles", walkAnimation && walkAnimation.isDone ? `${plan.cycles}<small>사이클</small>` : `${plan.cycles}<small>사이클 예상</small>`);
+    walkView.redraw();
+  }
+  let walkTimer = null;
+  function startWalk() {
+    clearInterval(walkTimer);
+    const plan = walkPlan();
+    walkAnimation = { walkedUpTo: plan.start - 1, isDone: false, cycle: 0 };
+    paintWalk();
+    walkTimer = setInterval(() => {
+      walkAnimation.cycle++;
+      if (walkAnimation.cycle > WALK_START_DELAY) {
+        // 정렬된 8칸 줄 하나씩
+        const nextRowEnd = (Math.floor((walkAnimation.walkedUpTo + 1) / COMMIT_WIDTH) + 1) * COMMIT_WIDTH - 1;
+        walkAnimation.walkedUpTo = Math.min(redirectPoint, nextRowEnd);
+      }
+      if (walkAnimation.walkedUpTo >= redirectPoint) { walkAnimation.isDone = true; clearInterval(walkTimer); }
+      paintWalk();
+    }, 260);
+  }
+  MB.seg("#wl-snap", (value) => { isSnapshotEnabled = value === "on"; walkAnimation = null; clearInterval(walkTimer); paintWalk(); });
+  MB.range("wl-point", (value) => { redirectPoint = value; walkAnimation = null; clearInterval(walkTimer); paintWalk(); }, (value) => `#${value}`);
+  document.getElementById("wl-go").onclick = startWalk;
+  document.getElementById("wl-reset").onclick = () => { walkAnimation = null; clearInterval(walkTimer); paintWalk(); };
+  paintWalk();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,1075 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>특권 구조와 인터럽트 · XiangShanBook</title>
+<meta name="description" content="XiangShan kunminghu-v3의 특권 모드(M·HS·HU·VS·VU), 트랩 위임, 예외 우선순위, 인터럽트 필터와 AIA IMSIC, PMP, CSR 주소 규칙, 디버그 트리거를 실제 NewCSR 코드로 따라간다.">
+<link rel="icon" type="image/svg+xml" href="../favicon.svg">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/common.js"></script>
+<style>
+  .grid-form { display: grid; gap: 10px 18px; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); padding: 14px 18px; border-top: 1px solid var(--border); }
+  .grid-form label { font-size: 14px; color: var(--text-dim); display: grid; gap: 4px; }
+  .grid-form select, .grid-form input[type="text"] { font: inherit; font-size: 14px; padding: 6px 9px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg-elev); color: var(--text); font-family: var(--mono); }
+  .bitgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 4px 12px; padding: 12px 18px; border-top: 1px solid var(--border); font-size: 13px; }
+  .bitgrid label { display: flex; gap: 6px; align-items: center; color: var(--text-dim); cursor: pointer; }
+  .bitgrid label.ro { opacity: .45; cursor: not-allowed; }
+  .bitgrid input { accent-color: var(--accent); }
+  .bitgrid .grp { grid-column: 1 / -1; font-weight: 700; color: var(--text); margin-top: 4px; }
+  .mini-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .mini-table th, .mini-table td { padding: 5px 8px; border-bottom: 1px solid var(--border); text-align: left; }
+  .mini-table th { background: var(--surface); color: var(--text-dim); font-size: 12px; }
+  .mini-table td.c { text-align: center; }
+  .mini-table tr.win td { background: var(--accent-soft); font-weight: 700; }
+  .mini-table input[type="checkbox"] { accent-color: var(--accent); }
+  .mini-table input:disabled { opacity: .4; }
+  .tag-m { color: var(--bad); font-weight: 700; } .tag-hs { color: var(--accent-2); font-weight: 700; } .tag-vs { color: var(--ok); font-weight: 700; }
+  .scroll { overflow-x: auto; padding: 0 18px 12px; }
+  .chip-list { display: flex; flex-wrap: wrap; gap: 5px; padding: 14px 18px; }
+  .chip-list span { font-family: var(--mono); font-size: 12.5px; padding: 2px 8px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface); }
+  .chip-list span.hit { border-color: var(--accent); color: var(--accent); font-weight: 700; background: var(--accent-soft); }
+  .chip-list span.dim { opacity: .3; }
+  .excp-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 4px 14px; padding: 12px 18px; font-size: 13.5px; }
+  .excp-list label { display: flex; gap: 8px; align-items: center; padding: 3px 6px; border-radius: 6px; cursor: pointer; }
+  .excp-list label.win { background: var(--accent-soft); font-weight: 700; color: var(--accent); }
+  .excp-list .rank { font-family: var(--mono); font-size: 11px; color: var(--text-faint); width: 22px; }
+  .pmp-row { display: grid; grid-template-columns: 34px 92px 1fr repeat(4, 34px); gap: 6px; align-items: center; font-size: 13px; padding: 4px 18px; }
+  .pmp-row select, .pmp-row input[type="text"] { font: inherit; font-size: 13px; padding: 4px 6px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg-elev); color: var(--text); font-family: var(--mono); min-width: 0; }
+  .pmp-row label { display: flex; justify-content: center; font-family: var(--mono); font-size: 11px; color: var(--text-dim); flex-direction: column; align-items: center; }
+  .pmp-row.head { font-size: 11.5px; color: var(--text-faint); font-weight: 700; }
+  .pmp-row.hit { background: var(--accent-soft); }
+  @media (max-width: 560px) { .pmp-row { grid-template-columns: 26px 74px 1fr repeat(4, 26px); gap: 4px; padding: 4px 10px; } }
+</style>
+</head>
+<body data-chapter="system">
+<main class="chapter">
+  <header class="chapter-hero">
+    <div class="eyebrow">Chapter 13</div>
+    <h1>특권 구조와 인터럽트</h1>
+    <p class="lead">운영체제는 코어를 직접 손대지 않는다. 정해진 손잡이 몇 개를 돌린다. 특권 모드를 오르내리는 명령, 예외가 났을 때 누가 처리할지 정하는 위임 레지스터, 인터럽트를 켜고 끄는 비트, 메모리 영역마다 권한을 거는 PMP가 그 손잡이다. XiangShan 곤명호 v3는 이 손잡이를 <code>NewCSR</code>이라는 한 덩어리 모듈에 모아 두었다. 이 장에서는 그 코드를 그대로 옮긴 시뮬레이터로 트랩 하나가 어느 모드로 떨어지는지, 인터럽트 여럿이 동시에 오면 무엇이 이기는지 직접 판정해 본다.</p>
+    <ul class="objectives">
+      <li>M·HS·HU·VS·VU 다섯 특권 상태와 <code>mret</code>·<code>sret</code>·트랩 진입이 상태를 바꾸는 규칙을 설명한다.</li>
+      <li><code>medeleg</code>·<code>hedeleg</code>로 예외가 M, HS, VS 중 어디서 처리될지 정하는 과정을 시뮬레이터로 확인한다.</li>
+      <li>동시에 생긴 예외의 우선순위와, 인터럽트 필터가 모드별 활성 조건과 기본 우선순위로 하나를 고르는 법을 익힌다.</li>
+      <li>AIA IMSIC 인터럽트 파일에서 MSI가 <code>topei</code>가 되기까지, 그리고 PMP가 주소마다 권한을 정하는 방식을 실험한다.</li>
+      <li>CSR 주소 12비트만 보고 읽기 전용 여부와 접근 가능한 최소 특권을 읽어 낸다.</li>
+    </ul>
+  </header>
+
+  <!-- ============================================================ 1 -->
+  <section id="modes">
+    <h2>다섯 가지 특권 상태</h2>
+    <p>RISC-V 기본 특권 구조에는 M(머신), S(슈퍼바이저), U(사용자) 세 모드가 있다. 곤명호 v3는 하이퍼바이저 확장(H)을 구현하므로 여기에 <span class="term">가상화 비트 V</span>가 붙는다. V = 0이면 진짜 하드웨어 위의 모드이고, S 모드는 하이퍼바이저가 도는 <b>HS</b>, U 모드는 <b>HU</b>가 된다. V = 1이면 게스트 운영체제가 도는 <b>VS</b>와 게스트 사용자 프로그램이 도는 <b>VU</b>다. M 모드에는 가상 버전이 없으므로 상태는 모두 다섯 가지다. 코드에서는 이 상태를 <code>PrivState</code> 번들의 <code>PRVM</code>(2비트)과 <code>V</code>(1비트)로 들고 다닌다.</p>
+    <p>모드 사이의 우열도 코드에 정의되어 있다. 같은 V끼리는 PRVM 값이 작을수록 낮다. 그리고 가상 모드(VS, VU)는 M과 HS보다 낮다. HU와 VS 사이에는 우열이 정의되지 않는다. 이 비교는 나중에 인터럽트가 지금 모드를 끊을 수 있는지 판단할 때 쓰인다.</p>
+    <div class="callout code"><strong>PrivState 비교 연산</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/backend/fu/NewCSR/CSRBundles.scala:145</span>
+<span class="k">def</span> &lt; (that: PrivState): Bool = {
+  (<span class="k">this</span>.isVirtual &amp;&amp; (that.isModeM || that.isModeHS)) ||
+    (<span class="k">this</span>.V === that.V &amp;&amp; <span class="k">this</span>.PRVM &lt; that.PRVM)
+}</code></pre>
+    </div>
+    <p>모드를 바꾸는 길은 두 종류다. 위로 올라가는 길은 <b>트랩</b>(예외나 인터럽트)뿐이다. 아래로 내려가는 길은 <code>mret</code>과 <code>sret</code> 명령이다. 트랩에 들어갈 때 하드웨어는 "어디서 왔는지"를 <code>mstatus.MPP</code>·<code>MPV</code>(M으로 갈 때), <code>mstatus.SPP</code>·<code>hstatus.SPV</code>(HS로 갈 때), <code>vsstatus.SPP</code>(VS로 갈 때)에 적어 둔다. 복귀 명령은 그 기록을 읽어 원래 모드로 돌아간다.</p>
+
+    <div class="sim" id="sim-fsm">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>모드 전이 기계</h3>
+        <button class="btn sm" id="fsm-reset">⏮ 초기화 (M 모드)</button>
+      </div>
+      <div class="sim-view"><canvas id="cv-fsm"></canvas></div>
+      <div class="sim-controls" style="grid-template-columns:1fr">
+        <div class="ctrl-row">
+          <button class="btn sm" id="fsm-trap-m">M으로 트랩</button>
+          <button class="btn sm" id="fsm-trap-hs">HS로 트랩</button>
+          <button class="btn sm" id="fsm-trap-vs">VS로 트랩</button>
+          <button class="btn sm primary" id="fsm-mret">mret</button>
+          <button class="btn sm primary" id="fsm-sret">sret</button>
+        </div>
+        <div class="ctrl-row">
+          <span class="small dim">mret 전에 MPP·MPV 직접 고치기:</span>
+          <div class="seg" id="fsm-mpp"><button data-value="0">MPP=U</button><button data-value="1">MPP=S</button><button data-value="3" class="on">MPP=M</button></div>
+          <div class="seg" id="fsm-mpv"><button data-value="0" class="on">MPV=0</button><button data-value="1">MPV=1</button></div>
+        </div>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">현재 상태</span><span class="v" id="fsm-mode">M</span></div>
+        <div class="stat"><span class="k">mstatus MPP / MPV / MIE / MPIE</span><span class="v" id="fsm-m">—</span></div>
+        <div class="stat"><span class="k">mstatus SPP · hstatus SPV / SIE</span><span class="v" id="fsm-s">—</span></div>
+        <div class="stat"><span class="k">vsstatus SPP / SIE</span><span class="v" id="fsm-vs">—</span></div>
+      </div>
+      <div class="info-panel" id="fsm-info">M 모드에서 시작한다. MPP를 S, MPV를 1로 맞추고 <code>mret</code>을 누르면 VS 모드로 내려간다.</div>
+      <figcaption><span class="try">따라가 보기</span>트랩 버튼은 지금 모드에서 해당 모드로 트랩이 들어갔다고 가정하고, <code>TrapEntryMEvent</code>·<code>TrapEntryHSEvent</code>·<code>TrapEntryVSEvent</code>가 쓰는 필드를 갱신한다. VS로의 트랩은 지금 V = 1일 때만 가능하다. HS로의 트랩도 M 모드에서는 일어나지 않는다. <code>mret</code>은 M 모드에서만, <code>sret</code>은 M·HS·VS에서만 쓸 수 있다. 다른 모드에서 쓰면 불법 명령 예외가 난다(이 그림에서는 경고만 띄운다). 복귀 뒤 <code>MPP</code>와 <code>SPP</code>가 U로 지워지는 것, <code>MPRV</code> 같은 다른 필드는 생략했다는 점에 주의하자.</figcaption>
+    </div>
+    <div class="callout code"><strong>mret이 상태를 바꾸는 법</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/backend/fu/NewCSR/CSREvents/MretEvent.scala:50</span>
+outPrivState.PRVM := in.mstatus.MPP
+outPrivState.V    := Mux(in.mstatus.MPP === PrivMode.M, VirtMode.Off.asUInt, in.mstatus.MPV.asUInt)
+<span class="c">// ... :65</span>
+out.mstatus.bits.MPP        := PrivMode.U
+out.mstatus.bits.MPV        := VirtMode.Off.asUInt
+out.mstatus.bits.MIE        := in.mstatus.MPIE
+out.mstatus.bits.MPIE       := 1.U</code></pre>
+    </div>
+  </section>
+
+  <!-- ============================================================ 2 -->
+  <section id="delegation">
+    <h2>트랩은 어디로 떨어지는가: 위임</h2>
+    <p>기본값으로 모든 트랩은 M 모드가 처리한다. 하지만 사용자 프로그램의 페이지 폴트를 매번 펌웨어(M 모드)가 받아 운영체제로 넘겨 주면 느리다. 그래서 M 모드는 <span class="term">위임 레지스터</span><span class="en">(delegation register)</span>로 "이 원인은 S 모드가 직접 받아라"라고 넘겨 줄 수 있다. 예외는 <code>medeleg</code>, 인터럽트는 <code>mideleg</code>가 그 역할을 한다. 하이퍼바이저가 있으면 한 단계가 더 생긴다. HS 모드가 <code>hedeleg</code>·<code>hideleg</code>로 게스트(VS)에게 다시 넘긴다.</p>
+    <p>곤명호 v3의 <code>TrapHandleModule</code>은 이 판단을 비트 마스크 세 줄로 끝낸다. 가장 우선순위가 높은 예외 비트(<code>highestPrioEX</code>) 하나를 골라, <code>medeleg</code>와 AND하면 HS 후보, 거기에 <code>hedeleg</code>까지 AND하면 VS 후보가 된다. 그리고 현재 모드가 조건을 맞춰야 실제로 그 모드에 떨어진다. M 모드에서 난 트랩은 위임과 상관없이 늘 M이 받는다. 트랩은 특권을 낮추는 쪽으로는 가지 않는다는 원칙 때문이다.</p>
+    <div class="formula">$$\text{VS로} \iff V{=}1 \land e \in \text{medeleg} \land e \in \text{hedeleg},\qquad \text{HS로} \iff \text{모드} \ne M \land e \in \text{medeleg} \land \lnot\text{VS로},\qquad \text{그 밖에는 M}$$
+      <div class="where">\(e\): 가장 우선순위가 높은 예외 번호. 이중 트랩(<code>MDT</code>/<code>SDT</code>) 처리는 생략했다. 코드는 VS 조건을 먼저 검사하므로 둘 다 참이면 VS가 이긴다.</div></div>
+    <div class="callout code"><strong>TrapHandleModule의 핵심</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/backend/fu/NewCSR/TrapHandleModule.scala:53</span>
+<span class="k">private val</span> mEXVec  = highestPrioEX
+<span class="k">private val</span> hsEXVec = highestPrioEX &amp; medeleg
+<span class="k">private val</span> vsEXVec = highestPrioEX &amp; medeleg &amp; hedeleg
+<span class="c">// ... :70</span>
+<span class="k">private val</span> handleTrapUnderHS = !privState.isModeM &amp;&amp; hsHasTrap
+<span class="k">private val</span> handleTrapUnderVS = privState.isVirtual &amp;&amp; vsHasTrap
+<span class="k">private val</span> handleTrapUnderM = !handleTrapUnderVS &amp;&amp; !handleTrapUnderHS</code></pre>
+    </div>
+    <p>모든 비트를 위임할 수 있는 것은 아니다. <code>medeleg</code>에서 M 모드 ecall(11)과 이중 트랩(16)은 읽기 전용 0이다. <code>hedeleg</code>에서는 ecall S·VS·M(9, 10, 11), 게스트 페이지 폴트(20, 21, 23), 가상 명령(22), 이중 트랩이 읽기 전용 0이다. 게스트가 일으킨 게스트 페이지 폴트는 하이퍼바이저가 받아야 하기 때문이다(<code>MachineLevel.scala:691</code>, <code>HypervisorLevel.scala:290</code>).</p>
+
+    <div class="sim" id="sim-deleg">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>예외 위임 판정기</h3>
+        <div class="seg" id="dg-preset"><button data-value="none" class="on">위임 없음</button><button data-value="os">운영체제 전형</button><button data-value="hyp">하이퍼바이저 전형</button></div>
+      </div>
+      <div class="sim-view"><canvas id="cv-deleg"></canvas></div>
+      <div class="grid-form">
+        <label>지금 모드<select id="dg-mode"><option value="M">M</option><option value="HS">HS</option><option value="HU" selected>HU</option><option value="VS">VS</option><option value="VU">VU</option></select></label>
+        <label>예외 원인<select id="dg-cause"></select></label>
+        <label>xtvec 기준 주소 (M / S / VS)<input type="text" id="dg-tvec" value="0x80000000 / 0x80200000 / 0x80400000"></label>
+      </div>
+      <div class="bitgrid" id="dg-bits"></div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">처리할 모드</span><span class="v" id="dg-target">—</span></div>
+        <div class="stat"><span class="k">기록되는 CSR</span><span class="v" id="dg-csrs" style="font-size:13px">—</span></div>
+        <div class="stat"><span class="k">새 PC</span><span class="v" id="dg-pc">—</span></div>
+      </div>
+      <figcaption><span class="try">만져 보기</span>위의 그림은 현재 모드에서 트랩이 떨어지는 모드로 가는 화살표다. 아래 체크 상자가 고른 원인의 <code>medeleg</code>·<code>hedeleg</code> 비트이고, 흐린 상자는 코드에서 읽기 전용인 비트다. '운영체제 전형'은 사용자 ecall과 페이지 폴트를 S에게 넘기는 흔한 설정이다. HU에서 페이지 폴트를 고르면 HS로 가지만, 같은 설정에서 M 모드로 바꾸면 M이 받는다. '하이퍼바이저 전형'에서 VU의 페이지 폴트는 VS로 가지만, 게스트 페이지 폴트(20, 21, 23)는 <code>hedeleg</code>에 위임할 수 없어 HS에 남는다. 예외는 벡터 모드라도 기준 주소로 바로 뛴다.</figcaption>
+    </div>
+
+    <h3>동시에 여러 예외가 나면</h3>
+    <p>명령어 하나가 예외 여러 개를 동시에 일으킬 수 있다. 예를 들어 정렬도 안 맞고 권한도 없는 적재가 그렇다. 하드웨어는 고정된 우선순위 표에서 가장 앞선 것 하나만 보고한다. 곤명호 v3의 표는 <code>ExceptionNO.priorities</code>(<code>package.scala:760</code>)다. 이중 트랩이 맨 앞이고 하드웨어 오류가 맨 뒤다. 명령어 인출 단계의 예외가 실행 단계의 예외보다 앞선다는 것을 볼 수 있다.</p>
+    <figure class="play" id="fig-prio">
+      <div class="excp-list" id="pr-list"></div>
+      <div class="info-panel" id="pr-info">상자를 둘 이상 골라 보자.</div>
+      <figcaption><span class="try">골라 보기</span>왼쪽 숫자는 우선순위 순위(1이 가장 높음), 괄호 안은 <code>mcause</code>에 들어갈 예외 번호다. 체크한 예외 중 순위가 가장 높은 것만 강조된다. 코드는 각 예외 i에 대해 "나보다 높은 순위의 예외가 하나도 없으면 나를 고른다"는 조건을 병렬로 만들어 원-핫 벡터를 얻는다(<code>TrapHandleModule.scala:38-48</code>). 단일 스텝 디버그는 원인과 상관없이 breakpoint(3)로 바뀐다.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ============================================================ 3 -->
+  <section id="interrupts">
+    <h2>인터럽트 필터: 무엇이, 누구에게</h2>
+    <p>인터럽트는 예외보다 복잡하다. 여러 개가 동시에 대기(pending)하는 일이 흔하고, 각자 켜져(enable) 있어야 하며, 지금 모드가 그 인터럽트를 받을 수 있어야 한다. <code>InterruptFilter</code>는 이것을 세 층으로 나눈다.</p>
+    <ol>
+      <li><b>M층</b>: <code>mip &amp; mie &amp; ~mideleg</code>. 위임하지 않은 인터럽트다. 지금 모드가 M이면서 <code>mstatus.MIE</code>가 켜져 있거나, 지금 모드가 M보다 낮을 때 받을 수 있다.</li>
+      <li><b>HS층</b>: <code>(hip|sip) &amp; (hie|sie) &amp; ~hideleg</code>. M이 넘겨준 것 중 HS가 직접 받는 것이다. 지금 모드가 HS이면서 <code>SIE</code>가 켜져 있거나, HS보다 낮을 때(HU, VS, VU) 받는다.</li>
+      <li><b>VS층</b>: 게스트에게까지 넘어간 것이다. VS에서 <code>vsstatus.SIE</code>가 켜져 있거나 VU일 때만 받는다.</li>
+    </ol>
+    <p>세 층 모두 받을 것이 있으면 M층이 이기고, 그다음이 HS층이다(<code>InterruptFilter.scala:489-490</code>). 한 층 안에서는 <span class="term">기본 우선순위</span>로 고른다. 표준 인터럽트의 순서는 MEI &gt; MSI &gt; MTI &gt; SEI &gt; SSI &gt; STI &gt; SGEI &gt; VSEI &gt; VSSI &gt; VSTI &gt; LCOFI다(<code>InterruptBundle.scala:336</code>). AIA의 <code>iprio</code> 레지스터로 이 순서를 바꿀 수 있지만, 아래 시뮬레이터는 모든 <code>iprio</code>가 0인 기본 상태를 가정한다.</p>
+    <div class="callout code"><strong>층별 활성 조건과 층 사이 우선순위</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/backend/fu/NewCSR/InterruptFilter.scala:463</span>
+<span class="k">val</span> mIRVecTmp = Mux(
+  privState.isModeM &amp;&amp; mstatusMIE || privState &lt; PrivState.ModeM,
+  io.out.mtopi.IID.asUInt, 0.U)
+<span class="k">val</span> hsIRVecTmp = Mux(
+  privState.isModeHS &amp;&amp; sstatusSIE || privState &lt; PrivState.ModeHS,
+  io.out.stopi.IID.asUInt, 0.U)
+<span class="c">// ... :489</span>
+<span class="k">val</span> irToHS = !mIRNotZero &amp;&amp; hsIRNotZero
+<span class="k">val</span> irToVS = !mIRNotZero &amp;&amp; !hsIRNotZero &amp;&amp; vsIRNotZero</code></pre>
+    </div>
+    <div class="sim" id="sim-irq">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>인터럽트 판정 행렬</h3>
+        <div class="seg" id="iq-preset"><button data-value="timer" class="on">타이머 둘 경합</button><button data-value="guest">게스트 외부 인터럽트</button><button data-value="clear">모두 끄기</button></div>
+      </div>
+      <div class="grid-form">
+        <label>지금 모드<select id="iq-mode"><option>M</option><option selected>HS</option><option>HU</option><option>VS</option><option>VU</option></select></label>
+        <label class="check" style="flex-direction:row"><input type="checkbox" id="iq-mie" checked> mstatus.MIE</label>
+        <label class="check" style="flex-direction:row"><input type="checkbox" id="iq-sie" checked> mstatus.SIE</label>
+        <label class="check" style="flex-direction:row"><input type="checkbox" id="iq-vsie" checked> vsstatus.SIE</label>
+        <label>xtvec 모드<select id="iq-tvec"><option value="direct">Direct</option><option value="vectored" selected>Vectored</option></select></label>
+      </div>
+      <div class="scroll"><table class="mini-table" id="iq-table"></table></div>
+      <div class="sim-view"><canvas id="cv-irq"></canvas></div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">받는 층</span><span class="v" id="iq-level">—</span></div>
+        <div class="stat"><span class="k">이긴 인터럽트</span><span class="v" id="iq-win">—</span></div>
+        <div class="stat"><span class="k">xcause 코드</span><span class="v" id="iq-cause">—</span></div>
+        <div class="stat"><span class="k">새 PC (기준 0x8000_0000)</span><span class="v" id="iq-pc">—</span></div>
+      </div>
+      <figcaption><span class="try">만져 보기</span>표의 한 줄이 인터럽트 하나다. P는 대기, E는 허용, D는 <code>mideleg</code>, HD는 <code>hideleg</code>이며, 흐린 칸은 코드에서 읽기 전용인 비트다. 예를 들어 VS 인터럽트(2, 6, 10)와 SGEI는 <code>mideleg</code>가 늘 1이다. 아래 사다리는 세 층과 층마다 고른 후보를 보여 준다. '타이머 둘 경합'에서 HS 모드로 두면 MTI(M층)가 STI(HS층)를 이긴다. MTI의 E를 끄면 STI가 받아진다. '게스트 외부 인터럽트'에서 지금 모드를 HS로 바꾸면 VS층은 받을 자격이 없어 대기만 한다. 벡터 모드에서 새 PC는 기준 + 4 × 번호다. VS로 가는 VS 인터럽트는 번호가 1 줄어든다(VSEI 10 → SEI 9). 게스트는 자신을 그냥 S 모드로 알기 때문이다.</figcaption>
+    </div>
+    <div class="callout code"><strong>벡터 모드 주소와 VS 번호 맞추기</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/backend/fu/NewCSR/TrapHandleModule.scala:96</span>
+<span class="k">private val</span> adjustinterruptNO = Mux(
+  InterruptNO.getVS.map(_.U === interruptNO).reduce(_ || _) &amp;&amp; vsHasIR,
+  interruptNO - 1.U, <span class="c">// map VSSIP, VSTIP, VSEIP to SSIP, STIP, SEIP</span>
+  interruptNO,
+)
+<span class="k">private val</span> pcFromXtvec = Cat(xtvec.addr.asUInt +
+  Mux(xtvec.mode === XtvecMode.Vectored &amp;&amp; hasIR, adjustinterruptNO(5, 0), 0.U), 0.U(2.W))</code></pre>
+    </div>
+  </section>
+
+  <!-- ============================================================ 4 -->
+  <section id="aia">
+    <h2>AIA: 메시지로 오는 인터럽트</h2>
+    <p>예전 방식에서는 외부 장치가 인터럽트 선을 PLIC에 꽂았다. 코어는 "외부 인터럽트가 있다"는 1비트만 받은 뒤, PLIC에 물어 어느 장치인지 알아냈다. 코어가 수십 개로 늘고 가상 머신까지 생기자 이 방식은 감당하기 어려워졌다. <span class="term">AIA</span><span class="en">(Advanced Interrupt Architecture)</span>는 인터럽트를 <b>메모리 쓰기</b>로 바꾼다. 장치가 특정 주소에 인터럽트 번호를 쓰면(MSI, Message-Signaled Interrupt), 그 주소에 붙은 <span class="term">IMSIC</span><span class="en">(Incoming MSI Controller)</span>가 해당 번호의 대기 비트를 켠다. 선 대신 일반 버스 트랜잭션을 쓰므로 장치와 코어 수가 늘어나도 배선이 늘지 않는다.</p>
+    <p>곤명호 v3는 IMSIC 구현을 서브모듈 ChiselAIA에서 가져온다. SoC 기본 설정(<code>system/SoC.scala:104</code>)은 다음과 같다.</p>
+    <ul>
+      <li><code>imsicIntSrcWidth = 8</code>이라 인터럽트 번호는 2^8 = 256개다.</li>
+      <li><code>geilen = 7</code>이라 하트 하나에 <b>인터럽트 파일</b>이 9개 있다. M용, S용, 그리고 게스트 7개용이다.</li>
+      <li>파일 하나는 4KB 영역(<code>intFileMemWidth = 12</code>)을 차지한다. M 파일은 <code>0x3A80_0000</code>부터, S·게스트 파일은 <code>0x3B00_0000</code>부터 하트마다 정해진 간격으로 놓인다.</li>
+    </ul>
+    <p>파일마다 대기 비트(<code>eip</code>)와 허용 비트(<code>eie</code>), 전달 스위치 <code>eidelivery</code>, 문턱 <code>eithreshold</code>가 있다. 코어는 <code>mtopei</code>·<code>stopei</code>·<code>vstopei</code> CSR로 "지금 가장 급한 번호"를 읽는다. 번호가 <b>작을수록</b> 우선순위가 높다. 읽은 값을 다시 쓰면 그 번호의 대기 비트가 지워진다. 이것이 claim이다.</p>
+    <div class="callout code"><strong>topei 계산</strong>
+<pre><code><span class="c">// ChiselAIA src/main/scala/IMSIC.scala:308</span>
+<span class="k">def</span> xtopei_filter(xeithreshold: UInt, xtopei: UInt): UInt = {
+  <span class="c">// interrupts, when i &lt;= (eithreshold -1), are enabled</span>
+  Mux(xtopei &lt;= (xeithreshold - 1.U), xtopei, 0.U)
+}
+toCSR.topei := xtopei_filter(eithreshold,
+  ParallelPriorityMux((eipBools zip eieBools).zipWithIndex.map {
+    <span class="k">case</span> ((p: Bool, e: Bool), i: Int) =&gt; (p &amp; e, i.U) }))
+toCSR.pending := (eidelivery(params.xlen - 1, 1) === 0.U) &amp;&amp; eidelivery(0) &amp;&amp; (toCSR.topei =/= 0.U)</code></pre>
+    </div>
+    <div class="sim" id="sim-imsic">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>IMSIC 인터럽트 파일 하나</h3>
+        <div class="seg" id="im-file"><button data-value="0" class="on">M 파일</button><button data-value="1">S 파일</button><button data-value="2">게스트 0</button><button data-value="8">게스트 6</button></div>
+      </div>
+      <div class="sim-view"><canvas id="cv-imsic"></canvas></div>
+      <div class="sim-controls">
+        <label class="ctrl"><span>MSI로 쓸 번호 <output id="im-id-out"></output></span><input type="range" id="im-id" min="1" max="255" step="1" value="37"></label>
+        <label class="ctrl"><span>eithreshold <output id="im-th-out"></output></span><input type="range" id="im-th" min="0" max="256" step="1" value="0"></label>
+        <div class="ctrl-row">
+          <button class="btn sm primary" id="im-send">MSI 쓰기</button>
+          <button class="btn sm" id="im-rand">장치 5개가 아무 번호나</button>
+          <button class="btn sm" id="im-claim">claim (topei 읽고 지우기)</button>
+          <label class="check"><input type="checkbox" id="im-deliv" checked> eidelivery = 1</label>
+        </div>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">MSI 쓰기 주소 (하트 0)</span><span class="v" id="im-addr" style="font-size:14px">—</span></div>
+        <div class="stat"><span class="k">대기 &amp; 허용 개수</span><span class="v" id="im-count">—</span></div>
+        <div class="stat"><span class="k">topei</span><span class="v" id="im-top">—</span></div>
+        <div class="stat"><span class="k">코어로 pending</span><span class="v" id="im-pend">—</span></div>
+      </div>
+      <figcaption><span class="try">눌러 보기</span>16 × 16 격자의 칸 하나가 인터럽트 번호 하나다(0번은 쓰지 않는다). 칸을 클릭하면 허용 비트 <code>eie</code>가 바뀐다. 처음에는 모두 허용 상태다. 주황 칸은 대기 중, 테두리 친 칸은 지금 <code>topei</code>다. <code>eithreshold</code>를 0이 아닌 값 t로 올리면 t 이상인 번호는 대기해도 무시된다. 0은 "문턱 없음"이다. 코드에서 0 − 1이 최댓값으로 넘어가기 때문이다. <code>eidelivery</code>를 끄면 <code>topei</code>는 계산되지만 코어로 인터럽트를 올리지 않는다.</figcaption>
+    </div>
+    <div class="callout tip"><strong>타이머와 소프트웨어 인터럽트</strong>
+      <p>타이머(MTI)와 소프트웨어 인터럽트(MSI)는 여전히 선으로 온다. 곤명호 v3는 <b>Sstc</b> 확장도 구현한다. S 모드가 <code>stimecmp</code>(0x14D)에 값을 쓰면 시간이 그 값을 넘을 때 STI가 켜진다. 덕분에 운영체제가 타이머를 맞출 때마다 M 모드 펌웨어를 부를 필요가 없다(<code>SstcInterruptGen.scala</code>). 게스트용 <code>vstimecmp</code>(0x24D)도 있다.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ 5 -->
+  <section id="pmp">
+    <h2>PMP: 물리 주소에 거는 자물쇠</h2>
+    <p>가상 메모리(11장)가 프로세스끼리를 떼어 놓는다면, <span class="term">PMP</span><span class="en">(Physical Memory Protection)</span>는 M 모드 펌웨어가 S·U 모드 전체로부터 물리 메모리 일부를 지키는 장치다. 펌웨어 코드나 보안 영역이 대상이다. 항목마다 주소 범위와 R·W·X 권한, 잠금 비트 L이 있다.</p>
+    <p>곤명호 v3의 PMP 규칙은 <code>PMP.scala</code>에 있다.</p>
+    <ul>
+      <li>CSR로는 64개 항목을 정의하지만 실제로 구현한 것은 <code>NumPMPReal = 32</code>개다.</li>
+      <li>최소 단위(grain)는 <code>PlatformGrain</code> = 4KB, 즉 페이지 하나다(<code>PMParameters.scala:30-35</code>). 그래서 4바이트 영역을 뜻하는 NA4 모드는 사실상 쓸 수 없고, TOR와 NAPOT만 의미가 있다.</li>
+      <li>여러 항목이 겹치면 <b>번호가 가장 작은 항목</b>이 이긴다.</li>
+      <li>어느 항목에도 맞지 않으면 M 모드는 통과하고, S·U 모드는 모두 거부된다.</li>
+      <li>잠금 비트가 꺼진 항목은 M 모드에 적용되지 않는다.</li>
+    </ul>
+    <div class="callout code"><strong>맞는 항목 고르기와 기본값</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/backend/fu/PMP.scala:425</span>
+<span class="k">val</span> passThrough = <span class="k">if</span> (pmpEntries.isEmpty) true.B <span class="k">else</span> (mode &gt; 1.U)
+<span class="c">// ... :436</span>
+<span class="k">val</span> ignore = passThrough &amp;&amp; !pmp.cfg.l
+cur.cfg.r := aligned &amp;&amp; (pmp.cfg.r || ignore)
+<span class="c">// ... :450</span>
+match_vec(num) := true.B
+cfg_vec(num) := pmpDefault
+ParallelPriorityMux(match_vec, cfg_vec)</code></pre>
+    </div>
+    <div class="sim" id="sim-pmp">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>PMP 항목 맞추기</h3>
+        <div class="seg" id="pm-mode"><button data-value="M">M 모드</button><button data-value="S" class="on">S 모드</button><button data-value="U">U 모드</button></div>
+      </div>
+      <div class="pmp-row head"><span>#</span><span>모드</span><span>pmpaddr (페이지 번호) · NAPOT 크기</span><span>R</span><span>W</span><span>X</span><span>L</span></div>
+      <div id="pm-rows"></div>
+      <div class="sim-view"><canvas id="cv-pmp"></canvas></div>
+      <div class="sim-controls">
+        <label class="ctrl"><span>검사할 물리 주소 <output id="pm-addr-out"></output></span><input type="range" id="pm-addr" min="0" max="1023" step="1" value="130"></label>
+        <div class="ctrl"><span>접근 종류</span><div class="seg" id="pm-kind"><button data-value="r" class="on">읽기</button><button data-value="w">쓰기</button><button data-value="x">실행</button></div></div>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">맞은 항목</span><span class="v" id="pm-hit">—</span></div>
+        <div class="stat"><span class="k">권한 R/W/X</span><span class="v" id="pm-perm">—</span></div>
+        <div class="stat"><span class="k">이 접근</span><span class="v" id="pm-ok">—</span></div>
+      </div>
+      <figcaption><span class="try">만져 보기</span>가로 막대는 물리 주소 0x8000_0000부터 4MB(4KB 페이지 1,024개)를 펼친 것이다. 칸마다 항목의 범위가 색 띠로 칠해진다. 주소 칸은 4KB 페이지 번호(0~1024)다. TOR 항목은 바로 앞 항목의 주소부터 자기 주소 앞까지를 덮는다. NAPOT 항목은 그 주소를 포함하고 크기에 정렬된 2의 거듭제곱 영역이다. 실제 NAPOT의 <code>pmpaddr</code>에는 크기를 나타내는 하위 1 비트가 섞이는데, 이 그림은 주소와 크기를 따로 받는다. 아래 슬라이더로 주소를 옮기며 어느 항목이 맞는지 보자. 0번과 1번이 겹치는 곳에서는 0번이 이긴다. S 모드에서 어떤 항목에도 맞지 않는 주소는 거부되지만, M 모드로 바꾸면 통과한다. M 모드라도 L이 켜진 항목에는 권한이 그대로 적용된다.</figcaption>
+    </div>
+  </section>
+
+  <!-- ============================================================ 6 -->
+  <section id="csr">
+    <h2>CSR 주소 12비트를 읽는 법</h2>
+    <p>CSR 주소는 12비트이고, 앞쪽 비트에 규칙이 숨어 있다. [11:10]이 <code>11</code>이면 <b>읽기 전용</b>이고, [9:8]은 접근에 필요한 <b>최소 특권</b>이다. 00은 U, 01은 S, 10은 H(하이퍼바이저), 11은 M이다. 예를 들어 <code>cycle</code>(0xC00)은 읽기 전용 U 레지스터, <code>mstatus</code>(0x300)는 읽고 쓸 수 있는 M 레지스터다. <code>vsstatus</code>(0x200)는 H 레지스터라서 HS 이상에서만 직접 만질 수 있다.</p>
+    <p>곤명호 v3의 <code>CSRPermitModule</code>은 (V, PRVM, 주소[9:8]) 다섯 비트로 진리표를 찾아 접근이 합법인지 판정한다. 불법일 때 무엇을 던지는지도 정해져 있다. 가상 모드에서 M이 아닌 CSR에 접근하다 막히면 <b>가상 명령 예외</b>(22)를 던진다. 하이퍼바이저가 게스트를 대신해 흉내 낼 수 있게 하기 위해서다. 그 밖의 경우는 <b>불법 명령 예외</b>(2)다. 0x7B0~0x7BF의 디버그 레지스터는 디버그 모드에서만 보인다.</p>
+    <div class="callout code"><strong>접근 진리표</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/backend/fu/NewCSR/CSRPermitModule.scala:360</span>
+<span class="k">private val</span> accessTable = TruthTable(Seq(
+  <span class="c">//       V PRVM ADDR</span>
+  BitPat(<span class="s">"b0__00___00"</span>) -&gt; BitPat.Y(), <span class="c">// HU access U</span>
+  BitPat(<span class="s">"b1__00___00"</span>) -&gt; BitPat.Y(), <span class="c">// VU access U</span>
+  BitPat(<span class="s">"b0__01___00"</span>) -&gt; BitPat.Y(), <span class="c">// HS access U</span>
+  BitPat(<span class="s">"b0__01___01"</span>) -&gt; BitPat.Y(), <span class="c">// HS access S</span>
+  BitPat(<span class="s">"b0__01___10"</span>) -&gt; BitPat.Y(), <span class="c">// HS access H</span>
+  BitPat(<span class="s">"b1__01___00"</span>) -&gt; BitPat.Y(), <span class="c">// VS access U</span>
+  BitPat(<span class="s">"b1__01___01"</span>) -&gt; BitPat.Y(), <span class="c">// VS access S</span>
+  <span class="c">// ... M access everything</span>
+), BitPat.N())
+io.out.privilege_EX_II := !privilegeLegal &amp;&amp; (!privState.isVirtual || csrIsM)
+io.out.privilege_EX_VI := !privilegeLegal &amp;&amp; privState.isVirtual &amp;&amp; !csrIsM</code></pre>
+    </div>
+    <figure class="play" id="fig-csr">
+      <div class="play-view"><canvas id="cv-csr"></canvas></div>
+      <div class="grid-form">
+        <label>CSR 고르기<select id="cs-pick"></select></label>
+        <label>또는 주소 직접 입력 (16진)<input type="text" id="cs-hex" value="0x200"></label>
+        <label>접근하는 모드<select id="cs-mode"><option>M</option><option>HS</option><option>HU</option><option selected>VS</option><option>VU</option></select></label>
+        <div class="ctrl"><span>동작</span><div class="seg" id="cs-op"><button data-value="r" class="on">읽기</button><button data-value="w">쓰기</button></div></div>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">[11:10] 쓰기</span><span class="v" id="cs-rw">—</span></div>
+        <div class="stat"><span class="k">[9:8] 최소 특권</span><span class="v" id="cs-priv">—</span></div>
+        <div class="stat"><span class="k">판정</span><span class="v" id="cs-res">—</span></div>
+      </div>
+      <figcaption><span class="try">눌러 보기</span>12개 비트 칸을 클릭하면 주소가 바뀐다. 색 띠는 [11:10] 읽기 전용 필드, [9:8] 특권 필드, [7:0] 번호다. 판정은 위 진리표와 읽기 전용 규칙을 그대로 옮긴 것이다. VS 모드에서 <code>vsstatus</code>(0x200)를 직접 읽으면 가상 명령 예외가 난다. 게스트는 같은 레지스터를 <code>sstatus</code>(0x100)라는 이름으로 읽어야 한다. 하드웨어가 그 접근을 <code>vsstatus</code>로 바꿔 준다. 실제 RTL은 여기에 더해 <code>mstateen</code>, <code>mcounteren</code>, <code>TVM</code> 같은 세부 허가 조건도 본다. 이 그림은 주소만 보는 1차 판정이다.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ============================================================ 7 -->
+  <section id="isa">
+    <h2>디버그, 트리거, 그리고 지원 확장 목록</h2>
+    <p>코어 밖의 디버거가 코어를 멈추려면 <span class="term">디버그 모드</span>가 필요하다. 곤명호 v3는 RISC-V 디버그 명세의 Sdext(디버그 모드, <code>dcsr</code>·<code>dpc</code>, <code>dret</code>)와 Sdtrig(트리거)를 구현한다.</p>
+    <ul>
+      <li>트리거는 4개다(<code>Parameters.scala:923</code>, <code>TriggerNum = 4</code>). <code>tselect</code>(0x7A0)로 하나를 고르고 <code>tdata1</code>·<code>tdata2</code>에 조건을 쓰면, 특정 주소를 인출하거나 적재·저장할 때 breakpoint 예외를 내거나 디버그 모드로 들어간다.</li>
+      <li>디버그 모드로 들어가는 길에는 <code>TrapEntryDEvent</code>가, 돌아오는 <code>dret</code>에는 <code>DretEvent</code>가 쓰인다.</li>
+    </ul>
+    <p>코어가 지원하는 ISA 확장의 공식 목록은 <code>XSCoreParameters.ISAExtensions</code>(<code>Parameters.scala:304</code>)에 문자열로 적혀 있다. 이 목록은 장치 트리와 문서를 만드는 데 쓰인다. 아래에서 검색해 보자.</p>
+    <figure class="play" id="fig-isa">
+      <div class="grid-form" style="border-top:0">
+        <label>확장 이름 검색 (예: zicond, sv48, smaia)<input type="text" id="isa-q" placeholder="검색어"></label>
+        <div class="ctrl"><span>분류</span><div class="seg" id="isa-cat"><button data-value="all" class="on">전체</button><button data-value="priv">특권(S·Sm·Ss·Sh·Sv)</button><button data-value="z">사용자(Z)</button><button data-value="single">한 글자</button></div></div>
+      </div>
+      <div class="chip-list" id="isa-chips"></div>
+      <div class="info-panel" id="isa-info">—</div>
+      <figcaption><span class="try">찾아 보기</span>한 글자 확장 9개(<code>imafdcbvh</code>)와 여러 글자 확장들이다. 기본은 <code>rv64i</code>다. 이 장에서 다룬 것은 <code>h</code>(하이퍼바이저), <code>smaia</code>/<code>ssaia</code>(AIA), <code>sstc</code>(S 모드 타이머), <code>sdext</code>/<code>sdtrig</code>(디버그), <code>sscofpmf</code>(카운터 오버플로 인터럽트, 14장)다. 가상 메모리 관련 <code>sv39</code>·<code>sv48</code>·<code>svnapot</code>·<code>svpbmt</code>는 11장에서 다룬다.</figcaption>
+    </figure>
+  </section>
+
+  <section class="keypoints">
+    <h2>핵심 정리</h2>
+    <ol>
+      <li>곤명호 v3의 특권 상태는 PRVM(2비트)과 V(1비트)로 표현하는 M·HS·HU·VS·VU 다섯 가지다. 트랩으로만 올라가고, <code>mret</code>·<code>sret</code>은 MPP·MPV·SPP·SPV에 적힌 곳으로 내려간다.</li>
+      <li>예외는 우선순위 표에서 하나만 고른 뒤 <code>medeleg</code>, <code>medeleg &amp; hedeleg</code> 마스크로 HS·VS 위임을 판정한다. M 모드에서 난 트랩은 늘 M이 받고, VS 조건이 HS보다 먼저 검사된다.</li>
+      <li>인터럽트는 M·HS·VS 세 층으로 나뉘고, 층마다 "그 모드에서 전역 허용 비트가 켜져 있거나 더 낮은 모드에 있을 것"을 만족해야 받는다. 층 사이에서는 M이 이기고, 층 안에서는 기본 우선순위(MEI가 가장 높음)를 따른다.</li>
+      <li>AIA IMSIC은 MSI 쓰기를 번호별 대기 비트로 바꾸고, 가장 작은 번호를 <code>topei</code>로 올린다. 하트마다 M·S·게스트 7개, 모두 9개의 인터럽트 파일이 있다.</li>
+      <li>PMP는 4KB 단위로 32개 항목을 실제 구현했다. 가장 작은 번호의 항목이 이기고, 맞는 항목이 없으면 M만 통과한다. CSR 주소 [11:10]과 [9:8]은 각각 읽기 전용 여부와 최소 특권을 정한다.</li>
+    </ol>
+  </section>
+
+  <section id="quiz">
+    <h2>확인 퀴즈</h2>
+    <div class="quiz">
+      <div class="quiz-q" data-answer="2"><p>Q1. VU 모드에서 적재 페이지 폴트(13)가 났다. medeleg[13] = 1, hedeleg[13] = 1이다. 누가 처리하는가?</p><div class="opts">
+        <button class="opt">M</button><button class="opt">HS</button><button class="opt">VS</button><button class="opt">VU 자신</button></div>
+        <div class="quiz-exp">V = 1이고 두 위임 비트가 모두 켜져 있으므로 vsEXVec가 0이 아니고 handleTrapUnderVS가 참이다. 코드는 VS 조건을 먼저 보므로 VS(게스트 커널)가 처리한다. 트랩은 지금 모드보다 낮은 모드(VU)로는 가지 않는다.</div></div>
+      <div class="quiz-q" data-answer="1"><p>Q2. M 모드에서 실행하다 불법 명령 예외(2)가 났다. medeleg[2] = 1이다. 누가 처리하는가?</p><div class="opts">
+        <button class="opt">HS</button><button class="opt">M</button><button class="opt">위임 비트에 따라 다르다</button></div>
+        <div class="quiz-exp">handleTrapUnderHS는 <code>!privState.isModeM &amp;&amp; hsHasTrap</code>이다. M 모드에서는 위임 비트와 상관없이 M이 받는다.</div></div>
+      <div class="quiz-q" data-answer="0"><p>Q3. HS 모드, mstatus.SIE = 0이다. M에서 HS로 위임된 STI가 대기 중이고 허용되어 있다. 다른 인터럽트는 없다. 결과는?</p><div class="opts">
+        <button class="opt">받지 않고 대기한다</button><button class="opt">HS가 바로 받는다</button><button class="opt">M이 대신 받는다</button></div>
+        <div class="quiz-exp">HS층 조건은 <code>(HS 모드 &amp;&amp; SIE) || 모드 &lt; HS</code>다. HS 모드인데 SIE가 0이므로 거짓이다. 위임된 인터럽트를 M이 대신 받지도 않는다. SIE가 켜지거나 더 낮은 모드로 내려가면 그때 받는다.</div></div>
+      <div class="quiz-q" data-answer="3"><p>Q4. IMSIC 파일에서 번호 5와 40이 대기·허용 상태이고 eithreshold = 5다. topei는?</p><div class="opts">
+        <button class="opt">5</button><button class="opt">40</button><button class="opt">4</button><button class="opt">0 (전달할 것 없음)</button></div>
+        <div class="quiz-exp">우선순위 MUX는 가장 작은 번호 5를 고른다. 그러나 필터 조건 <code>topei ≤ eithreshold − 1 = 4</code>를 통과하지 못해 0이 된다. 문턱은 "이 번호 이상은 무시"라는 뜻이고, 더 작은 번호만 남기는 방식이라 40도 보지 않는다.</div></div>
+      <div class="quiz-q" data-answer="1"><p>Q5. CSR 주소 0xB03(mhpmcounter3)을 HS 모드에서 쓰려 한다. 판정은?</p><div class="opts">
+        <button class="opt">합법</button><button class="opt">불법 명령 예외</button><button class="opt">가상 명령 예외</button></div>
+        <div class="quiz-exp">0xB03의 [11:10] = 10(읽기·쓰기 가능), [9:8] = 11(M 전용)이다. HS는 M CSR에 접근할 수 없고 가상 모드가 아니므로 불법 명령 예외다. S 모드가 카운터를 읽으려면 읽기 전용 별칭 <code>hpmcounter3</code>(0xC03)을 쓰고, <code>mcounteren</code>이 허락해야 한다.</div></div>
+    </div>
+  </section>
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ======================================================= 공통: 모드 정의 */
+  const MODES = {
+    M:  { privilegeLevel: 3, isVirtual: false, label: "M" },
+    HS: { privilegeLevel: 1, isVirtual: false, label: "HS" },
+    HU: { privilegeLevel: 0, isVirtual: false, label: "HU" },
+    VS: { privilegeLevel: 1, isVirtual: true,  label: "VS" },
+    VU: { privilegeLevel: 0, isVirtual: true,  label: "VU" },
+  };
+  const MODE_POSITIONS = { M: [0.5, 0.16], HS: [0.25, 0.48], HU: [0.25, 0.84], VS: [0.75, 0.48], VU: [0.75, 0.84] };
+  const MODE_COLOR = { M: "bad", HS: "accent-2", HU: "accent-2", VS: "ok", VU: "ok" };
+  function modeFrom(privilegeLevel, isVirtual) {
+    if (privilegeLevel === 3) return "M";
+    if (privilegeLevel === 1) return isVirtual ? "VS" : "HS";
+    return isVirtual ? "VU" : "HU";
+  }
+  /** CSRBundles.scala:145 의 PrivState < 를 그대로 옮긴 것 */
+  function isLower(thisMode, thatMode) {
+    const a = MODES[thisMode], b = MODES[thatMode];
+    return (a.isVirtual && (thatMode === "M" || thatMode === "HS")) || (a.isVirtual === b.isVirtual && a.privilegeLevel < b.privilegeLevel);
+  }
+  /** 다섯 모드를 노드로 그리고, 화살표 목록을 얹는다. */
+  function drawModeDiagram(ctx, width, height, currentMode, arrows, highlightMode) {
+    const nodeWidth = Math.min(110, width * 0.2), nodeHeight = 38;
+    const center = (mode) => [MODE_POSITIONS[mode][0] * width, MODE_POSITIONS[mode][1] * height];
+    MB.text(ctx, "V = 0 (호스트)", width * 0.25, height * 0.3 - 4, { align: "center", size: 11, color: MB.css("text-faint") });
+    MB.text(ctx, "V = 1 (게스트)", width * 0.75, height * 0.3 - 4, { align: "center", size: 11, color: MB.css("text-faint") });
+    ctx.strokeStyle = MB.css("grid"); ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(width / 2, height * 0.32); ctx.lineTo(width / 2, height - 8); ctx.stroke(); ctx.setLineDash([]);
+    arrows.forEach((arrow) => {
+      const [x1, y1] = center(arrow.from), [x2, y2] = center(arrow.to);
+      const angle = Math.atan2(y2 - y1, x2 - x1);
+      const shrinkX = Math.cos(angle) * (nodeWidth / 2 + 4), shrinkY = Math.sin(angle) * (nodeHeight / 2 + 4);
+      const offset = arrow.offset || 0;
+      const normalX = -Math.sin(angle) * offset, normalY = Math.cos(angle) * offset;
+      if (arrow.from === arrow.to) return;
+      MB.arrow(ctx, x1 + shrinkX + normalX, y1 + shrinkY + normalY, x2 - shrinkX + normalX, y2 - shrinkY + normalY, MB.css(arrow.color || "text-faint"), arrow.width || 1.6, 8);
+      if (arrow.label) MB.text(ctx, arrow.label, (x1 + x2) / 2 + normalX * 2.2, (y1 + y2) / 2 + normalY * 2.2 - 6, { align: "center", size: 11, weight: 700, color: MB.css(arrow.color || "text-dim") });
+    });
+    Object.keys(MODES).forEach((mode) => {
+      const [x, y] = center(mode);
+      const isCurrent = mode === currentMode, isHighlighted = mode === highlightMode;
+      const color = MB.css(MODE_COLOR[mode]);
+      ctx.fillStyle = isCurrent ? MB.alpha(color, 0.22) : isHighlighted ? MB.alpha(color, 0.12) : MB.css("surface");
+      MB.roundRect(ctx, x - nodeWidth / 2, y - nodeHeight / 2, nodeWidth, nodeHeight, 9); ctx.fill();
+      ctx.strokeStyle = isCurrent || isHighlighted ? color : MB.css("border"); ctx.lineWidth = isCurrent ? 2.6 : isHighlighted ? 2 : 1; ctx.stroke();
+      MB.text(ctx, mode, x, y, { align: "center", size: 15, weight: 800, mono: true, color: isCurrent || isHighlighted ? color : MB.css("text-dim") });
+    });
+  }
+
+  /* ======================================================= 그림: 모드 전이 기계 */
+  const machine = {};
+  function resetMachine() {
+    Object.assign(machine, { mode: "M", previousMachinePrivilege: 3, previousMachineVirtual: 0, machineInterruptEnable: 1, machinePreviousInterruptEnable: 0,
+      supervisorPreviousPrivilege: 0, supervisorPreviousVirtual: 0, supervisorInterruptEnable: 0, supervisorPreviousInterruptEnable: 0,
+      virtualPreviousPrivilege: 0, virtualInterruptEnable: 0, virtualPreviousInterruptEnable: 0, lastArrow: null });
+    fsmInfo("M 모드에서 시작한다. MPP를 S, MPV를 1로 맞추고 <code>mret</code>을 누르면 VS 모드로 내려간다.");
+    paintMachine();
+  }
+  const fsmView = MB.canvas("#cv-fsm", { aspect: 0.5, minHeight: 240, maxHeight: 340, draw(ctx, width, height) {
+    const arrows = machine.lastArrow ? [machine.lastArrow] : [];
+    drawModeDiagram(ctx, width, height, machine.mode, arrows, null);
+  } });
+  function fsmInfo(html) { document.getElementById("fsm-info").innerHTML = html; }
+  const privilegeName = (value) => ({ 0: "U", 1: "S", 3: "M" }[value]);
+  function paintMachine() {
+    MB.set("fsm-mode", machine.mode);
+    MB.set("fsm-m", `${privilegeName(machine.previousMachinePrivilege)} / ${machine.previousMachineVirtual} / ${machine.machineInterruptEnable} / ${machine.machinePreviousInterruptEnable}`);
+    MB.set("fsm-s", `${privilegeName(machine.supervisorPreviousPrivilege)} · ${machine.supervisorPreviousVirtual} / ${machine.supervisorInterruptEnable}`);
+    MB.set("fsm-vs", `${privilegeName(machine.virtualPreviousPrivilege)} / ${machine.virtualInterruptEnable}`);
+    document.querySelectorAll("#fsm-mpp button").forEach((b) => b.classList.toggle("on", +b.dataset.value === machine.previousMachinePrivilege));
+    document.querySelectorAll("#fsm-mpv button").forEach((b) => b.classList.toggle("on", +b.dataset.value === machine.previousMachineVirtual));
+    fsmView.redraw();
+  }
+  function trapTo(target) {
+    const from = machine.mode, current = MODES[from];
+    if (target === "HS" && from === "M") return fsmInfo("M 모드에서 난 트랩은 위임과 상관없이 M이 받는다. HS로는 갈 수 없다.");
+    if (target === "VS" && !current.isVirtual) return fsmInfo("VS로의 트랩은 지금 V = 1(VS나 VU)일 때만 일어난다.");
+    if (target === "M") {
+      // TrapEntryMEvent: MPP, MPV, MPIE ← MIE, MIE ← 0
+      machine.previousMachinePrivilege = current.privilegeLevel; machine.previousMachineVirtual = current.isVirtual ? 1 : 0;
+      machine.machinePreviousInterruptEnable = machine.machineInterruptEnable; machine.machineInterruptEnable = 0;
+      machine.mode = "M";
+      fsmInfo(`${from} → M 트랩. <code>mstatus.MPP</code> = ${privilegeName(current.privilegeLevel)}, <code>MPV</code> = ${current.isVirtual ? 1 : 0}, MIE는 MPIE로 옮기고 0. <code>mepc</code>·<code>mcause</code>·<code>mtval</code>·<code>mtval2</code>·<code>mtinst</code>도 기록된다.`);
+    } else if (target === "HS") {
+      machine.supervisorPreviousPrivilege = current.privilegeLevel; machine.supervisorPreviousVirtual = current.isVirtual ? 1 : 0;
+      machine.supervisorPreviousInterruptEnable = machine.supervisorInterruptEnable; machine.supervisorInterruptEnable = 0;
+      machine.mode = "HS";
+      fsmInfo(`${from} → HS 트랩. <code>mstatus.SPP</code> = ${privilegeName(current.privilegeLevel)}, <code>hstatus.SPV</code> = ${current.isVirtual ? 1 : 0}, SIE는 SPIE로 옮기고 0. <code>sepc</code>·<code>scause</code>·<code>stval</code>·<code>htval</code>·<code>htinst</code>가 기록된다.`);
+    } else {
+      machine.virtualPreviousPrivilege = current.privilegeLevel;
+      machine.virtualPreviousInterruptEnable = machine.virtualInterruptEnable; machine.virtualInterruptEnable = 0;
+      machine.mode = "VS";
+      fsmInfo(`${from} → VS 트랩. <code>vsstatus.SPP</code> = ${privilegeName(current.privilegeLevel)}, vsstatus의 SIE는 SPIE로. <code>vsepc</code>·<code>vscause</code>·<code>vstval</code>이 기록된다. V는 계속 1이다.`);
+    }
+    machine.lastArrow = { from, to: machine.mode, color: "bad", label: "트랩", width: 2.4 };
+    paintMachine();
+  }
+  function mret() {
+    const from = machine.mode;
+    if (from !== "M") return fsmInfo("<code>mret</code>은 M 모드에서만 쓸 수 있다. 다른 모드에서는 불법 명령 예외가 난다.");
+    // MretEvent.scala:50 — V는 MPP가 M이면 0, 아니면 MPV
+    const nextPrivilege = machine.previousMachinePrivilege;
+    const nextVirtual = nextPrivilege === 3 ? false : machine.previousMachineVirtual === 1;
+    machine.mode = modeFrom(nextPrivilege, nextVirtual);
+    machine.machineInterruptEnable = machine.machinePreviousInterruptEnable; machine.machinePreviousInterruptEnable = 1;
+    machine.previousMachinePrivilege = 0; machine.previousMachineVirtual = 0;
+    machine.lastArrow = { from, to: machine.mode, color: "accent", label: "mret", width: 2.4 };
+    fsmInfo(`mret: PRVM ← MPP(${privilegeName(nextPrivilege)}), V ← ${nextPrivilege === 3 ? "0 (MPP가 M)" : "MPV"} → <b>${machine.mode}</b>. 그 뒤 MPP는 U, MPV는 0으로 지워지고 MIE ← MPIE, MPIE ← 1.`);
+    paintMachine();
+  }
+  function sret() {
+    const from = machine.mode;
+    if (from === "HU" || from === "VU") return fsmInfo("U 모드에서 <code>sret</code>은 불법 명령 예외다.");
+    if (from === "VS") {
+      const nextPrivilege = machine.virtualPreviousPrivilege;
+      machine.mode = modeFrom(nextPrivilege, true);
+      machine.virtualInterruptEnable = machine.virtualPreviousInterruptEnable; machine.virtualPreviousPrivilege = 0;
+      fsmInfo(`VS에서 sret: PRVM ← vsstatus.SPP(${privilegeName(nextPrivilege)}), V는 1 유지 → <b>${machine.mode}</b>. vsstatus.SPP는 U로 지워진다.`);
+    } else {
+      const nextPrivilege = machine.supervisorPreviousPrivilege, nextVirtual = machine.supervisorPreviousVirtual === 1;
+      machine.mode = modeFrom(nextPrivilege, nextVirtual);
+      machine.supervisorInterruptEnable = machine.supervisorPreviousInterruptEnable; machine.supervisorPreviousInterruptEnable = 1;
+      machine.supervisorPreviousPrivilege = 0; machine.supervisorPreviousVirtual = 0;
+      fsmInfo(`${from}에서 sret: PRVM ← mstatus.SPP(${privilegeName(nextPrivilege)}), V ← hstatus.SPV(${nextVirtual ? 1 : 0}) → <b>${machine.mode}</b>. SPP는 U, SPV는 0으로 지워진다.`);
+    }
+    machine.lastArrow = { from, to: machine.mode, color: "accent", label: "sret", width: 2.4 };
+    paintMachine();
+  }
+  document.getElementById("fsm-reset").onclick = resetMachine;
+  document.getElementById("fsm-trap-m").onclick = () => trapTo("M");
+  document.getElementById("fsm-trap-hs").onclick = () => trapTo("HS");
+  document.getElementById("fsm-trap-vs").onclick = () => trapTo("VS");
+  document.getElementById("fsm-mret").onclick = mret;
+  document.getElementById("fsm-sret").onclick = sret;
+  document.getElementById("fsm-mpp").addEventListener("click", (event) => { const b = event.target.closest("button"); if (b) { machine.previousMachinePrivilege = +b.dataset.value; paintMachine(); } });
+  document.getElementById("fsm-mpv").addEventListener("click", (event) => { const b = event.target.closest("button"); if (b) { machine.previousMachineVirtual = +b.dataset.value; paintMachine(); } });
+  resetMachine();
+
+  /* ======================================================= 예외 표 (package.scala:695, :760) */
+  const EXCEPTIONS = [
+    [0, "명령 주소 정렬 오류"], [1, "명령 접근 오류"], [2, "불법 명령"], [3, "breakpoint"], [4, "적재 주소 정렬 오류"],
+    [5, "적재 접근 오류"], [6, "저장 주소 정렬 오류"], [7, "저장 접근 오류"], [8, "U 모드 ecall"], [9, "HS 모드 ecall"],
+    [10, "VS 모드 ecall"], [11, "M 모드 ecall"], [12, "명령 페이지 폴트"], [13, "적재 페이지 폴트"], [15, "저장 페이지 폴트"],
+    [16, "이중 트랩"], [18, "소프트웨어 검사"], [19, "하드웨어 오류"], [20, "명령 게스트 페이지 폴트"], [21, "적재 게스트 페이지 폴트"],
+    [22, "가상 명령"], [23, "저장 게스트 페이지 폴트"],
+  ];
+  const EXCEPTION_NAME = Object.fromEntries(EXCEPTIONS);
+  const EXCEPTION_PRIORITY = [16, 3, 12, 20, 1, 18, 2, 22, 0, 11, 9, 10, 8, 6, 4, 15, 13, 23, 21, 7, 5, 19];
+  const MEDELEG_READ_ONLY = [11, 16];
+  const HEDELEG_READ_ONLY = [9, 10, 11, 20, 21, 22, 23, 16];
+
+  /* ======================================================= 그림: 예외 위임 판정기 */
+  const delegation = { medeleg: new Set(), hedeleg: new Set() };
+  const PRESETS = {
+    none: { medeleg: [], hedeleg: [] },
+    os: { medeleg: [0, 3, 8, 12, 13, 15], hedeleg: [] },
+    hyp: { medeleg: [0, 3, 8, 10, 12, 13, 15, 20, 21, 22, 23], hedeleg: [0, 3, 8, 12, 13, 15] },
+  };
+  const causeSelect = document.getElementById("dg-cause");
+  causeSelect.innerHTML = EXCEPTIONS.map(([code, name]) => `<option value="${code}">${code} · ${name}</option>`).join("");
+  causeSelect.value = "13";
+  function buildDelegationBits() {
+    const box = document.getElementById("dg-bits");
+    let html = '<div class="grp">medeleg (M → HS 위임)</div>';
+    EXCEPTIONS.forEach(([code]) => {
+      const isReadOnly = MEDELEG_READ_ONLY.includes(code);
+      html += `<label class="${isReadOnly ? "ro" : ""}"><input type="checkbox" data-register="medeleg" data-code="${code}" ${isReadOnly ? "disabled" : ""} ${delegation.medeleg.has(code) ? "checked" : ""}>[${code}] ${EXCEPTION_NAME[code]}</label>`;
+    });
+    html += '<div class="grp">hedeleg (HS → VS 위임)</div>';
+    EXCEPTIONS.forEach(([code]) => {
+      const isReadOnly = HEDELEG_READ_ONLY.includes(code);
+      html += `<label class="${isReadOnly ? "ro" : ""}"><input type="checkbox" data-register="hedeleg" data-code="${code}" ${isReadOnly ? "disabled" : ""} ${delegation.hedeleg.has(code) ? "checked" : ""}>[${code}] ${EXCEPTION_NAME[code]}</label>`;
+    });
+    box.innerHTML = html;
+  }
+  document.getElementById("dg-bits").addEventListener("change", (event) => {
+    const input = event.target;
+    const register = delegation[input.dataset.register], code = +input.dataset.code;
+    if (input.checked) register.add(code); else register.delete(code);
+    paintDelegation();
+  });
+  MB.seg("#dg-preset", (value) => {
+    delegation.medeleg = new Set(PRESETS[value].medeleg); delegation.hedeleg = new Set(PRESETS[value].hedeleg);
+    buildDelegationBits(); paintDelegation();
+  });
+  /** TrapHandleModule.scala:53-72 을 예외 하나에 대해 계산한다. */
+  function delegateException(mode, code) {
+    const isDelegatedToSupervisor = delegation.medeleg.has(code);
+    const isDelegatedToGuest = isDelegatedToSupervisor && delegation.hedeleg.has(code);
+    const handleUnderSupervisor = mode !== "M" && isDelegatedToSupervisor;
+    const handleUnderGuest = MODES[mode].isVirtual && isDelegatedToGuest;
+    if (handleUnderGuest) return "VS";
+    if (handleUnderSupervisor) return "HS";
+    return "M";
+  }
+  const CSRS_WRITTEN = {
+    M: "mstatus(MPP·MPV·MPIE·MIE), mepc, mcause, mtval, mtval2, mtinst",
+    HS: "mstatus(SPP·SPIE·SIE), hstatus(SPV·SPVP·GVA), sepc, scause, stval, htval, htinst",
+    VS: "vsstatus(SPP·SPIE·SIE), vsepc, vscause, vstval",
+  };
+  const delegationView = MB.canvas("#cv-deleg", { aspect: 0.42, minHeight: 220, maxHeight: 300, draw(ctx, width, height) {
+    const mode = document.getElementById("dg-mode").value;
+    const target = delegateException(mode, +causeSelect.value);
+    drawModeDiagram(ctx, width, height, mode, mode === target ? [] : [{ from: mode, to: target, color: "bad", label: "트랩", width: 2.6 }], target);
+    if (mode === target) MB.text(ctx, "같은 모드에서 처리", MODE_POSITIONS[mode][0] * width, MODE_POSITIONS[mode][1] * height + 30, { align: "center", size: 11.5, weight: 700, color: MB.css("bad") });
+  } });
+  function parseVectorBases() {
+    const parts = document.getElementById("dg-tvec").value.split("/").map((text) => parseInt(text.trim(), 16));
+    return { M: parts[0] || 0, HS: parts[1] || 0, VS: parts[2] || 0 };
+  }
+  function paintDelegation() {
+    const mode = document.getElementById("dg-mode").value;
+    const code = +causeSelect.value;
+    const target = delegateException(mode, code);
+    const bases = parseVectorBases();
+    MB.set("dg-target", `<span class="tag-${target.toLowerCase()}">${target}</span>`);
+    MB.set("dg-csrs", CSRS_WRITTEN[target]);
+    MB.set("dg-pc", "0x" + (bases[target] >>> 0).toString(16).padStart(8, "0"));
+    delegationView.redraw();
+  }
+  ["dg-mode", "dg-cause"].forEach((id) => document.getElementById(id).addEventListener("change", paintDelegation));
+  document.getElementById("dg-tvec").addEventListener("input", paintDelegation);
+  buildDelegationBits(); paintDelegation();
+
+  /* ======================================================= 그림: 예외 우선순위 */
+  const priorityList = document.getElementById("pr-list");
+  const checkedExceptions = new Set([13, 4]);
+  priorityList.innerHTML = EXCEPTION_PRIORITY.map((code, rank) =>
+    `<label data-code="${code}"><span class="rank">${rank + 1}</span><input type="checkbox" data-code="${code}" ${checkedExceptions.has(code) ? "checked" : ""}> ${EXCEPTION_NAME[code]} (${code})</label>`).join("");
+  priorityList.addEventListener("change", (event) => {
+    const code = +event.target.dataset.code;
+    if (event.target.checked) checkedExceptions.add(code); else checkedExceptions.delete(code);
+    paintPriority();
+  });
+  function paintPriority() {
+    const winner = EXCEPTION_PRIORITY.find((code) => checkedExceptions.has(code));
+    priorityList.querySelectorAll("label").forEach((label) => label.classList.toggle("win", +label.dataset.code === winner));
+    document.getElementById("pr-info").innerHTML = winner === undefined ? "체크한 예외가 없다." :
+      `보고되는 예외: <b>${EXCEPTION_NAME[winner]}</b> — <code>xcause</code> = ${winner}. ${checkedExceptions.size > 1 ? `나머지 ${checkedExceptions.size - 1}개는 버려진다.` : ""}`;
+  }
+  paintPriority();
+
+  /* ======================================================= 그림: 인터럽트 판정 행렬 */
+  // InterruptBundle.scala:315, privArchGroup 순서가 기본 우선순위다.
+  const INTERRUPTS = [
+    { code: 11, name: "MEI", note: "M 외부" },  { code: 3, name: "MSI", note: "M 소프트웨어" }, { code: 7, name: "MTI", note: "M 타이머" },
+    { code: 9, name: "SEI", note: "S 외부" },   { code: 1, name: "SSI", note: "S 소프트웨어" }, { code: 5, name: "STI", note: "S 타이머" },
+    { code: 12, name: "SGEI", note: "게스트 외부(하이퍼바이저용)" },
+    { code: 10, name: "VSEI", note: "VS 외부" }, { code: 2, name: "VSSI", note: "VS 소프트웨어" }, { code: 6, name: "VSTI", note: "VS 타이머" },
+    { code: 13, name: "LCOFI", note: "카운터 오버플로" },
+  ];
+  const MACHINE_ONLY = [3, 7, 11];
+  const ALWAYS_DELEGATED_BY_MACHINE = [2, 6, 10, 12];
+  const HIDELEG_READ_ONLY = [1, 3, 5, 7, 9, 11, 12];  // LCOFI(13)는 HidelegBundle에서 다시 RW
+  const VIRTUAL_SUPERVISOR_INTERRUPTS = [2, 6, 10];
+  const interruptState = {};
+  function setInterrupt(code, pending, enable, machineDelegate, hypervisorDelegate) {
+    interruptState[code] = { pending, enable, machineDelegate: ALWAYS_DELEGATED_BY_MACHINE.includes(code) ? true : MACHINE_ONLY.includes(code) ? false : machineDelegate, hypervisorDelegate: HIDELEG_READ_ONLY.includes(code) ? false : hypervisorDelegate };
+  }
+  const INTERRUPT_PRESETS = {
+    timer: () => { INTERRUPTS.forEach((i) => setInterrupt(i.code, false, true, false, false)); setInterrupt(7, true, true, false, false); setInterrupt(5, true, true, true, false); },
+    guest: () => { INTERRUPTS.forEach((i) => setInterrupt(i.code, false, true, false, false)); setInterrupt(10, true, true, true, true); document.getElementById("iq-mode").value = "VS"; },
+    clear: () => { INTERRUPTS.forEach((i) => setInterrupt(i.code, false, false, false, false)); },
+  };
+  INTERRUPT_PRESETS.timer();
+  function buildInterruptTable() {
+    const table = document.getElementById("iq-table");
+    let html = "<tr><th>번호</th><th>이름</th><th class='c'>P</th><th class='c'>E</th><th class='c'>D (mideleg)</th><th class='c'>HD (hideleg)</th><th>층</th></tr>";
+    INTERRUPTS.forEach((interrupt) => {
+      const state = interruptState[interrupt.code];
+      const machineDelegateLocked = MACHINE_ONLY.includes(interrupt.code) || ALWAYS_DELEGATED_BY_MACHINE.includes(interrupt.code);
+      const hypervisorDelegateLocked = HIDELEG_READ_ONLY.includes(interrupt.code);
+      html += `<tr data-code="${interrupt.code}"><td class="mono">${interrupt.code}</td><td><b>${interrupt.name}</b> <span class="dim small">${interrupt.note}</span></td>` +
+        `<td class="c"><input type="checkbox" data-field="pending" ${state.pending ? "checked" : ""}></td>` +
+        `<td class="c"><input type="checkbox" data-field="enable" ${state.enable ? "checked" : ""}></td>` +
+        `<td class="c"><input type="checkbox" data-field="machineDelegate" ${state.machineDelegate ? "checked" : ""} ${machineDelegateLocked ? "disabled" : ""}></td>` +
+        `<td class="c"><input type="checkbox" data-field="hypervisorDelegate" ${state.hypervisorDelegate ? "checked" : ""} ${hypervisorDelegateLocked ? "disabled" : ""}></td>` +
+        `<td class="mono" data-level></td></tr>`;
+    });
+    table.innerHTML = html;
+  }
+  document.getElementById("iq-table").addEventListener("change", (event) => {
+    const row = event.target.closest("tr");
+    interruptState[+row.dataset.code][event.target.dataset.field] = event.target.checked;
+    paintInterrupts();
+  });
+  function levelOf(code) {
+    const state = interruptState[code];
+    if (!state.machineDelegate) return "M";
+    if (!state.hypervisorDelegate) return "HS";
+    return "VS";
+  }
+  /** InterruptFilter.scala:463-494 */
+  function decideInterrupt() {
+    const mode = document.getElementById("iq-mode").value;
+    const machineEnable = document.getElementById("iq-mie").checked;
+    const supervisorEnable = document.getElementById("iq-sie").checked;
+    const guestEnable = document.getElementById("iq-vsie").checked;
+    const candidates = { M: null, HS: null, VS: null };
+    INTERRUPTS.forEach((interrupt) => {
+      const state = interruptState[interrupt.code];
+      if (!state.pending || !state.enable) return;
+      const level = levelOf(interrupt.code);
+      if (level === "VS" && !VIRTUAL_SUPERVISOR_INTERRUPTS.includes(interrupt.code) && interrupt.code !== 13) return; // VS층에 갈 수 있는 것은 VS 인터럽트와 LCOFI
+      if (candidates[level] === null) candidates[level] = interrupt;
+    });
+    const isEligible = {
+      M: (mode === "M" && machineEnable) || isLower(mode, "M"),
+      HS: (mode === "HS" && supervisorEnable) || isLower(mode, "HS"),
+      VS: (mode === "VS" && guestEnable) || isLower(mode, "VS"),
+    };
+    let level = null;
+    if (candidates.M && isEligible.M) level = "M";
+    else if (candidates.HS && isEligible.HS) level = "HS";
+    else if (candidates.VS && isEligible.VS) level = "VS";
+    return { mode, candidates, isEligible, level, winner: level ? candidates[level] : null };
+  }
+  const interruptView = MB.canvas("#cv-irq", { aspect: 0.3, minHeight: 170, maxHeight: 230, draw(ctx, width, height) {
+    const decision = decideInterrupt();
+    const levels = ["M", "HS", "VS"];
+    const columnWidth = (width - 40) / 3;
+    levels.forEach((level, index) => {
+      const x = 20 + index * columnWidth, boxWidth = columnWidth - 16;
+      const candidate = decision.candidates[level], isEligible = decision.isEligible[level];
+      const isWinner = decision.level === level;
+      const color = MB.css(MODE_COLOR[level]);
+      ctx.fillStyle = isWinner ? MB.alpha(color, 0.2) : MB.css("surface");
+      MB.roundRect(ctx, x, 16, boxWidth, height - 32, 10); ctx.fill();
+      ctx.strokeStyle = isWinner ? color : MB.css("border"); ctx.lineWidth = isWinner ? 2.4 : 1; ctx.stroke();
+      MB.text(ctx, `${level}층`, x + 12, 34, { size: 13, weight: 800, color });
+      MB.text(ctx, isEligible ? "받을 자격 있음" : "지금 모드에서 못 받음", x + boxWidth - 10, 34, { align: "right", size: 11, color: isEligible ? MB.css("ok") : MB.css("text-faint") });
+      MB.text(ctx, candidate ? candidate.name : "후보 없음", x + boxWidth / 2, height / 2 + 8, { align: "center", size: candidate ? 22 : 13, weight: 800, mono: !!candidate, color: candidate ? MB.css("text") : MB.css("text-faint") });
+      if (candidate && !isWinner) MB.text(ctx, decision.level ? "대기 (위층이 이김)" : "대기", x + boxWidth / 2, height - 30, { align: "center", size: 11, color: MB.css("text-dim") });
+      if (isWinner) MB.text(ctx, "▶ 이것을 받는다", x + boxWidth / 2, height - 30, { align: "center", size: 12, weight: 700, color });
+      if (index < 2) MB.text(ctx, ">", x + columnWidth - 8, height / 2, { align: "center", size: 16, weight: 800, color: MB.css("text-faint") });
+    });
+  } });
+  function paintInterrupts() {
+    const decision = decideInterrupt();
+    document.querySelectorAll("#iq-table tr[data-code]").forEach((row) => {
+      const code = +row.dataset.code;
+      row.querySelector("[data-level]").textContent = levelOf(code);
+      row.classList.toggle("win", decision.winner && decision.winner.code === code);
+    });
+    if (!decision.winner) {
+      MB.set("iq-level", "없음"); MB.set("iq-win", "—"); MB.set("iq-cause", "—"); MB.set("iq-pc", "—");
+    } else {
+      const code = decision.winner.code;
+      const adjusted = decision.level === "VS" && VIRTUAL_SUPERVISOR_INTERRUPTS.includes(code) ? code - 1 : code;
+      const isVectored = document.getElementById("iq-tvec").value === "vectored";
+      const base = 0x80000000;
+      MB.set("iq-level", `<span class="tag-${decision.level.toLowerCase()}">${decision.level}</span>`);
+      MB.set("iq-win", decision.winner.name);
+      MB.set("iq-cause", `인터럽트 ${adjusted}${adjusted !== code ? ` <small>(${code} → ${adjusted})</small>` : ""}`);
+      MB.set("iq-pc", "0x" + ((base + (isVectored ? 4 * adjusted : 0)) >>> 0).toString(16));
+    }
+    interruptView.redraw();
+  }
+  ["iq-mode", "iq-mie", "iq-sie", "iq-vsie", "iq-tvec"].forEach((id) => document.getElementById(id).addEventListener("change", paintInterrupts));
+  MB.seg("#iq-preset", (value) => { INTERRUPT_PRESETS[value](); buildInterruptTable(); paintInterrupts(); });
+  buildInterruptTable(); paintInterrupts();
+
+  /* ======================================================= 그림: IMSIC */
+  const IMSIC_IDENTITY_COUNT = 256;            // imsicIntSrcWidth = 8
+  const IMSIC_FILE_SHIFT = 12;                 // intFileMemWidth = 12, 파일 하나 4KB
+  const IMSIC_MACHINE_BASE = 0x3a800000;
+  const IMSIC_SUPERVISOR_GUEST_BASE = 0x3b000000;
+  const IMSIC_FILE_COUNT = 9;                  // M, S, 게스트 7개 (geilen = 7)
+  const imsicFiles = Array.from({ length: IMSIC_FILE_COUNT }, () => ({ pending: new Uint8Array(IMSIC_IDENTITY_COUNT), enable: new Uint8Array(IMSIC_IDENTITY_COUNT).fill(1), threshold: 0, isDelivering: true }));
+  let imsicFileIndex = 0;
+  const imsicRandom = MB.rng(2026);
+  function imsicTop(file) {
+    let top = 0;
+    for (let identity = 1; identity < IMSIC_IDENTITY_COUNT; identity++) {
+      if (file.pending[identity] && file.enable[identity]) { top = identity; break; }
+    }
+    // xtopei_filter: threshold − 1 을 부호 없는 값으로 비교한다(0이면 모두 통과).
+    const limit = file.threshold === 0 ? Infinity : file.threshold - 1;
+    return top <= limit ? top : 0;
+  }
+  function imsicAddress(fileIndex) {
+    if (fileIndex === 0) return IMSIC_MACHINE_BASE;
+    // 하트 0의 S 파일은 sgAddr, 게스트 g는 sgAddr + (1+g) << 12
+    return IMSIC_SUPERVISOR_GUEST_BASE + ((fileIndex - 1) << IMSIC_FILE_SHIFT);
+  }
+  const imsicView = MB.canvas("#cv-imsic", { aspect: 0.5, minHeight: 250, maxHeight: 380, draw(ctx, width, height) {
+    const file = imsicFiles[imsicFileIndex];
+    const top = imsicTop(file);
+    const size = Math.min((width - 40) / 16, (height - 30) / 16);
+    const left = (width - size * 16) / 2, topOffset = 10;
+    for (let identity = 0; identity < IMSIC_IDENTITY_COUNT; identity++) {
+      const x = left + (identity % 16) * size, y = topOffset + Math.floor(identity / 16) * size;
+      const isAboveThreshold = file.threshold !== 0 && identity >= file.threshold;
+      let fill = MB.css("surface");
+      if (identity === 0) fill = MB.css("bg");
+      else if (file.pending[identity]) fill = file.enable[identity] ? MB.css("taken") : MB.alpha(MB.css("taken"), 0.35);
+      ctx.fillStyle = fill;
+      ctx.globalAlpha = isAboveThreshold ? 0.35 : 1;
+      ctx.fillRect(x + 1, y + 1, size - 2, size - 2);
+      ctx.globalAlpha = 1;
+      if (!file.enable[identity] && identity !== 0) {
+        ctx.strokeStyle = MB.css("text-faint"); ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(x + 3, y + 3); ctx.lineTo(x + size - 3, y + size - 3); ctx.stroke();
+      }
+      if (identity === top && top !== 0) { ctx.strokeStyle = MB.css("text"); ctx.lineWidth = 2.4; ctx.strokeRect(x + 1, y + 1, size - 2, size - 2); }
+      if (size > 18 && (identity % 16 === 0)) MB.text(ctx, String(identity), x - 4, y + size / 2, { align: "right", size: 9, mono: true, color: MB.css("text-faint") });
+    }
+    if (file.threshold !== 0) {
+      const identity = Math.min(file.threshold, 255);
+      const x = left + (identity % 16) * size, y = topOffset + Math.floor(identity / 16) * size;
+      MB.text(ctx, "← 문턱", x + size + 2, y + size / 2, { size: 10.5, weight: 700, color: MB.css("warn") });
+    }
+  } });
+  imsicView.onPointer("click", (x, y) => {
+    const size = Math.min((imsicView.width - 40) / 16, (imsicView.height - 30) / 16);
+    const left = (imsicView.width - size * 16) / 2;
+    const column = Math.floor((x - left) / size), row = Math.floor((y - 10) / size);
+    if (column < 0 || column > 15 || row < 0 || row > 15) return;
+    const identity = row * 16 + column;
+    if (identity === 0) return;
+    const file = imsicFiles[imsicFileIndex];
+    file.enable[identity] = file.enable[identity] ? 0 : 1;
+    paintImsic();
+  });
+  function paintImsic() {
+    const file = imsicFiles[imsicFileIndex];
+    const top = imsicTop(file);
+    let count = 0;
+    for (let identity = 1; identity < IMSIC_IDENTITY_COUNT; identity++) if (file.pending[identity] && file.enable[identity]) count++;
+    MB.set("im-addr", "0x" + imsicAddress(imsicFileIndex).toString(16).toUpperCase());
+    MB.set("im-count", String(count));
+    MB.set("im-top", top === 0 ? "0 <small>없음</small>" : String(top));
+    const isPending = file.isDelivering && top !== 0;
+    MB.set("im-pend", isPending ? "예" : "아니오", isPending ? "good" : "");
+    document.getElementById("im-deliv").checked = file.isDelivering;
+    imsicView.redraw();
+  }
+  const imsicIdentity = MB.range("im-id", () => {}, (v) => String(v));
+  MB.range("im-th", (value) => { imsicFiles[imsicFileIndex].threshold = value; paintImsic(); }, (v) => (v === 0 ? "0 (없음)" : String(v)));
+  document.getElementById("im-send").onclick = () => { imsicFiles[imsicFileIndex].pending[imsicIdentity.value] = 1; paintImsic(); };
+  document.getElementById("im-rand").onclick = () => {
+    for (let k = 0; k < 5; k++) imsicFiles[imsicFileIndex].pending[1 + Math.floor(imsicRandom() * 255)] = 1;
+    paintImsic();
+  };
+  document.getElementById("im-claim").onclick = () => {
+    const file = imsicFiles[imsicFileIndex];
+    const top = imsicTop(file);
+    if (top !== 0) file.pending[top] = 0;
+    paintImsic();
+  };
+  document.getElementById("im-deliv").onchange = (event) => { imsicFiles[imsicFileIndex].isDelivering = event.target.checked; paintImsic(); };
+  MB.seg("#im-file", (value) => {
+    imsicFileIndex = +value;
+    const thresholdInput = document.getElementById("im-th");
+    thresholdInput.value = imsicFiles[imsicFileIndex].threshold;
+    document.getElementById("im-th-out").textContent = imsicFiles[imsicFileIndex].threshold === 0 ? "0 (없음)" : String(imsicFiles[imsicFileIndex].threshold);
+    paintImsic();
+  });
+  [37, 200, 64].forEach((identity) => (imsicFiles[0].pending[identity] = 1));
+  paintImsic();
+
+  /* ======================================================= 그림: PMP */
+  const PAGE_COUNT = 1024;          // 4MB / 4KB
+  const PAGE_BYTES = 4096;          // PlatformGrain = 4KB
+  const PMP_BASE = 0x80000000;
+  // 항목마다 pmpaddr에 해당하는 address(페이지 번호)를 둔다. TOR는 [앞 항목 address, 자기 address)를 덮는다.
+  const pmpEntries = [
+    { addressMode: "TOR",   address: 256, size: 16,  read: true, write: true,  execute: false, isLocked: false },
+    { addressMode: "NAPOT", address: 128, size: 64,  read: true, write: false, execute: true,  isLocked: false },
+    { addressMode: "NAPOT", address: 768, size: 128, read: true, write: false, execute: false, isLocked: true },
+    { addressMode: "OFF",   address: 0,   size: 16,  read: false, write: false, execute: false, isLocked: false },
+  ];
+  let pmpMode = "S", pmpKind = "r";
+  function pmpRange(index) {
+    const entry = pmpEntries[index];
+    if (entry.addressMode === "NAPOT") {
+      const start = Math.floor(entry.address / entry.size) * entry.size; // NAPOT 영역은 크기에 정렬된다
+      return [start, start + entry.size];
+    }
+    if (entry.addressMode === "TOR") {
+      const lowerBound = index === 0 ? 0 : pmpEntries[index - 1].address;
+      return [lowerBound, entry.address];
+    }
+    return null;
+  }
+  function buildPmpRows() {
+    const box = document.getElementById("pm-rows");
+    box.innerHTML = pmpEntries.map((entry, index) => {
+      const sizeSelect = entry.addressMode === "NAPOT" ? `<select data-field="size" data-i="${index}" style="width:50%">${[1, 2, 4, 8, 16, 32, 64, 128, 256, 512].map((size) => `<option value="${size}" ${size === entry.size ? "selected" : ""}>${size * 4}KB</option>`).join("")}</select>` : "";
+      const addressField = `<span class="mono small" style="display:flex;gap:4px"><input type="text" data-field="address" data-i="${index}" value="${entry.address}" title="페이지 번호(0~1024)" style="width:${sizeSelect ? "50%" : "100%"}">${sizeSelect}</span>`;
+      return `<div class="pmp-row" id="pm-row-${index}"><span class="mono">${index}</span>` +
+        `<select data-field="addressMode" data-i="${index}">${["OFF", "TOR", "NAPOT"].map((mode) => `<option ${mode === entry.addressMode ? "selected" : ""}>${mode}</option>`).join("")}</select>` +
+        addressField +
+        ["read", "write", "execute", "isLocked"].map((field) => `<label><input type="checkbox" data-field="${field}" data-i="${index}" ${entry[field] ? "checked" : ""}></label>`).join("") + "</div>";
+    }).join("");
+  }
+  document.getElementById("pm-rows").addEventListener("change", (event) => {
+    const target = event.target, index = +target.dataset.i, field = target.dataset.field;
+    if (target.type === "checkbox") pmpEntries[index][field] = target.checked;
+    else if (field === "addressMode") { pmpEntries[index].addressMode = target.value; buildPmpRows(); }
+    else pmpEntries[index][field] = MB.clamp(parseInt(target.value, 10) || 0, 0, PAGE_COUNT);
+    paintPmp();
+  });
+  /** PMP.scala:425-457: 가장 작은 번호의 맞는 항목, 없으면 기본값 */
+  function checkPmp(page) {
+    const isMachine = pmpMode === "M";
+    for (let index = 0; index < pmpEntries.length; index++) {
+      const range = pmpRange(index);
+      if (!range) continue;
+      if (page >= range[0] && page < range[1]) {
+        const entry = pmpEntries[index];
+        const ignore = isMachine && !entry.isLocked;
+        return { index, read: entry.read || ignore, write: entry.write || ignore, execute: entry.execute || ignore };
+      }
+    }
+    return { index: -1, read: isMachine, write: isMachine, execute: isMachine };
+  }
+  const PMP_COLORS = ["accent", "accent-2", "warn", "ok"];
+  const pmpView = MB.canvas("#cv-pmp", { aspect: 0.22, minHeight: 150, maxHeight: 190, draw(ctx, width, height) {
+    const left = 14, right = width - 14, scale = (page) => left + (page / PAGE_COUNT) * (right - left);
+    pmpEntries.forEach((entry, index) => {
+      const range = pmpRange(index);
+      if (!range || range[1] <= range[0]) return;
+      const y = 14 + index * 18;
+      ctx.fillStyle = MB.alpha(MB.css(PMP_COLORS[index]), 0.45);
+      ctx.fillRect(scale(range[0]), y, Math.max(2, scale(range[1]) - scale(range[0])), 14);
+      MB.text(ctx, `#${index}`, scale(range[0]) + 3, y + 7, { size: 10, weight: 700, color: MB.css("text") });
+    });
+    const barY = 14 + 4 * 18 + 6;
+    for (let page = 0; page < PAGE_COUNT; page += 4) {
+      const result = checkPmp(page);
+      const isAllowed = result[{ r: "read", w: "write", x: "execute" }[pmpKind]];
+      ctx.fillStyle = isAllowed ? MB.alpha(MB.css("ok"), 0.55) : MB.alpha(MB.css("bad"), 0.45);
+      ctx.fillRect(scale(page), barY, scale(page + 4) - scale(page) + 0.5, 14);
+    }
+    MB.text(ctx, "이 접근의 허용(초록)/거부(빨강)", left, barY + 26, { size: 10.5, color: MB.css("text-dim") });
+    const address = +document.getElementById("pm-addr").value;
+    const x = scale(address + 0.5);
+    ctx.strokeStyle = MB.css("text"); ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x, 8); ctx.lineTo(x, barY + 16); ctx.stroke();
+    MB.text(ctx, "0x8000_0000", left, height - 8, { size: 10, mono: true, color: MB.css("text-faint") });
+    MB.text(ctx, "0x8040_0000", right, height - 8, { size: 10, mono: true, color: MB.css("text-faint"), align: "right" });
+  } });
+  function paintPmp() {
+    const page = +document.getElementById("pm-addr").value;
+    const result = checkPmp(page);
+    const kindField = { r: "read", w: "write", x: "execute" }[pmpKind];
+    MB.set("pm-hit", result.index < 0 ? "없음 <small>기본값</small>" : `#${result.index}`);
+    MB.set("pm-perm", `${result.read ? "R" : "-"}${result.write ? "W" : "-"}${result.execute ? "X" : "-"}`);
+    MB.set("pm-ok", result[kindField] ? "허용" : "거부 → 접근 오류", result[kindField] ? "good" : "bad");
+    pmpEntries.forEach((entry, index) => { const row = document.getElementById("pm-row-" + index); if (row) row.classList.toggle("hit", index === result.index); });
+    pmpView.redraw();
+  }
+  MB.range("pm-addr", paintPmp, (v) => "0x" + (PMP_BASE + v * PAGE_BYTES).toString(16));
+  MB.seg("#pm-mode", (value) => { pmpMode = value; paintPmp(); });
+  MB.seg("#pm-kind", (value) => { pmpKind = value; paintPmp(); });
+  buildPmpRows(); paintPmp();
+
+  /* ======================================================= 그림: CSR 주소 */
+  const CSR_NAMES = [
+    [0xc00, "cycle"], [0xc01, "time"], [0xc02, "instret"], [0xc03, "hpmcounter3"], [0x100, "sstatus"], [0x104, "sie"], [0x105, "stvec"],
+    [0x141, "sepc"], [0x142, "scause"], [0x144, "sip"], [0x14d, "stimecmp"], [0x15c, "stopei"], [0x180, "satp"],
+    [0x200, "vsstatus"], [0x205, "vstvec"], [0x24d, "vstimecmp"], [0x25c, "vstopei"], [0x280, "vsatp"],
+    [0x600, "hstatus"], [0x602, "hedeleg"], [0x603, "hideleg"], [0x680, "hgatp"],
+    [0x300, "mstatus"], [0x302, "medeleg"], [0x303, "mideleg"], [0x304, "mie"], [0x305, "mtvec"], [0x323, "mhpmevent3"],
+    [0x341, "mepc"], [0x342, "mcause"], [0x344, "mip"], [0x35c, "mtopei"], [0x3a0, "pmpcfg0"], [0x3b0, "pmpaddr0"],
+    [0x7a0, "tselect"], [0x7b0, "dcsr"], [0xb00, "mcycle"], [0xb02, "minstret"], [0xb03, "mhpmcounter3"], [0xfb0, "mtopi"],
+  ];
+  const csrPick = document.getElementById("cs-pick");
+  csrPick.innerHTML = CSR_NAMES.map(([address, name]) => `<option value="${address}">${name} (0x${address.toString(16).toUpperCase().padStart(3, "0")})</option>`).join("");
+  let csrAddress = 0x200, csrOperation = "r";
+  const ACCESS_TABLE = new Set(["0,0,0", "1,0,0", "0,1,0", "0,1,1", "0,1,2", "1,1,0", "1,1,1", "0,3,0", "0,3,1", "0,3,2", "0,3,3"]);
+  function judgeCsr(address, mode, operation) {
+    const isReadOnly = ((address >> 10) & 3) === 3;
+    const requiredPrivilege = (address >> 8) & 3;
+    const modeInfo = MODES[mode];
+    const isDebugRegister = ((address >> 4) & 0xff) === 0x7b;
+    const isMachineCsr = requiredPrivilege === 3;
+    const isPrivilegeLegal = isDebugRegister ? false : ACCESS_TABLE.has(`${modeInfo.isVirtual ? 1 : 0},${modeInfo.privilegeLevel},${requiredPrivilege}`);
+    if (!isPrivilegeLegal) {
+      if (isDebugRegister) return { verdict: "불법 명령 (디버그 모드 전용)", isOk: false };
+      return modeInfo.isVirtual && !isMachineCsr ? { verdict: "가상 명령 예외 (22)", isOk: false } : { verdict: "불법 명령 예외 (2)", isOk: false };
+    }
+    if (isReadOnly && operation === "w") return { verdict: "불법 명령 (읽기 전용에 쓰기)", isOk: false };
+    return { verdict: "합법", isOk: true };
+  }
+  const csrView = MB.canvas("#cv-csr", { aspect: 0.2, minHeight: 120, maxHeight: 150, draw(ctx, width, height) {
+    const cellWidth = Math.min(54, (width - 30) / 12), left = (width - cellWidth * 12) / 2, top = 30, cellHeight = 44;
+    const fields = [[11, 10, "warn", "읽기/쓰기"], [9, 8, "accent", "최소 특권"], [7, 0, "accent-2", "번호"]];
+    fields.forEach(([high, low, color, label]) => {
+      const x0 = left + (11 - high) * cellWidth, x1 = left + (12 - low) * cellWidth;
+      ctx.fillStyle = MB.alpha(MB.css(color), 0.18); ctx.fillRect(x0, top - 22, x1 - x0, 18);
+      MB.text(ctx, label, (x0 + x1) / 2, top - 13, { align: "center", size: 11, weight: 700, color: MB.css(color) });
+    });
+    for (let bit = 11; bit >= 0; bit--) {
+      const x = left + (11 - bit) * cellWidth;
+      const value = (csrAddress >> bit) & 1;
+      ctx.fillStyle = value ? MB.alpha(MB.css("taken"), 0.25) : MB.css("surface");
+      MB.roundRect(ctx, x + 2, top, cellWidth - 4, cellHeight, 6); ctx.fill();
+      ctx.strokeStyle = MB.css("border"); ctx.lineWidth = 1; ctx.stroke();
+      MB.text(ctx, String(value), x + cellWidth / 2, top + cellHeight / 2, { align: "center", size: 17, weight: 800, mono: true });
+      MB.text(ctx, String(bit), x + cellWidth / 2, top + cellHeight + 12, { align: "center", size: 10, mono: true, color: MB.css("text-faint") });
+    }
+  } });
+  csrView.onPointer("click", (x, y) => {
+    const cellWidth = Math.min(54, (csrView.width - 30) / 12), left = (csrView.width - cellWidth * 12) / 2;
+    const column = Math.floor((x - left) / cellWidth);
+    if (column < 0 || column > 11 || y < 30 || y > 74) return;
+    csrAddress ^= 1 << (11 - column);
+    document.getElementById("cs-hex").value = "0x" + csrAddress.toString(16).toUpperCase().padStart(3, "0");
+    paintCsr();
+  });
+  function paintCsr() {
+    const mode = document.getElementById("cs-mode").value;
+    const result = judgeCsr(csrAddress, mode, csrOperation);
+    const known = CSR_NAMES.find(([address]) => address === csrAddress);
+    MB.set("cs-rw", ((csrAddress >> 10) & 3) === 3 ? "11 → 읽기 전용" : `${((csrAddress >> 10) & 3).toString(2).padStart(2, "0")} → 읽기·쓰기`);
+    MB.set("cs-priv", `${((csrAddress >> 8) & 3).toString(2).padStart(2, "0")} → ${["U", "S", "H", "M"][(csrAddress >> 8) & 3]}`);
+    MB.set("cs-res", `${result.verdict}${known ? ` <small>${known[1]}</small>` : ""}`, result.isOk ? "good" : "bad");
+    if (known) csrPick.value = String(csrAddress);
+    csrView.redraw();
+  }
+  csrPick.addEventListener("change", () => { csrAddress = +csrPick.value; document.getElementById("cs-hex").value = "0x" + csrAddress.toString(16).toUpperCase().padStart(3, "0"); paintCsr(); });
+  document.getElementById("cs-hex").addEventListener("input", (event) => { const value = parseInt(event.target.value, 16); if (!isNaN(value)) { csrAddress = value & 0xfff; paintCsr(); } });
+  document.getElementById("cs-mode").addEventListener("change", paintCsr);
+  MB.seg("#cs-op", (value) => { csrOperation = value; paintCsr(); });
+  csrPick.value = "512";
+  paintCsr();
+
+  /* ======================================================= 그림: ISA 확장 목록 (Parameters.scala:304) */
+  const ISA_EXTENSIONS = ["i", "m", "a", "f", "d", "c", "b", "v", "h",
+    "sdext", "sdtrig", "sha", "shcounterenw", "shgatpa", "shlcofideleg", "shtvala", "shvsatpa", "shvstvala",
+    "shvstvecd", "smaia", "smcdeleg", "smcntrpmf", "smcsrind", "smdbltrp", "smmpm", "smnpm", "smrnmi", "smstateen",
+    "ss1p13", "ssaia", "ssccfg", "ssccptr", "sscofpmf", "sscounterenw", "sscsrind", "ssdbltrp", "ssnpm",
+    "sspm", "ssstateen", "ssstrict", "sstc", "sstvala", "sstvecd", "ssu64xl", "supm", "sv39",
+    "sv48", "svade", "svbare", "svinval", "svnapot", "svpbmt", "za64rs", "zabha", "zacas", "zama16b", "zawrs", "zba",
+    "zbb", "zbc", "zbkb", "zbkc", "zbkx", "zbs", "zcb", "zcmop", "zfa", "zfh", "zfhmin", "zic64b",
+    "zicbom", "zicbop", "zicboz", "ziccamoa", "ziccamoc", "ziccif", "zicclsm", "ziccrse", "zicntr", "zicond",
+    "zicsr", "zifencei", "zihintntl", "zihintpause", "zihpm", "zimop", "zkn", "zknd", "zkne", "zknh",
+    "zksed", "zksh", "zkt", "zvbb", "zvfh", "zvfhmin", "zvkt", "zvl128b", "zvl32b", "zvl64b"];
+  const ISA_NOTES = { h: "하이퍼바이저 확장. 이 장의 VS·VU 모드", smaia: "M 모드 AIA CSR(mtopei 등)", ssaia: "S 모드 AIA CSR", sstc: "S 모드 타이머 비교(stimecmp)", sdext: "디버그 모드", sdtrig: "디버그 트리거(4개)", sscofpmf: "카운터 오버플로 인터럽트(14장)", sv39: "39비트 가상 주소(11장)", sv48: "48비트 가상 주소(11장)", zicond: "조건부 0 만들기 명령", v: "벡터 확장", b: "비트 조작(Zba·Zbb·Zbs)", smdbltrp: "M 모드 이중 트랩", smrnmi: "재개 가능한 NMI", smstateen: "상태 허용 레지스터", zicntr: "기본 카운터 cycle·time·instret", zihpm: "하드웨어 성능 카운터(14장)" };
+  let isaCategory = "all";
+  function categoryOf(name) {
+    if (name.length === 1) return "single";
+    if (name.startsWith("z")) return "z";
+    return "priv";
+  }
+  function paintIsa() {
+    const query = document.getElementById("isa-q").value.trim().toLowerCase();
+    let shown = 0;
+    document.getElementById("isa-chips").innerHTML = ISA_EXTENSIONS.map((name) => {
+      const isInCategory = isaCategory === "all" || categoryOf(name) === isaCategory;
+      const isHit = query && name.includes(query);
+      if (isInCategory && (!query || isHit)) shown++;
+      return `<span class="${isHit ? "hit" : ""} ${!isInCategory || (query && !isHit) ? "dim" : ""}" data-name="${name}">${name}</span>`;
+    }).join("");
+    const exact = ISA_EXTENSIONS.find((name) => name === query);
+    document.getElementById("isa-info").innerHTML = `전체 ${ISA_EXTENSIONS.length}개 중 ${shown}개 표시. ` + (exact ? `<b>${exact}</b>: ${ISA_NOTES[exact] || "목록에 있음"}` : query ? "칩을 눌러 설명을 볼 수 있다." : "칩을 누르면 설명이 나온다.");
+  }
+  document.getElementById("isa-chips").addEventListener("click", (event) => {
+    const chip = event.target.closest("span[data-name]");
+    if (!chip) return;
+    const name = chip.dataset.name;
+    document.getElementById("isa-info").innerHTML = `<b>${name}</b>: ${ISA_NOTES[name] || "이 책에서 따로 다루지 않는 확장. 이름은 RISC-V 명세의 확장 이름 그대로다."}`;
+  });
+  document.getElementById("isa-q").addEventListener("input", paintIsa);
+  MB.seg("#isa-cat", (value) => { isaCategory = value; paintIsa(); });
+  paintIsa();
+})();
+</script>
+</body>
+</html>

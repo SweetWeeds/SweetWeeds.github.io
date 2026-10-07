@@ -1,0 +1,706 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>명령어의 여정 · XiangShanBook</title>
+<meta name="description" content="XiangShan 비순차 파이프라인을 인출에서 커밋까지 따라간다. 디코드·리네임·디스패치·이슈·실행·커밋, 레지스터 리네이밍, ROB, 실행 유닛 경합, top-down 슬롯 분석.">
+<link rel="icon" type="image/svg+xml" href="../favicon.svg">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/common.js"></script>
+<style>
+  .rename-grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); padding: 14px 18px; }
+  .rename-grid h5 { margin: 0 0 6px; font-size: 13px; color: var(--text-dim); }
+  .rename-table { width: 100%; font-family: var(--mono); font-size: 13px; border-collapse: collapse; }
+  .rename-table td, .rename-table th { padding: 3px 8px; border-bottom: 1px solid var(--border); }
+  .rename-table tr.changed td { background: var(--accent-soft); }
+  .rename-table tr.head td { background: var(--accent-2-soft); }
+  .chips { display: flex; flex-wrap: wrap; gap: 4px; }
+  .chips span { font-family: var(--mono); font-size: 12.5px; padding: 2px 7px; border-radius: 6px; background: var(--surface); border: 1px solid var(--border); }
+  .chips span.fresh { border-color: var(--ok); color: var(--ok); font-weight: 700; }
+  .program-list { font-family: var(--mono); font-size: 13px; margin: 0; padding: 0; list-style: none; }
+  .program-list li { padding: 2px 8px; border-radius: 5px; }
+  .program-list li.current { background: var(--accent-soft); font-weight: 700; }
+  .program-list li.done { color: var(--text-faint); }
+</style>
+</head>
+<body data-chapter="pipeline">
+<main class="chapter">
+  <header class="chapter-hero">
+    <div class="eyebrow">Chapter 02</div>
+    <h1>명령어의 여정</h1>
+    <p class="lead">프로그램은 순서대로 쓰여 있지만, XiangShan은 그 순서를 지키지 않고 실행한다. 준비된 명령부터 먼저 실행하고, 끝난 결과를 원래 순서대로 다시 줄 세워 확정한다. 명령 하나가 인출되어 커밋될 때까지 거치는 단계를 따라가며, 폭·큐 크기·실행 유닛 수가 성능을 어떻게 정하는지 직접 돌려 본다.</p>
+    <ul class="objectives">
+      <li>인출 → 디코드 → 리네임 → 디스패치 → 이슈 → 실행 → 쓰기 → 커밋의 역할과 XiangShan의 폭·크기를 설명한다.</li>
+      <li>사이클 단위 시뮬레이터로 폭, ROB 크기, 캐시 미스, 분기 오예측이 IPC에 주는 영향을 잰다.</li>
+      <li>레지스터 리네이밍이 RAT과 프리 리스트로 거짓 의존을 없애는 과정을 한 명령씩 따라간다.</li>
+      <li>리틀의 법칙으로 '필요한 ROB 크기'를 계산한다.</li>
+      <li>top-down 슬롯 분석이 성능 손실을 어떻게 나누어 세는지 이해하고, 슬롯 모델로 원인별 손실을 직접 만들어 본다.</li>
+    </ul>
+  </header>
+
+  <!-- ============================================================ 1 -->
+  <section id="stages">
+    <h2>여덟 단계, 여덟 폭</h2>
+    <p>명령은 다음 단계들을 지난다. 앞의 셋은 1장의 프런트엔드에 속하고, 나머지는 백엔드다.</p>
+    <div class="table-wrap"><table>
+      <tr><th>단계</th><th>하는 일</th><th>XiangShan (DefaultConfig)</th></tr>
+      <tr><td>BPU · FTQ</td><td>다음에 가져올 64바이트 블록을 예측해 큐에 넣는다</td><td>FTQ 64칸</td></tr>
+      <tr><td>IFU · IBuffer</td><td>명령 바이트를 가져와 프리디코드하고 버퍼에 쌓는다</td><td>IBuffer 48칸, 읽기 뱅크 8</td></tr>
+      <tr><td>Decode</td><td>명령을 마이크로 연산(uop)으로 해독, 퓨전</td><td>폭 8, 명령당 uop 최대 8</td></tr>
+      <tr><td>Rename</td><td>아키텍처 레지스터를 물리 레지스터로 바꾼다</td><td>폭 8, 물리 레지스터 정수 224·부동소수 256·벡터 128, 스냅샷 4</td></tr>
+      <tr><td>Dispatch</td><td>ROB·적재/저장 큐에 자리를 잡고 이슈 큐로 보낸다</td><td>폭 8, ROB 352, LQ 120, SQ 물리 64(가상 128)</td></tr>
+      <tr><td>Issue</td><td>피연산자가 준비된 uop을 실행 유닛에 보낸다</td><td>이슈 큐 16·18·20칸, 큐마다 사이클당 2개 입장</td></tr>
+      <tr><td>Execute · Writeback</td><td>계산하고 결과를 물리 레지스터와 바이패스 망에 쓴다</td><td>ALU 6, BJU 3, LDU 3, STA 2, STD 2, FEX 4, VFEX 4, VSTD 2</td></tr>
+      <tr><td>Commit</td><td>ROB 머리부터 끝난 명령을 순서대로 확정한다</td><td>커밋 폭 8</td></tr>
+    </table></div>
+    <p>여기서 '폭'은 한 사이클에 그 단계를 통과할 수 있는 명령 수다. 디코드·리네임·커밋이 모두 8이므로, 이상적이라면 사이클당 8개 명령이 끝난다(IPC 8). 실제로는 분기, 캐시 미스, 의존성 때문에 훨씬 낮다. 성능 공학은 그 차이가 어디서 생기는지 찾아내는 일이다.</p>
+    <div class="callout code"><strong>폭은 한곳에서 정한다</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/Parameters.scala:81-88</span>
+  DecodeWidth: Int = 8,
+  RenameWidth: Int = 8,
+  CommitWidth: Int = 8,
+  RobCommitWidth: Int = 8,
+  RabCommitWidth: Int = 8,
+  MaxUopSize: Int = 8,
+  EnableRenameSnapshot: Boolean = true,
+  RenameSnapshotNum: Int = 4,</code></pre>
+      <p>폭과 큐 크기는 모두 <code>XSCoreParameters</code>의 필드다. Config는 이 값을 바꿔 끼울 뿐이고, 각 모듈은 <code>p(XSCoreParamsKey)</code>로 같은 값을 읽는다.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ 2 -->
+  <section id="sim">
+    <h2>사이클 단위 파이프라인 시뮬레이터</h2>
+    <p>아래 시뮬레이터는 16개 명령짜리 짧은 프로그램을 비순차 코어 모델에 흘려 보낸다. 가로는 사이클, 세로는 명령이다. 칸의 글자는 그 사이클에 명령이 있는 단계다. F 인출, D 디코드, R 리네임·디스패치, · 이슈 큐에서 대기, X 실행, = 실행이 끝나고 커밋 대기, C 커밋이다. 첫 적재 명령은 캐시를 놓치고, 여덟 번째 명령은 분기다.</p>
+    <div class="sim" id="sim-pipe">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>비순차 파이프라인 시공간도</h3></div>
+      <div class="sim-view"><canvas id="cv-pipe"></canvas></div>
+      <div class="sim-controls">
+        <label class="ctrl"><span>폭 (인출·디코드·리네임·이슈·커밋) <output id="ps-width-out"></output></span><input type="range" id="ps-width" min="1" max="8" step="1" value="8"></label>
+        <label class="ctrl"><span>ROB 크기 <output id="ps-rob-out"></output></span><input type="range" id="ps-rob" min="4" max="64" step="1" value="48"></label>
+        <label class="ctrl"><span>첫 적재의 미스 지연 <output id="ps-miss-out"></output></span><input type="range" id="ps-miss" min="4" max="60" step="1" value="30"></label>
+        <div class="ctrl"><span>분기 예측</span><div class="seg" id="ps-branch"><button data-value="0" class="on">맞힘</button><button data-value="1">틀림</button></div></div>
+        <label class="ctrl"><span>관찰 사이클 <output id="ps-cursor-out"></output></span><input type="range" id="ps-cursor" min="0" max="60" step="1" value="0"></label>
+        <div class="ctrl-row"><button class="btn sm" id="ps-play">▶ 재생</button></div>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">걸린 사이클</span><span class="v" id="ps-cycles">—</span></div>
+        <div class="stat"><span class="k">IPC (16 / 사이클)</span><span class="v" id="ps-ipc">—</span></div>
+        <div class="stat"><span class="k">ROB 최대 점유</span><span class="v" id="ps-peak">—</span></div>
+        <div class="stat"><span class="k">버린 명령(잘못된 경로)</span><span class="v" id="ps-squash">—</span></div>
+      </div>
+      <div class="info-panel" id="ps-info"></div>
+      <figcaption><span class="try">만져 보기</span>미스 지연을 4로 줄이고 분기를 '틀림'으로 바꿔 보자. 분기 뒤에 잘못된 경로의 명령(회색)이 줄줄이 들어왔다가, 분기가 실행되는 순간 한꺼번에 버려지고(취소선), 3사이클 뒤 올바른 경로로 다시 인출한다. 이번에는 미스 지연을 30으로 올린 채 분기를 '틀림'으로 두자. 걸린 사이클이 거의 변하지 않는다. 오예측 비용이 긴 캐시 미스 그늘에 숨기 때문이다. ROB를 8로 줄이면 미스 뒤의 독립 명령이 ROB에 들어오지 못해 다시 느려진다. 이 모델은 프런트엔드 지연을 1단계로, 리다이렉트를 3사이클로 줄였다. 실제 XiangShan의 오예측 비용은 이보다 크다.</figcaption>
+    </div>
+    <div class="predict"><strong>폭을 8로 늘리면 8배 빨라질까?</strong>
+      <p>미스 지연 4, 분기 맞힘, ROB 48에서 폭을 2에서 8로 바꾸면 걸린 사이클은 어떻게 될까?</p>
+      <details><summary>답 보기</summary><p>20사이클에서 14사이클로 줄어든다. 1.4배 정도다. 이 프로그램은 의존 사슬(ld → add → mul, addi → addi → add → beq)이 길어서, 폭을 늘려도 사슬의 길이보다 빨리 끝날 수 없다. 넓은 폭은 '독립적인 일이 충분할 때'만 값을 한다. 그래서 더 많은 명령을 동시에 붙잡아 독립적인 일을 찾아내는 큰 ROB와 정확한 분기 예측이 함께 필요하다.</p></details>
+    </div>
+  </section>
+
+  <!-- ============================================================ 3 -->
+  <section id="rename">
+    <h2>레지스터 이름 바꾸기</h2>
+    <p>RISC-V 정수 레지스터는 32개뿐이다. 그래서 같은 레지스터가 서로 상관없는 계산에 재사용된다. <code>x1</code>에 쓰는 두 명령은 값으로는 상관이 없는데도, 순서를 바꾸면 덮어쓰기 순서가 꼬일 수 있다. 이런 <span class="term">거짓 의존</span><span class="en">(WAR·WAW)</span>을 없애는 장치가 <span class="term">레지스터 리네이밍</span>이다.</p>
+    <p>원리는 간단하다. 명령이 레지스터에 쓸 때마다 <span class="term">프리 리스트</span><span class="en">(free list)</span>에서 새 물리 레지스터를 하나 꺼내 준다. 아키텍처 레지스터가 지금 어느 물리 레지스터를 가리키는지는 <span class="term">RAT</span><span class="en">(Register Alias Table)</span>에 기록한다. 읽는 쪽은 RAT을 보고 최신 물리 레지스터를 읽는다. 덮어쓰인 옛 물리 레지스터는 그 명령이 커밋될 때 프리 리스트로 돌아간다. 커밋 전에는 분기 오예측으로 되돌아갈 수 있으므로 아직 버리면 안 된다. XiangShan은 정수 물리 레지스터 224개, RAT 다섯 종(int/fp/vec/v0/vl), 되돌리기용 스냅샷 4개를 둔다.</p>
+    <div class="sim" id="sim-rename">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>RAT과 프리 리스트 따라가기</h3>
+        <div class="ctrl-row"><button class="btn sm" id="rn-reset">⏮ 처음</button><button class="btn sm primary" id="rn-rename">리네임 1개 →</button><button class="btn sm" id="rn-commit">커밋 1개 →</button></div>
+      </div>
+      <div class="rename-grid">
+        <div><h5>프로그램</h5><ul class="program-list" id="rn-program"></ul></div>
+        <div><h5>RAT (아키텍처 → 물리)</h5><table class="rename-table" id="rn-rat"></table></div>
+        <div><h5>ROB (오래된 것이 위)</h5><table class="rename-table" id="rn-rob"></table></div>
+        <div><h5>프리 리스트</h5><div class="chips" id="rn-free"></div></div>
+      </div>
+      <div class="info-panel" id="rn-info">'리네임 1개'를 눌러 보세요.</div>
+      <figcaption><span class="try">따라가 보기</span>물리 레지스터 11개(p1~p11)로 줄인 모델이다. 처음에는 x1~x4가 p1~p4를 가리키고 p5~p11 일곱 개가 비어 있다. 1번 명령과 4번 명령은 모두 x1에 쓰지만 서로 다른 물리 레지스터(p5, p8)를 받으므로 순서를 바꿔 실행해도 안전하다. 리네임만 계속 누르면 프리 리스트가 바닥나 리네임이 멈춘다. 이것이 top-down 분석의 <code>IntFlStall</code>(정수 프리 리스트 정지)이다. 커밋을 누르면 덮어쓰인 옛 물리 레지스터가 프리 리스트로 돌아온다(초록 칩).</figcaption>
+    </div>
+  </section>
+
+  <!-- ============================================================ 4 -->
+  <section id="little">
+    <h2>ROB는 얼마나 커야 하나: 리틀의 법칙</h2>
+    <p>ROB에 동시에 들어 있는 명령 수는 '들어오는 속도 × 머무는 시간'이다. 대기열 이론의 <span class="term">리틀의 법칙</span><span class="en">(Little's law)</span>이다. 사이클당 4개를 커밋하고 싶은데 명령 하나가 디스패치부터 커밋까지 평균 50사이클 머문다면, ROB에는 평균 200개가 들어 있어야 한다. ROB가 그보다 작으면 원하는 IPC를 낼 수 없다. 캐시 미스가 머무는 시간을 늘리므로, 메모리를 많이 기다리는 프로그램일수록 큰 ROB가 필요하다.</p>
+    <div class="formula">$$N_{\text{ROB}} = \text{IPC} \times T_{\text{체류}} \quad\Longleftrightarrow\quad \text{IPC}_{\max} = \frac{N_{\text{ROB}}}{T_{\text{체류}}}$$
+      <div class="where">\(T_{\text{체류}}\): 명령이 디스패치되어 커밋될 때까지의 평균 사이클. DefaultConfig의 \(N_{\text{ROB}}\)는 352, MinimalConfig는 48이다.</div></div>
+    <figure class="play" id="fig-little">
+      <div class="play-view"><canvas id="cv-little"></canvas></div>
+      <div class="play-ctrl">
+        <label class="ctrl"><span>목표 IPC <output id="lt-ipc-out"></output></span><input type="range" id="lt-ipc" min="0.5" max="8" step="0.1" value="4"></label>
+        <label class="ctrl"><span>평균 체류 시간(사이클) <output id="lt-time-out"></output></span><input type="range" id="lt-time" min="5" max="300" step="1" value="50"></label>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">필요한 ROB 칸</span><span class="v" id="lt-need">—</span></div>
+        <div class="stat"><span class="k">Default(352)로 낼 수 있는 IPC 상한</span><span class="v" id="lt-default">—</span></div>
+        <div class="stat"><span class="k">Minimal(48)로 낼 수 있는 IPC 상한</span><span class="v" id="lt-minimal">—</span></div>
+      </div>
+      <figcaption><span class="try">만져 보기</span>가로축은 평균 체류 시간, 세로축은 IPC다. 두 곡선은 ROB 352와 48이 허락하는 IPC 상한(N/T)이고, 위의 평평한 선은 폭 8이 정하는 상한이다. 점은 지금 고른 목표다. 체류 시간을 200사이클(L3 미스가 잦은 프로그램)로 올리면, MinimalConfig로는 IPC 0.24가 한계다. MinimalConfig 숫자를 Default 성능처럼 읽으면 안 되는 이유다.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ============================================================ 5 -->
+  <section id="units">
+    <h2>실행 유닛 경합</h2>
+    <p>폭이 8이어도 실행 유닛이 모자라면 그 폭을 못 쓴다. XiangShan DefaultConfig의 정수 쪽은 ALU 6개(그중 2개가 곱셈 겸용), 분기 유닛 BJU 3개, 적재 유닛 LDU 3개, 저장 주소 STA 2개, 저장 데이터 STD 2개다. 명령 구성 비율에 따라 어느 유닛이 먼저 바닥나는지 보자.</p>
+    <div class="callout code"><strong>실행 유닛 배치</strong>
+      <p><code>src/main/scala/xiangshan/Parameters.scala:341-549</code>의 스케줄러 정의(<code>intSchdParams</code>, <code>fpSchdParams</code>, <code>vecSchdParams</code>)를 요약하면 다음과 같다. 괄호는 그 유닛이 맡는 연산, 오른쪽은 이슈 큐 칸 수다.</p>
+<pre><code>Int : ALU0+BJU0 (Alu, Csr, Fence, Link / Brh, NJmp)   IQ 18
+Int : ALU1+BJU1 (Alu, Div / Brh, NJmp)                IQ 18
+Int : ALU2+BJU2 (Alu, I2f / Brh, NJmp)                IQ 18
+Int : ALU3 (Alu, Bku, VSet)                           IQ 20
+Int : ALU4 (Alu, Mul), ALU5 (Alu, Mul)                IQ 20 ×2
+Mem : LDU0-2                                          IQ 20 ×3
+Mem : STA0-1 (Sta, Mou), STD0-1 (Std, Moud)           IQ 16 ×4
+Fp  : FEX0-3 (Falu, Fmul, Fdiv…)                      IQ 20 ×4
+Vec : VFEX0-3, VSTD0-1                                IQ 16 ×6</code></pre>
+    </div>
+    <figure class="play" id="fig-units">
+      <div class="play-view"><canvas id="cv-units"></canvas></div>
+      <div class="play-ctrl">
+        <label class="ctrl"><span>적재 비율 <output id="fu-load-out"></output></span><input type="range" id="fu-load" min="0" max="0.6" step="0.01" value="0.25"></label>
+        <label class="ctrl"><span>저장 비율 <output id="fu-store-out"></output></span><input type="range" id="fu-store" min="0" max="0.4" step="0.01" value="0.10"></label>
+        <label class="ctrl"><span>분기 비율 <output id="fu-branch-out"></output></span><input type="range" id="fu-branch" min="0" max="0.4" step="0.01" value="0.15"></label>
+        <label class="ctrl"><span>곱셈 비율 <output id="fu-mul-out"></output></span><input type="range" id="fu-mul" min="0" max="0.4" step="0.01" value="0.03"></label>
+        <div class="ctrl"><span>디스패치 폭</span><div class="seg" id="fu-width"><button data-value="6">6 (BackendV2Config)</button><button data-value="8" class="on">8 (기본)</button></div></div>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">유닛이 허락하는 IPC 상한</span><span class="v" id="fu-ipc">—</span></div>
+        <div class="stat"><span class="k">먼저 바닥나는 자원</span><span class="v" id="fu-limit">—</span></div>
+        <div class="stat"><span class="k">나머지 ALU 연산 비율</span><span class="v" id="fu-alu">—</span></div>
+      </div>
+      <figcaption><span class="try">만져 보기</span>막대는 그 상한 IPC에서 각 유닛 종류가 얼마나 바쁜지(사용률)다. 어느 하나가 100%에 닿으면 그것이 병목이다. 모든 명령이 준비되어 있다고 가정한 상한이고, 의존성과 미스는 무시한다. 적재 비율을 40% 넘게 올리면 LDU 3개가 먼저 바닥난다(3/0.4 = 7.5). 곱셈 비율을 30%로 올리면 곱셈 겸용 ALU 2개 때문에 IPC가 6.7에 묶인다.</figcaption>
+    </figure>
+    <div class="formula">$$\text{IPC}_{\max} = \min\!\left(W,\; \frac{N_{\text{LDU}}}{f_{\text{load}}},\; \frac{N_{\text{STA}}}{f_{\text{store}}},\; \frac{N_{\text{BJU}}}{f_{\text{branch}}},\; \frac{N_{\text{MUL}}}{f_{\text{mul}}},\; \frac{N_{\text{ALU}}}{f_{\text{alu}}+f_{\text{mul}}}\right)$$
+      <div class="where">곱셈은 ALU4·ALU5에서 실행되므로 ALU 전체 6개도 함께 나눠 쓴다. 이 식은 이 그림의 단순화 모델이다.</div></div>
+  </section>
+
+  <!-- ============================================================ 6 -->
+  <section id="topdown">
+    <h2>잃어버린 슬롯 세기: top-down 분석</h2>
+    <p>여기서 슬롯은 디스패치 단계의 한 자리이며, XiangShan은 리네임 폭 W만큼의 슬롯을 사이클마다 분류한다. uop이 디스패치되면 NoStall이고, 보내지 못하면 그 원인을 붙인다. NoStall에는 나중에 잘못된 경로로 판명되어 버려질 uop도 포함된다. 따라서 디스패치 성공률은 커밋된 명령의 비율(retiring)이나 커밋 IPC와 같지 않다. 프런트엔드가 명령을 못 보냈는지, 잘못된 경로라 버려졌는지, 백엔드가 받을 자리가 없었는지를 가린다. 전체 슬롯 = W × 사이클이고, 원인별 슬롯의 비율을 보면 성능을 어디서 잃는지 알 수 있다. 이것이 <span class="term">top-down 분석</span>이다.</p>
+    <p>XiangShan은 슬롯마다 정지 원인 코드를 달아 파이프라인을 따라 흘려 보낸다. 프런트엔드 → 디코드 → 리네임 → 디스패치로 가며 각 단계가 앞 단계의 원인, 리다이렉트 원인, 자기 단계의 정지 원인 중 하나를 고른다. 마지막에 디스패치에서 원인별로 센다. 원인들이 '리네임 폭 × 사이클'을 정확히 나누어 가지므로 비율 계산이 정확하다.</p>
+    <div class="callout code"><strong>원인별 슬롯 세기</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/backend/dispatch/Dispatch.scala:1263</span>
+TopDownCounters.values.foreach(ctr =&gt;
+  XSPerfAccumulate(ctr.toString(),
+    PopCount(stallReason.map(_ === ctr.id.U)), XSPerfLevel.CRITICAL))</code></pre>
+      <p>원인 목록(<code>TopDownCounters</code>)은 <code>xiangshan/package.scala:817-897</code>에 정의되어 있다. 디스패치된 슬롯(<code>NoStall</code>) 하나와, 프런트엔드(OverrideBubble, TAGEMissBubble, ICacheMissBubble, FetchFragBubble 등), 백엔드(RobStall, LqStall, IntFlStall, 각종 IQFullStall 등), 메모리 블록(LoadL1Stall~LoadMemStall, StoreStall 등) 묶음으로 나뉜다. 세는 코드는 <code>backend/dispatch/Dispatch.scala:1263</code>에 있다.</p>
+    </div>
+    <div class="table-wrap"><table>
+      <tr><th>묶음</th><th>대표 원인 (package.scala)</th><th>뜻</th></tr>
+      <tr><td>디스패치된 슬롯</td><td class="mono">NoStall</td><td>디스패치 fire가 발생한 슬롯. 이후 커밋 여부는 별도다</td></tr>
+      <tr><td>프런트엔드 · 잘못된 추측</td><td class="mono">OverrideBubble, TAGEMissBubble, SCMissBubble, ITTAGEMissBubble, RASMissBubble, MemVioRedirectBubble</td><td>예측기의 덮어쓰기, 분기·메모리 위반 리다이렉트 뒤 다시 가져오는 거품</td></tr>
+      <tr><td>프런트엔드 · 공급</td><td class="mono">ICacheMissBubble, ITLBMissBubble, BTBMissBubble, FetchFragBubble, FtqFullStall</td><td>명령 캐시·TLB 미스, 페치 블록이 폭을 다 채우지 못한 경우</td></tr>
+      <tr><td>백엔드</td><td class="mono">RobStall, LqStall, SqStall, IntFlStall, FpFlStall, *IQFullStall, DivStall, *NotReadyStall</td><td>받을 자리(ROB·큐·물리 레지스터·이슈 큐)가 없거나 ROB 머리 명령이 오래 걸림</td></tr>
+      <tr><td>메모리</td><td class="mono">LoadTLBStall, LoadL1Stall, LoadL2Stall, LoadL3Stall, LoadMemStall, StoreStall</td><td>ROB 머리의 적재가 어느 단계의 미스를 기다리는지</td></tr>
+    </table></div>
+    <p>원인을 아는 것보다 중요한 것은 원인끼리의 <b>상호 작용</b>이다. 같은 캐시 미스라도 ROB가 그 지연을 다 덮을 만큼 크면 슬롯을 거의 잃지 않는다. 아래 그림은 이것을 보여 주는 작은 슬롯 모델이다. 실제 코어의 측정이 아니라, 사건의 빈도와 지연을 넣으면 8칸짜리 사이클들을 원인별로 칠해 주는 장난감이다.</p>
+    <figure class="play" id="fig-topdown">
+      <div class="play-ctrl" style="border-top:0;border-bottom:1px solid var(--border)">
+        <label class="ctrl"><span>taken 분기 사이 평균 명령 수 <output id="td-run-out"></output></span><input type="range" id="td-run" min="2" max="24" step="1" value="8"></label>
+        <label class="ctrl"><span>분기 오예측 (1,000명령당) <output id="td-mpki-out"></output></span><input type="range" id="td-mpki" min="0" max="20" step="0.5" value="4"></label>
+        <label class="ctrl"><span>오예측 회복 사이클 <output id="td-penalty-out"></output></span><input type="range" id="td-penalty" min="4" max="20" step="1" value="10"></label>
+        <label class="ctrl"><span>명령 캐시 미스 (1,000명령당) <output id="td-icache-out"></output></span><input type="range" id="td-icache" min="0" max="10" step="0.5" value="1"></label>
+        <label class="ctrl"><span>메모리까지 가는 적재 (1,000명령당) <output id="td-memory-out"></output></span><input type="range" id="td-memory" min="0" max="10" step="0.5" value="2"></label>
+        <label class="ctrl"><span>메모리 지연 사이클 <output id="td-latency-out"></output></span><input type="range" id="td-latency" min="20" max="300" step="10" value="60"></label>
+        <div class="ctrl"><span>ROB 크기</span><div class="seg" id="td-rob"><button data-value="352" class="on">352 (Default)</button><button data-value="48">48 (Minimal)</button></div></div>
+      </div>
+      <div class="play-view"><canvas id="cv-topdown"></canvas></div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">모델 IPC</span><span class="v" id="td-ipc">—</span></div>
+        <div class="stat"><span class="k">모델의 유효 작업 슬롯 비율</span><span class="v" id="td-retire">—</span></div>
+        <div class="stat"><span class="k">가장 큰 손실 원인</span><span class="v" id="td-top">—</span></div>
+      </div>
+      <figcaption><span class="try">만져 보기</span>위 띠는 처음 120사이클의 슬롯 격자(세로 8칸 = 리네임 폭, 가로 = 사이클)이고, 아래 막대는 명령 2만 개를 흘렸을 때의 원인별 슬롯 비율이다. 모델 규칙은 이렇다. 페치는 taken 분기에서 끊기므로 한 사이클에 '다음 taken 분기까지 남은 명령 수'만큼만 공급하고, 빈 칸은 FetchFragBubble이다. 오예측 하나는 회복 사이클 동안 8칸을 모두 TAGEMissBubble로, 명령 캐시 미스 하나는 12사이클을 ICacheMissBubble로 만든다. 메모리까지 가는 적재는 지연 중 ROB가 덮지 못하는 부분, 즉 <code>max(0, 지연 − ROB/8)</code>사이클만 LoadMemStall로 칠한다. 처음 설정(메모리 지연 60)에서 ROB 352면 지연 60 − 44 = 16사이클만 드러나 가장 큰 손실은 FetchFragBubble이고 모델 IPC는 3.72다. ROB를 48로 바꾸면 54사이클이 드러나 LoadMemStall이 1위로 올라서고 IPC는 3.03으로 떨어진다. 이 모델은 잘못된 경로의 uop과 폐기 이력을 따로 추적하지 않아 성공 슬롯을 유효 명령으로 간주한다. 그래서 표시한 모델 IPC를 실제 NoStall 카운터에서 구한 커밋 IPC로 해석하면 안 된다. 실제 코어에서는 여러 사건이 겹치고 의존성과 실행 유닛 경합도 있어 이보다 복잡하다.</figcaption>
+    </figure>
+  </section>
+
+  <section class="keypoints">
+    <h2>핵심 정리</h2>
+    <ol>
+      <li>XiangShan DefaultConfig는 디코드·리네임·커밋 폭 8, ROB 352, LQ 120, SQ 물리 64(가상 128), 정수 물리 레지스터 224다. 정수 쪽 실행 유닛은 ALU 6, BJU 3, LDU 3, STA 2, STD 2.</li>
+      <li>폭을 늘려도 의존 사슬보다 빨라질 수는 없다. 넓은 폭은 큰 ROB와 정확한 분기 예측이 독립적인 일을 찾아 줄 때만 값을 한다.</li>
+      <li>리네이밍은 쓰기마다 새 물리 레지스터를 주어 거짓 의존을 없앤다. 옛 물리 레지스터는 커밋 때 프리 리스트로 돌아간다.</li>
+      <li>리틀의 법칙: 필요한 ROB = IPC × 평균 체류 시간. 미스가 잦으면 큰 ROB가 필요하고, MinimalConfig(48)는 메모리를 기다리는 프로그램에서 크게 불리하다.</li>
+      <li>top-down 분석은 슬롯(리네임 폭 × 사이클)마다 원인 코드(<code>TopDownCounters</code>)를 하나씩 붙여 디스패치에서 센다. 같은 미스라도 ROB가 지연을 덮으면 슬롯을 거의 잃지 않는다.</li>
+    </ol>
+  </section>
+
+  <section id="quiz">
+    <h2>확인 퀴즈</h2>
+    <div class="quiz">
+      <div class="quiz-q" data-answer="1"><p>Q1. 덮어쓰인 옛 물리 레지스터가 프리 리스트로 돌아가는 시점은?</p><div class="opts">
+        <button class="opt">새 값을 쓰는 명령이 리네임될 때</button><button class="opt">새 값을 쓰는 명령이 커밋될 때</button><button class="opt">새 값을 쓰는 명령이 실행을 마칠 때</button><button class="opt">옛 값을 읽는 마지막 명령이 이슈될 때</button></div>
+        <div class="quiz-exp">커밋 전에는 분기 오예측이나 예외로 되돌아가야 할 수 있으므로 옛 값을 지우면 안 된다. 커밋되면 되돌아갈 일이 없으므로 그때 돌려준다.</div></div>
+      <div class="quiz-q" data-answer="2"><p>Q2. 목표 IPC 3, 평균 체류 시간 150사이클이면 필요한 ROB는?</p><div class="opts">
+        <button class="opt">50</button><button class="opt">153</button><button class="opt">450</button><button class="opt">352</button></div>
+        <div class="quiz-exp">3 × 150 = 450. DefaultConfig의 352로도 모자라므로, 이 경우 IPC 상한은 352/150 ≈ 2.35다.</div></div>
+      <div class="quiz-q" data-answer="0"><p>Q3. 시뮬레이터에서 첫 적재가 30사이클 미스일 때 분기 오예측 비용이 거의 보이지 않은 이유는?</p><div class="opts">
+        <button class="opt">분기가 미스보다 먼저 해소되어, 리다이렉트 비용이 미스를 기다리는 시간 안에 숨었다</button><button class="opt">미스가 나면 분기 예측기가 꺼진다</button><button class="opt">잘못된 경로 명령도 커밋되기 때문이다</button><button class="opt">ROB가 너무 커서다</button></div>
+        <div class="quiz-exp">커밋은 첫 적재(미스)가 끝나야 진행된다. 분기는 그보다 훨씬 일찍 해소되고 올바른 경로 명령도 그사이 다시 들어오므로, 전체 시간은 미스가 정한다.</div></div>
+      <div class="quiz-q" data-answer="3"><p>Q4. top-down 분석에서 전체 슬롯 수는?</p><div class="opts">
+        <button class="opt">커밋한 명령 수</button><button class="opt">ROB 크기 × 사이클</button><button class="opt">실행 유닛 수 × 사이클</button><button class="opt">(리네임) 폭 × 사이클</button></div>
+        <div class="quiz-exp">원인 코드는 리네임 폭 크기의 벡터(<code>StallReasonIO(RenameWidth)</code>)로 흐르므로, 사이클마다 8칸이 각각 원인 하나를 받는다. 전체 슬롯은 8 × 사이클이다.</div></div>
+      <div class="quiz-q" data-answer="1"><p>Q5. 적재 비율이 50%이고 다른 유닛은 넉넉하다. LDU 3개가 허락하는 IPC 상한은?</p><div class="opts">
+        <button class="opt">3</button><button class="opt">6</button><button class="opt">8</button><button class="opt">1.5</button></div>
+        <div class="quiz-exp">3 / 0.5 = 6. 폭 8보다 작으므로 적재 유닛이 병목이다.</div></div>
+    </div>
+  </section>
+</main>
+
+<script>
+(function () {
+  "use strict";
+  /* =================================================== 그림 2-1: 파이프라인 시뮬레이터
+     규칙: 인출·디코드·리네임·이슈·커밋 모두 같은 폭. 단계마다 1사이클 이상.
+     이슈는 피연산자가 준비된 것 중 오래된 순서. 적재 3, 곱셈 2, 분기 3, 저장 2개까지.
+     오예측 분기가 실행을 마치면 그 뒤의 잘못된 경로를 버리고 3사이클 뒤 다시 인출한다. */
+  const PIPELINE_PROGRAM = [
+    { text: "ld   x1, 0(x10)",   kind: "load",   destination: 1,  sources: [10], isMiss: true },
+    { text: "add  x2, x1, x3",   kind: "alu",    destination: 2,  sources: [1, 3] },
+    { text: "mul  x4, x2, x2",   kind: "mul",    destination: 4,  sources: [2] },
+    { text: "addi x5, x6, 1",    kind: "alu",    destination: 5,  sources: [6] },
+    { text: "addi x7, x5, 2",    kind: "alu",    destination: 7,  sources: [5] },
+    { text: "ld   x8, 8(x11)",   kind: "load",   destination: 8,  sources: [11] },
+    { text: "add  x9, x8, x7",   kind: "alu",    destination: 9,  sources: [8, 7] },
+    { text: "beq  x9, x0, L1",   kind: "branch", destination: 0,  sources: [9], isBranch: true },
+    { text: "addi x12, x12, 1",  kind: "alu",    destination: 12, sources: [12] },
+    { text: "sub  x13, x12, x6", kind: "alu",    destination: 13, sources: [12, 6] },
+    { text: "ld   x14, 16(x11)", kind: "load",   destination: 14, sources: [11] },
+    { text: "add  x15, x14, x13",kind: "alu",    destination: 15, sources: [14, 13] },
+    { text: "mul  x16, x15, x3", kind: "mul",    destination: 16, sources: [15, 3] },
+    { text: "sd   x16, 0(x10)",  kind: "store",  destination: 0,  sources: [16, 10] },
+    { text: "addi x17, x6, 4",   kind: "alu",    destination: 17, sources: [6] },
+    { text: "add  x18, x17, x5", kind: "alu",    destination: 18, sources: [17, 5] },
+  ];
+  const LATENCY = { alu: 1, mul: 3, branch: 1, store: 1, load: 4 };
+  const FUNCTION_UNIT_LIMIT = { load: 3, mul: 2, branch: 3, store: 2 };
+  const REDIRECT_DELAY_CYCLES = 3;
+  const MAXIMUM_CYCLES = 400;
+  const MAXIMUM_SHOWN_WRONG_PATH = 8;
+
+  function simulatePipeline(options) {
+    const width = options.width, robSize = options.robSize;
+    const rows = [];
+    let nextProgramIndex = 0, wrongPathCount = 0, isOnWrongPath = false, fetchResumeCycle = 0;
+    let branchRow = null, isBranchResolved = false, peakRob = 0, lastCommitCycle = 0;
+    const fetchBufferLimit = 2 * width;
+    const producerOf = {};
+    const occupancyByCycle = [];
+    for (let cycle = 0; cycle < MAXIMUM_CYCLES; cycle++) {
+      if (branchRow && !isBranchResolved && branchRow.complete !== undefined && branchRow.complete <= cycle) {
+        isBranchResolved = true;
+        rows.forEach((row) => { if (row.isWrongPath && row.squash === undefined) row.squash = cycle; });
+        isOnWrongPath = false;
+        fetchResumeCycle = cycle + REDIRECT_DELAY_CYCLES;
+      }
+      const live = rows.filter((row) => row.squash === undefined);
+      let committedThisCycle = 0;
+      for (const row of live) {
+        if (row.rename === undefined || row.commit !== undefined) continue;
+        if (committedThisCycle >= width) break;
+        if (row.complete === undefined || row.complete > cycle) break;
+        row.commit = cycle; committedThisCycle++; lastCommitCycle = cycle;
+      }
+      let issuedThisCycle = 0;
+      const unitUse = { load: 0, mul: 0, branch: 0, store: 0 };
+      for (const row of live) {
+        if (issuedThisCycle >= width) break;
+        if (row.rename === undefined || row.rename >= cycle || row.issue !== undefined) continue;
+        const isReady = row.producers.every((producer) => producer.complete !== undefined && producer.complete <= cycle);
+        if (!isReady) continue;
+        const limit = FUNCTION_UNIT_LIMIT[row.kind];
+        if (limit !== undefined && unitUse[row.kind] >= limit) continue;
+        if (limit !== undefined) unitUse[row.kind]++;
+        row.issue = cycle;
+        row.complete = cycle + (row.kind === "load" && row.isMiss ? options.missLatency : LATENCY[row.kind]);
+        issuedThisCycle++;
+      }
+      let robOccupancy = live.filter((row) => row.rename !== undefined && row.commit === undefined).length;
+      let renamedThisCycle = 0;
+      for (const row of live) {
+        if (row.rename !== undefined) continue;
+        if (row.decode === undefined || row.decode >= cycle) break;
+        if (renamedThisCycle >= width || robOccupancy >= robSize) break;
+        row.producers = row.sources.map((register) => producerOf[register]).filter(Boolean);
+        if (row.destination) producerOf[row.destination] = row;
+        row.rename = cycle; renamedThisCycle++; robOccupancy++;
+      }
+      peakRob = Math.max(peakRob, robOccupancy);
+      occupancyByCycle.push(robOccupancy);
+      let decodedThisCycle = 0;
+      for (const row of live) {
+        if (row.decode !== undefined) continue;
+        if (row.fetch >= cycle || decodedThisCycle >= width) break;
+        row.decode = cycle; decodedThisCycle++;
+      }
+      const waiting = live.filter((row) => row.rename === undefined).length;
+      if (cycle >= fetchResumeCycle) {
+        for (let k = 0; k < width; k++) {
+          if (waiting + k >= fetchBufferLimit) break;
+          if (isOnWrongPath) {
+            // 잘못된 경로 명령은 레지스터를 쓰지 않는 독립 연산으로 둔다.
+            rows.push({ text: `(잘못된 경로 ${++wrongPathCount})`, kind: "alu", destination: 0, sources: [], isWrongPath: true, fetch: cycle, producers: [] });
+            continue;
+          }
+          if (nextProgramIndex >= PIPELINE_PROGRAM.length) break;
+          const instruction = PIPELINE_PROGRAM[nextProgramIndex++];
+          const row = Object.assign({}, instruction, { fetch: cycle, isWrongPath: false, producers: [] });
+          rows.push(row);
+          if (instruction.isBranch && options.isMispredict) { branchRow = row; isOnWrongPath = true; break; }
+        }
+      }
+      const correct = rows.filter((row) => !row.isWrongPath);
+      if (correct.length === PIPELINE_PROGRAM.length && correct.every((row) => row.commit !== undefined)) break;
+    }
+    return { rows, cycles: lastCommitCycle + 1, peakRob, wrongPath: wrongPathCount, occupancyByCycle };
+  }
+
+  const STAGE_STYLE = {
+    F: "accent", D: "accent", R: "accent-2", wait: "text-faint", X: "warn", done: "ok", C: "ok",
+  };
+  /** 한 행의 cycle에서의 상태 글자 */
+  function stageAt(row, cycle) {
+    if (row.squash !== undefined && cycle >= row.squash) return null;
+    if (cycle < row.fetch) return null;
+    if (row.commit !== undefined && cycle > row.commit) return null;
+    if (row.commit === cycle) return "C";
+    if (row.decode === undefined || cycle < row.decode) return "F";
+    if (row.rename === undefined || cycle < row.rename) return "D";
+    if (cycle === row.rename) return "R";
+    if (row.issue === undefined || cycle < row.issue) return "·";
+    if (cycle < row.complete) return "X";
+    return "=";
+  }
+  let pipeOptions = { width: 8, robSize: 48, missLatency: 30, isMispredict: false };
+  let pipeResult = null, pipeCursor = 0;
+  const pipeView = MB.canvas("#cv-pipe", { aspect: 0.62, minHeight: 360, maxHeight: 620, draw: drawPipe });
+  function visibleRows() {
+    const rows = [];
+    let shownWrongPath = 0, hiddenWrongPath = 0;
+    pipeResult.rows.forEach((row) => {
+      if (!row.isWrongPath) { rows.push(row); return; }
+      if (shownWrongPath < MAXIMUM_SHOWN_WRONG_PATH) { rows.push(row); shownWrongPath++; } else hiddenWrongPath++;
+    });
+    return { rows, hiddenWrongPath };
+  }
+  function drawPipe(ctx, width, height) {
+    if (!pipeResult) return;
+    const { rows, hiddenWrongPath } = visibleRows();
+    const isSmall = width < 560;
+    const labelWidth = isSmall ? 92 : 150;
+    const columnCount = pipeResult.cycles + 1;
+    const top = 22, bottom = height - (hiddenWrongPath ? 22 : 8);
+    const rowHeight = Math.min(30, (bottom - top) / rows.length);
+    const cellWidth = (width - labelWidth - 8) / columnCount;
+    const cursorX = labelWidth + pipeCursor * cellWidth;
+    ctx.fillStyle = MB.alpha(MB.css("accent-2"), 0.12);
+    ctx.fillRect(cursorX, top - 4, cellWidth, rows.length * rowHeight + 4);
+    const labelEvery = Math.ceil(28 / cellWidth);
+    for (let cycle = 0; cycle < columnCount; cycle += labelEvery) {
+      MB.text(ctx, String(cycle), labelWidth + cycle * cellWidth + cellWidth / 2, 10, { align: "center", size: 9.5, mono: true, color: MB.css("text-faint") });
+    }
+    rows.forEach((row, index) => {
+      const y = top + index * rowHeight;
+      const isSquashed = row.squash !== undefined;
+      MB.text(ctx, isSmall ? row.text.replace(/\s+/g, " ").slice(0, 14) : row.text, 6, y + rowHeight / 2, { size: isSmall ? 9 : 11, mono: true, color: row.isWrongPath ? MB.css("text-faint") : MB.css("text") });
+      for (let cycle = 0; cycle < columnCount; cycle++) {
+        const stage = stageAt(row, cycle);
+        if (!stage) continue;
+        const x = labelWidth + cycle * cellWidth;
+        let color;
+        if (row.isWrongPath) color = MB.css("text-faint");
+        else if (stage === "·") color = MB.css("text-faint");
+        else if (stage === "=") color = MB.css("ok");
+        else color = MB.css(STAGE_STYLE[stage]);
+        const isQuiet = stage === "·" || stage === "=";
+        ctx.fillStyle = MB.alpha(color, row.isWrongPath ? 0.18 : isQuiet ? 0.12 : 0.28);
+        ctx.fillRect(x + 0.5, y + 1, cellWidth - 1, rowHeight - 2);
+        if (cellWidth > 9) MB.text(ctx, stage, x + cellWidth / 2, y + rowHeight / 2, { align: "center", size: Math.min(11, cellWidth * 0.75), mono: true, weight: 700, color });
+      }
+      if (isSquashed) {
+        ctx.strokeStyle = MB.css("bad"); ctx.lineWidth = 1.4;
+        const startX = labelWidth + row.fetch * cellWidth, endX = labelWidth + row.squash * cellWidth;
+        ctx.beginPath(); ctx.moveTo(startX, y + rowHeight / 2); ctx.lineTo(endX, y + rowHeight / 2); ctx.stroke();
+      }
+    });
+    if (hiddenWrongPath) MB.text(ctx, `… 잘못된 경로 명령 ${hiddenWrongPath}개 더 (생략)`, 6, height - 10, { size: 11, color: MB.css("text-faint") });
+  }
+  function describeCursor() {
+    const cycle = pipeCursor;
+    const counts = { F: 0, D: 0, R: 0, "·": 0, X: 0, "=": 0, C: 0 };
+    pipeResult.rows.forEach((row) => { const stage = stageAt(row, cycle); if (stage) counts[stage]++; });
+    const occupancy = pipeResult.occupancyByCycle[cycle] || 0;
+    document.getElementById("ps-info").innerHTML =
+      `<b>사이클 ${cycle}</b> · 인출 ${counts.F}, 디코드 ${counts.D}, 리네임 ${counts.R}, 이슈 대기 ${counts["·"]}, 실행 중 ${counts.X}, 커밋 대기 ${counts["="]}, 커밋 ${counts.C} · ROB 점유 <span class="mono">${occupancy}/${pipeOptions.robSize}</span>`;
+  }
+  function runPipe() {
+    pipeResult = simulatePipeline(pipeOptions);
+    const cursorInput = document.getElementById("ps-cursor");
+    cursorInput.max = pipeResult.cycles;
+    if (pipeCursor > pipeResult.cycles) pipeCursor = pipeResult.cycles;
+    MB.set("ps-cycles", String(pipeResult.cycles));
+    MB.set("ps-ipc", (PIPELINE_PROGRAM.length / pipeResult.cycles).toFixed(2));
+    MB.set("ps-peak", `${pipeResult.peakRob}<small>/${pipeOptions.robSize}</small>`);
+    MB.set("ps-squash", String(pipeResult.wrongPath), pipeResult.wrongPath ? "bad" : "");
+    describeCursor();
+    pipeView.redraw();
+  }
+  MB.range("ps-width", (v) => { pipeOptions.width = v; runPipe(); });
+  MB.range("ps-rob", (v) => { pipeOptions.robSize = v; runPipe(); });
+  MB.range("ps-miss", (v) => { pipeOptions.missLatency = v; runPipe(); }, (v) => v + " 사이클");
+  MB.seg("#ps-branch", (v) => { pipeOptions.isMispredict = v === "1"; runPipe(); });
+  const cursorControl = MB.range("ps-cursor", (v) => { pipeCursor = v; if (pipeResult) { describeCursor(); pipeView.redraw(); } });
+  let cursorClock = 0;
+  const pipeLoop = MB.loop(document.getElementById("sim-pipe"), (dt) => {
+    cursorClock += dt;
+    if (cursorClock < 0.18) return;
+    cursorClock = 0;
+    cursorControl.set(pipeCursor >= pipeResult.cycles ? 0 : pipeCursor + 1);
+  });
+  pipeLoop.running = false;
+  MB.playButton("ps-play", pipeLoop, ["⏸ 멈춤", "▶ 재생"]);
+  runPipe();
+
+  /* =================================================== 그림 2-2: 리네이밍 */
+  const RENAME_PROGRAM = [
+    { text: "add x1, x2, x3", destination: 1, sources: [2, 3] },
+    { text: "sub x4, x1, x2", destination: 4, sources: [1, 2] },
+    { text: "mul x2, x4, x4", destination: 2, sources: [4] },
+    { text: "addi x1, x3, 8", destination: 1, sources: [3] },
+    { text: "and x3, x1, x2", destination: 3, sources: [1, 2] },
+    { text: "or  x4, x3, x1", destination: 4, sources: [3, 1] },
+    { text: "add x1, x4, x4", destination: 1, sources: [4] },
+    { text: "sub x2, x1, x3", destination: 2, sources: [1, 3] },
+  ];
+  const ARCHITECTURAL_REGISTER_COUNT = 4, PHYSICAL_REGISTER_COUNT = 12;
+  let renameState;
+  function resetRename() {
+    const table = {};
+    for (let register = 1; register <= ARCHITECTURAL_REGISTER_COUNT; register++) table[register] = register;
+    const free = [];
+    for (let physical = ARCHITECTURAL_REGISTER_COUNT + 1; physical < PHYSICAL_REGISTER_COUNT; physical++) free.push(physical);
+    renameState = { table, free, rob: [], next: 0, changed: null, freshFree: null, message: "'리네임 1개'를 눌러 보세요." };
+    paintRename();
+  }
+  function renameOne() {
+    const state = renameState;
+    if (state.next >= RENAME_PROGRAM.length) { state.message = "프로그램을 다 리네임했다. 커밋으로 ROB를 비워 보자."; paintRename(); return; }
+    if (!state.free.length) { state.message = "<b>프리 리스트가 비었다!</b> 새 물리 레지스터가 없어 리네임이 멈춘다(IntFlStall). 커밋해서 옛 레지스터를 돌려받아야 한다."; paintRename(); return; }
+    const instruction = RENAME_PROGRAM[state.next];
+    const sources = instruction.sources.map((register) => `x${register}→p${state.table[register]}`);
+    const fresh = state.free.shift();
+    const old = state.table[instruction.destination];
+    state.table[instruction.destination] = fresh;
+    state.rob.push({ index: state.next, text: instruction.text, destination: instruction.destination, fresh, old });
+    state.changed = instruction.destination; state.freshFree = null;
+    state.message = `<b>${instruction.text}</b> · 읽기: ${sources.join(", ")} · 쓰기: x${instruction.destination}에 새 물리 레지스터(p${fresh})를 준다. 옛 물리 레지스터(p${old})는 ROB에 적어 두었다가 커밋 때 돌려준다.`;
+    state.next++;
+    paintRename();
+  }
+  function commitOne() {
+    const state = renameState;
+    if (!state.rob.length) { state.message = "ROB가 비어 있다."; paintRename(); return; }
+    const entry = state.rob.shift();
+    state.free.push(entry.old);
+    state.freshFree = entry.old; state.changed = null;
+    state.message = `<b>${entry.text}</b> 커밋 · 이제 되돌아갈 일이 없으므로 x${entry.destination}의 옛 물리 레지스터(p${entry.old})를 프리 리스트에 돌려준다.`;
+    paintRename();
+  }
+  function paintRename() {
+    const state = renameState;
+    document.getElementById("rn-program").innerHTML = RENAME_PROGRAM.map((instruction, index) =>
+      `<li class="${index === state.next ? "current" : index < state.next ? "done" : ""}">${index + 1}. ${instruction.text}</li>`).join("");
+    let rat = "<tr><th>아키텍처</th><th>물리</th></tr>";
+    for (let register = 1; register <= ARCHITECTURAL_REGISTER_COUNT; register++) rat += `<tr class="${state.changed === register ? "changed" : ""}"><td>x${register}</td><td>p${state.table[register]}</td></tr>`;
+    document.getElementById("rn-rat").innerHTML = rat;
+    document.getElementById("rn-rob").innerHTML = "<tr><th>명령</th><th>새</th><th>옛</th></tr>" +
+      (state.rob.length ? state.rob.map((entry, index) => `<tr class="${index === 0 ? "head" : ""}"><td>${entry.index + 1}. ${entry.text.split(" ")[0]} x${entry.destination}</td><td>p${entry.fresh}</td><td>p${entry.old}</td></tr>`).join("") : `<tr><td colspan="3" class="dim">비어 있음</td></tr>`);
+    document.getElementById("rn-free").innerHTML = state.free.length ? state.free.map((p) => `<span class="${p === state.freshFree ? "fresh" : ""}">p${p}</span>`).join("") : `<span style="color:var(--bad)">비어 있음</span>`;
+    document.getElementById("rn-info").innerHTML = state.message;
+  }
+  document.getElementById("rn-reset").onclick = resetRename;
+  document.getElementById("rn-rename").onclick = renameOne;
+  document.getElementById("rn-commit").onclick = commitOne;
+  resetRename();
+
+  /* =================================================== 그림 2-3: 리틀의 법칙 */
+  const DEFAULT_ROB = 352, MINIMAL_ROB = 48, MACHINE_WIDTH = 8;
+  let targetIpc = 4, residenceTime = 50;
+  const littleView = MB.canvas("#cv-little", { aspect: 0.48, minHeight: 240, maxHeight: 360, draw: drawLittle });
+  function drawLittle(ctx, width, height) {
+    const curve = (robSize) => { const points = []; for (let time = 5; time <= 300; time += 2) points.push([time, Math.min(MACHINE_WIDTH, robSize / time)]); return points; };
+    const axes = MB.lineChart(ctx, width, height, [
+      { name: "폭", color: MB.css("text-faint"), data: [[5, MACHINE_WIDTH], [300, MACHINE_WIDTH]], dash: [5, 4], width: 1.4 },
+      { name: "ROB 352", color: MB.css("accent-2"), data: curve(DEFAULT_ROB), width: 2.4 },
+      { name: "ROB 48", color: MB.css("warn"), data: curve(MINIMAL_ROB), width: 2.4 },
+    ], { xMin: 5, xMax: 300, yMin: 0, yMax: 8.5, xLabel: "평균 체류 시간 (사이클)", yLabel: "IPC 상한", yFormat: (v) => v.toFixed(1) });
+    const isFeasible = targetIpc <= Math.min(MACHINE_WIDTH, DEFAULT_ROB / residenceTime);
+    ctx.fillStyle = isFeasible ? MB.css("ok") : MB.css("bad");
+    ctx.beginPath(); ctx.arc(axes.sx(residenceTime), axes.sy(targetIpc), 6, 0, Math.PI * 2); ctx.fill();
+    MB.text(ctx, "■ ROB 352", axes.right - 4, axes.top + 10, { align: "right", size: 11.5, color: MB.css("accent-2"), weight: 700 });
+    MB.text(ctx, "■ ROB 48", axes.right - 4, axes.top + 26, { align: "right", size: 11.5, color: MB.css("warn"), weight: 700 });
+  }
+  function paintLittle() {
+    const need = targetIpc * residenceTime;
+    MB.set("lt-need", Math.round(need).toLocaleString(), need > DEFAULT_ROB ? "bad" : "good");
+    MB.set("lt-default", Math.min(MACHINE_WIDTH, DEFAULT_ROB / residenceTime).toFixed(2));
+    MB.set("lt-minimal", Math.min(MACHINE_WIDTH, MINIMAL_ROB / residenceTime).toFixed(2));
+    littleView.redraw();
+  }
+  MB.range("lt-ipc", (v) => { targetIpc = v; paintLittle(); }, (v) => v.toFixed(1));
+  MB.range("lt-time", (v) => { residenceTime = v; paintLittle(); });
+  paintLittle();
+
+  /* =================================================== 그림 2-4: 실행 유닛 경합 */
+  const UNIT_COUNT = { load: 3, store: 2, branch: 3, mul: 2, alu: 6 };
+  const UNIT_NAME = { load: "LDU 3", store: "STA 2", branch: "BJU 3", mul: "MUL(ALU4·5) 2", alu: "ALU 6", width: "디스패치 폭" };
+  const mix = { load: 0.25, store: 0.10, branch: 0.15, mul: 0.03 };
+  let dispatchWidth = 8;
+  const unitsView = MB.canvas("#cv-units", { aspect: 0.42, minHeight: 230, maxHeight: 330, draw: drawUnits });
+  function computeUnits() {
+    const aluFraction = Math.max(0, 1 - mix.load - mix.store - mix.branch - mix.mul);
+    const bounds = [{ key: "width", value: dispatchWidth }];
+    const divide = (count, fraction) => (fraction > 0 ? count / fraction : Infinity);
+    bounds.push({ key: "load", value: divide(UNIT_COUNT.load, mix.load) });
+    bounds.push({ key: "store", value: divide(UNIT_COUNT.store, mix.store) });
+    bounds.push({ key: "branch", value: divide(UNIT_COUNT.branch, mix.branch) });
+    bounds.push({ key: "mul", value: divide(UNIT_COUNT.mul, mix.mul) });
+    bounds.push({ key: "alu", value: divide(UNIT_COUNT.alu, aluFraction + mix.mul) });
+    const limit = bounds.reduce((a, b) => (b.value < a.value ? b : a));
+    const ipc = limit.value;
+    const utilization = {
+      load: (ipc * mix.load) / UNIT_COUNT.load,
+      store: (ipc * mix.store) / UNIT_COUNT.store,
+      branch: (ipc * mix.branch) / UNIT_COUNT.branch,
+      mul: (ipc * mix.mul) / UNIT_COUNT.mul,
+      alu: (ipc * (aluFraction + mix.mul)) / UNIT_COUNT.alu,
+    };
+    return { ipc, limit, utilization, aluFraction };
+  }
+  function drawUnits(ctx, width, height) {
+    const result = computeUnits();
+    const items = ["alu", "mul", "branch", "load", "store"].map((key) => ({
+      label: UNIT_NAME[key], value: result.utilization[key] * 100,
+      color: result.utilization[key] > 0.995 ? MB.css("bad") : result.utilization[key] > 0.8 ? MB.css("warn") : MB.css("accent-2"),
+    }));
+    MB.barChart(ctx, width, height, items, { min: 0, max: 100, format: (v) => v.toFixed(0) + "%", pad: { l: width < 560 ? 110 : 140, r: 50, t: 10, b: 10 } });
+  }
+  function paintUnits() {
+    const result = computeUnits();
+    MB.set("fu-ipc", result.ipc.toFixed(2));
+    MB.set("fu-limit", UNIT_NAME[result.limit.key]);
+    MB.set("fu-alu", MB.pct(result.aluFraction, 0));
+    unitsView.redraw();
+  }
+  ["load", "store", "branch", "mul"].forEach((key) => MB.range("fu-" + key, (v) => { mix[key] = v; paintUnits(); }, (v) => MB.pct(v, 0)));
+  MB.seg("#fu-width", (v) => { dispatchWidth = +v; paintUnits(); });
+  paintUnits();
+
+  /* =================================================== 그림 2-5: top-down 슬롯 모델 (설명용 모델, 측정값 아님) */
+  const TOPDOWN_WIDTH = 8;                 // 리네임 폭 = 사이클당 슬롯 수
+  const TOPDOWN_INSTRUCTIONS = 20000;      // 막대 그래프에 쓰는 명령 수
+  const TOPDOWN_GRID_CYCLES = 120;         // 위 띠에 그리는 사이클 수
+  const ICACHE_MISS_CYCLES = 12;           // 모델에서 명령 캐시 미스 하나가 막는 사이클
+  const TOPDOWN_CAUSES = [
+    { key: "NoStall", label: "NoStall (일함)", color: "ok" },
+    { key: "FetchFragBubble", label: "FetchFragBubble", color: "accent-2" },
+    { key: "TAGEMissBubble", label: "TAGEMissBubble", color: "bad" },
+    { key: "ICacheMissBubble", label: "ICacheMissBubble", color: "warn" },
+    { key: "LoadMemStall", label: "LoadMemStall", color: "color-purple" },
+  ];
+  const topdownSettings = { run: 8, mpki: 4, penalty: 10, icache: 1, memory: 2, latency: 60, rob: 352 };
+  let topdownResult = null;
+  /** 사건 빈도로 슬롯을 원인별로 칠한다. 같은 시드를 쓰므로 같은 설정이면 같은 결과가 나온다. */
+  function simulateTopdown(settings) {
+    const random = MB.rng(2024);
+    const counts = {};
+    TOPDOWN_CAUSES.forEach((cause) => { counts[cause.key] = 0; });
+    const grid = [];
+    let delivered = 0, cycles = 0, untilTaken = 0, stallCycles = 0, stallCause = null;
+    const drawRun = () => 1 + Math.floor(-Math.log(1 - random()) * (settings.run - 1));
+    untilTaken = drawRun();
+    while (delivered < TOPDOWN_INSTRUCTIONS) {
+      const column = [];
+      if (stallCycles > 0) {
+        for (let lane = 0; lane < TOPDOWN_WIDTH; lane++) column.push(stallCause);
+        counts[stallCause] += TOPDOWN_WIDTH;
+        stallCycles--;
+      } else {
+        const supplied = Math.min(TOPDOWN_WIDTH, untilTaken);
+        let pendingCause = null, pendingCycles = 0;
+        for (let lane = 0; lane < TOPDOWN_WIDTH; lane++) {
+          if (lane < supplied) {
+            column.push("NoStall"); counts.NoStall++; delivered++;
+            // 이 명령이 일으키는 사건. 한 사이클에 사건이 여럿이면 가장 긴 것을 남긴다.
+            const roll = random() * 1000;
+            let cause = null, length = 0;
+            if (roll < settings.mpki) { cause = "TAGEMissBubble"; length = settings.penalty; }
+            else if (roll < settings.mpki + settings.icache) { cause = "ICacheMissBubble"; length = ICACHE_MISS_CYCLES; }
+            else if (roll < settings.mpki + settings.icache + settings.memory) {
+              cause = "LoadMemStall"; length = Math.max(0, Math.round(settings.latency - settings.rob / TOPDOWN_WIDTH));
+            }
+            if (cause && length > pendingCycles) { pendingCause = cause; pendingCycles = length; }
+          } else { column.push("FetchFragBubble"); counts.FetchFragBubble++; }
+        }
+        untilTaken -= supplied;
+        if (untilTaken <= 0) untilTaken = drawRun();
+        if (pendingCycles > 0) { stallCause = pendingCause; stallCycles = pendingCycles; }
+      }
+      if (grid.length < TOPDOWN_GRID_CYCLES) grid.push(column);
+      cycles++;
+    }
+    const totalSlots = cycles * TOPDOWN_WIDTH;
+    return { counts, grid, cycles, totalSlots, ipc: delivered / cycles };
+  }
+  const topdownCanvas = MB.canvas("#cv-topdown", { aspect: 0.5, minHeight: 300, maxHeight: 420, draw: drawTopdown });
+  function drawTopdown(ctx, width, height) {
+    if (!topdownResult) return;
+    const colorOf = {};
+    TOPDOWN_CAUSES.forEach((cause) => { colorOf[cause.key] = MB.css(cause.color); });
+    // 위: 슬롯 격자
+    const gridTop = 10, cell = Math.min((width - 20) / TOPDOWN_GRID_CYCLES, 9);
+    topdownResult.grid.forEach((column, cycle) => {
+      column.forEach((cause, lane) => {
+        ctx.fillStyle = cause === "NoStall" ? MB.alpha(colorOf[cause], 0.75) : colorOf[cause];
+        ctx.fillRect(10 + cycle * cell, gridTop + lane * cell, Math.max(1, cell - 0.6), Math.max(1, cell - 0.6));
+      });
+    });
+    MB.text(ctx, "처음 120사이클 (세로 8칸 = 리네임 폭)", 10, gridTop + TOPDOWN_WIDTH * cell + 12, { size: 11, color: MB.css("text-dim") });
+    // 아래: 원인별 막대
+    const barTop = gridTop + TOPDOWN_WIDTH * cell + 30;
+    const rowHeight = (height - barTop - 8) / TOPDOWN_CAUSES.length;
+    const labelWidth = width < 560 ? 112 : 150;
+    TOPDOWN_CAUSES.forEach((cause, index) => {
+      const share = topdownResult.counts[cause.key] / topdownResult.totalSlots;
+      const y = barTop + index * rowHeight;
+      MB.text(ctx, cause.label, labelWidth - 8, y + rowHeight / 2, { align: "right", size: width < 560 ? 9.5 : 11.5, mono: true });
+      const full = width - labelWidth - 60;
+      ctx.fillStyle = colorOf[cause.key];
+      MB.roundRect(ctx, labelWidth, y + rowHeight * 0.2, Math.max(2, full * share), rowHeight * 0.6, 4); ctx.fill();
+      MB.text(ctx, MB.pct(share, 1), labelWidth + full * share + 6, y + rowHeight / 2, { size: 11.5, mono: true, color: MB.css("text-dim") });
+    });
+  }
+  function paintTopdown() {
+    topdownResult = simulateTopdown(topdownSettings);
+    MB.set("td-ipc", topdownResult.ipc.toFixed(2));
+    MB.set("td-retire", MB.pct(topdownResult.counts.NoStall / topdownResult.totalSlots, 1));
+    const losses = TOPDOWN_CAUSES.filter((cause) => cause.key !== "NoStall");
+    const worst = losses.reduce((a, b) => (topdownResult.counts[b.key] > topdownResult.counts[a.key] ? b : a));
+    MB.set("td-top", `<span class="mono" style="font-size:14px">${worst.key}</span>`);
+    topdownCanvas.redraw();
+  }
+  MB.range("td-run", (v) => { topdownSettings.run = v; paintTopdown(); });
+  MB.range("td-mpki", (v) => { topdownSettings.mpki = v; paintTopdown(); });
+  MB.range("td-penalty", (v) => { topdownSettings.penalty = v; paintTopdown(); });
+  MB.range("td-icache", (v) => { topdownSettings.icache = v; paintTopdown(); });
+  MB.range("td-memory", (v) => { topdownSettings.memory = v; paintTopdown(); });
+  MB.range("td-latency", (v) => { topdownSettings.latency = v; paintTopdown(); });
+  MB.seg("#td-rob", (v) => { topdownSettings.rob = +v; paintTopdown(); });
+  paintTopdown();
+})();
+</script>
+</body>
+</html>

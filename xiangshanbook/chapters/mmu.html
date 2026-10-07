@@ -1,0 +1,955 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>가상 메모리: TLB와 PTW · XiangShanBook</title>
+<meta name="description" content="XiangShan 곤명호 v3의 MMU. Sv39/Sv48 페이지 워크, 섹터 L1 TLB, L2TLB의 페이지 캐시와 PTW·LLPTW·HPTW, 하이퍼바이저 2단계 변환, 권한 검사와 페이지 폴트를 직접 따라가 본다.">
+<link rel="icon" type="image/svg+xml" href="../favicon.svg">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/common.js"></script>
+<style>
+  .bit-editor { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; }
+  .bit-editor label { display: inline-flex; gap: 5px; align-items: center; font-family: var(--mono); font-size: 13px; color: var(--text-dim); cursor: pointer; }
+  .bit-editor input { accent-color: var(--accent); }
+  .va-input { font-family: var(--mono); font-size: 14px; padding: 6px 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg-elev); color: var(--text); width: 100%; }
+  .result-chip { display: inline-block; font-family: var(--mono); font-weight: 700; font-size: 13px; padding: 2px 9px; border-radius: 999px; }
+  .result-chip.allowed { background: color-mix(in srgb, var(--ok) 16%, transparent); color: var(--ok); }
+  .result-chip.fault { background: color-mix(in srgb, var(--bad) 14%, transparent); color: var(--bad); }
+  .check-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px 16px; }
+  .reason-list { margin: 6px 0 0; padding-left: 18px; font-size: 14px; }
+</style>
+</head>
+<body data-chapter="mmu">
+<main class="chapter">
+  <header class="chapter-hero">
+    <div class="eyebrow">Chapter 11</div>
+    <h1>가상 메모리: TLB와 PTW</h1>
+    <p class="lead">프로그램이 쓰는 주소는 가짜다. 운영체제는 프로세스마다 0번지부터 시작하는 넓은 가상 주소 공간을 주고, 그 주소가 실제 DRAM의 어디에 해당하는지는 메모리 안의 <span class="term">페이지 테이블</span><span class="en">(page table)</span>에 적어 둔다. 적재·저장·인출 명령은 매번 이 표를 거쳐 주소를 바꿔야 한다. 그런데 표를 메모리에서 서너 번씩 읽으면 명령 하나가 수백 사이클을 기다리게 된다. XiangShan은 변환 결과를 <b>TLB</b>에 담아 두고, TLB에 없을 때만 <b>L2TLB</b>의 페이지 캐시와 페이지 테이블 워커<span class="en">(PTW)</span>로 표를 걷는다. 이 장에서는 그 길을 비트 단위로 따라간다.</p>
+    <ul class="objectives">
+      <li>Sv39·Sv48 가상 주소를 VPN 조각과 페이지 오프셋으로 나누고, PTE의 각 비트가 무슨 뜻인지 읽는다.</li>
+      <li>페이지 워크가 단계마다 PTE를 읽고, 리프나 폴트에서 멈추는 과정을 장난감 페이지 테이블로 직접 걸어 본다.</li>
+      <li>48엔트리 완전 연관 L1 TLB가 '섹터' 엔트리 하나로 연속 페이지 8개를 덮는 이유를 히트율 실험으로 확인한다.</li>
+      <li>L2TLB의 페이지 캐시 계층(l3·l2·l1·l0·sp)과 PTW·LLPTW·HPTW의 분업을 이해한다.</li>
+      <li>하이퍼바이저 2단계 변환의 중첩 워크가 최악 24번의 메모리 접근이 되는 이유를 계산한다.</li>
+      <li>U/S 모드, SUM, MXR, A/D 비트가 권한 검사와 페이지 폴트 종류를 어떻게 정하는지 실험한다.</li>
+    </ul>
+  </header>
+
+  <!-- ============================================================ 1 -->
+  <section id="address">
+    <h2>가상 주소를 쪼개는 법</h2>
+    <p>RISC-V의 페이지 기반 가상 메모리는 페이지 크기 4 KiB(12비트 오프셋)를 기본으로 하고, 가상 페이지 번호<span class="en">(VPN)</span>를 9비트씩 잘라 단계별 표의 인덱스로 쓴다. 9비트인 이유는 간단하다. 표 하나가 4 KiB 페이지 한 장이고, PTE 하나가 8바이트라서 한 표에 PTE가 정확히 512 = 2<sup>9</sup>개 들어간다. <b>Sv39</b>는 9비트 조각 3개(39 = 12 + 9×3), <b>Sv48</b>은 4개(48 = 12 + 9×4)를 쓴다. XiangShan 곤명호 v3는 기본 설정에서 Sv48을 켜 두었고(<code>EnableSv48 = true</code>), 하이퍼바이저 확장도 켜져 있다(<code>HasHExtension = true</code>).</p>
+    <div class="table-wrap"><table>
+      <tr><th>항목</th><th>값</th><th>위치</th></tr>
+      <tr><td>지원 변환 모드</td><td class="mono">Bare, Sv39, Sv48 (2단계는 Sv39x4, Sv48x4)</td><td class="mono">cache/mmu/MMUConst.scala:192-196</td></tr>
+      <tr><td>단계 수 (Level 최대값)</td><td class="mono">Sv48이면 3, 아니면 2 → 단계 4개 / 3개</td><td class="mono">MMUConst.scala:139</td></tr>
+      <tr><td>물리 주소 폭 (PAddrBits)</td><td class="mono">48비트 → PPN 36비트</td><td class="mono">system/SoC.scala:57</td></tr>
+      <tr><td>가상 주소 폭 (VAddrBits)</td><td class="mono">H 확장 + Sv48이면 50비트 (게스트 물리 주소 Sv48x4 폭)</td><td class="mono">xiangshan/Parameters.scala:694-706</td></tr>
+      <tr><td>ASID / VMID 폭</td><td class="mono">16 / 14비트</td><td class="mono">Parameters.scala:72-74</td></tr>
+      <tr><td>PMP / PMA 엔트리</td><td class="mono">각 64개 정의, 실제 구현 32개, 4 KiB 단위</td><td class="mono">xiangshan/PMParameters.scala:29-34</td></tr>
+    </table></div>
+    <p>PTE는 64비트다. 아래 그림에서 가상 주소와 PTE의 비트 배치를 직접 만져 보자. 곤명호 v3의 물리 주소는 48비트라서 PTE의 44비트 PPN 칸 중 하위 36비트만 쓴다. 상위 8비트에 1이 있으면 <b>접근 폴트</b><span class="en">(access fault)</span>가 난다.</p>
+
+    <figure class="play" id="fig-split">
+      <div class="play-ctrl" style="border-top:0;border-bottom:1px solid var(--border)">
+        <div class="seg" id="split-mode"><button data-value="sv39">Sv39</button><button data-value="sv48" class="on">Sv48</button></div>
+        <label class="ctrl"><span>가상 주소 (16진수)</span><input class="va-input" id="split-va" value="0x0000_7F3A_5C61_2ABC"></label>
+        <button class="btn sm" id="split-random">무작위 주소</button>
+      </div>
+      <div class="play-view"><canvas id="cv-split"></canvas></div>
+      <div class="info-panel" id="split-info">비트 칸을 누르면 그 조각의 의미가 여기에 나온다.</div>
+      <figcaption><span class="try">눌러 보기</span>위 막대는 가상 주소, 아래 막대는 PTE 한 개다. 가상 주소의 색 조각 하나가 각 단계 표의 인덱스가 된다. 오프셋 12비트는 변환되지 않고 물리 주소로 그대로 내려간다. Sv39에서는 비트 38이 그 위 비트들과 같아야 한다(부호 확장). 다르면 주소 자체가 잘못된 것이므로 표를 볼 필요도 없이 폴트가 난다. 아래 PTE 막대를 누르면 각 비트의 뜻이 나온다.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ============================================================ 2 -->
+  <section id="walk">
+    <h2>페이지 워크: 표를 한 칸씩 내려가기</h2>
+    <p>TLB에 변환 결과가 없으면 하드웨어가 직접 표를 걷는다. <code>satp</code> CSR이 가리키는 최상위 표에서 시작해, VPN 조각으로 고른 PTE를 읽는다. PTE의 R·W·X가 모두 0이면 '다음 단계 표를 가리키는 포인터'(non-leaf)이고, 하나라도 1이면 <span class="term">리프</span><span class="en">(leaf)</span>다. 리프를 만나면 걷기가 끝난다. 리프가 마지막 단계보다 위에서 나오면 그 PTE는 2 MiB, 1 GiB, 512 GiB짜리 <span class="term">슈퍼페이지</span><span class="en">(superpage)</span>를 뜻한다.</p>
+    <div class="callout code"><strong>리프인가, 포인터인가, 폴트인가</strong>
+      <p>PTW는 PTE를 받을 때마다 세 가지를 판정한다. 리프면 끝, 접근 폴트나 페이지 폴트면 끝, 그렇지 않으면 한 단계 내려간다. 단계 1에서 아직 포인터라면 마지막(4 KiB) 단계는 LLPTW에게 넘긴다.</p>
+<pre><code><span class="c">// src/main/scala/xiangshan/cache/mmu/PageTableWalker.scala:192-194, 278</span>
+<span class="k">val</span> pageFault   = pte.isPf(level, s1Pbmte)
+<span class="k">val</span> find_pte    = pte.isLeaf() || ppn_af || pageFault
+<span class="k">val</span> to_find_pte = level === 1.U && find_pte === false.B
+...
+io.llptw.valid := s_llptw_req === false.B && to_find_pte && !accessFaultMpt && !guestFault</code></pre>
+    </div>
+    <p>XiangShan이 PTE를 받자마자 폴트로 판정하는 조건은 <code>MMUBundle.scala</code>의 <code>isPf</code>에 모여 있다. 예약 비트가 0이 아닐 때, PBMT 값이 3(예약)일 때, 포인터 PTE에 U·A·D·N이나 PBMT가 켜져 있을 때, V=0이거나 W=1인데 R=0일 때가 해당한다. 또 NAPOT 비트(N)는 64 KiB 페이지 하나만 지원한다. 그래서 N=1이면서 PPN 하위 4비트가 <code>1000</code>이 아니거나 리프가 단계 0이 아니면 폴트다. 슈퍼페이지의 PPN 하위 비트가 0으로 정렬되어 있지 않아도 폴트가 난다.</p>
+
+    <div class="sim" id="sim-walk">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>장난감 페이지 테이블 걷기</h3>
+        <div class="seg" id="walk-mode"><button data-value="sv39">Sv39</button><button data-value="sv48" class="on">Sv48</button></div>
+      </div>
+      <div class="sim-view"><canvas id="cv-walk"></canvas></div>
+      <div class="sim-controls">
+        <label class="ctrl"><span>시나리오</span>
+          <select id="walk-scenario">
+            <option value="normal">4 KiB 페이지 (정상)</option>
+            <option value="mega">2 MiB 슈퍼페이지</option>
+            <option value="giga">1 GiB 슈퍼페이지</option>
+            <option value="napot">64 KiB NAPOT 페이지</option>
+            <option value="misaligned">정렬 안 된 2 MiB 슈퍼페이지</option>
+            <option value="invalid">중간 단계 PTE가 V=0</option>
+            <option value="writeonly">W=1, R=0인 리프</option>
+            <option value="pointerA">A 비트가 켜진 포인터 PTE</option>
+            <option value="toohigh">PPN이 48비트 물리 주소를 넘음</option>
+          </select></label>
+        <div class="ctrl"><span>걷기</span><div class="ctrl-row">
+          <button class="btn sm" id="walk-reset">⏮ 처음</button>
+          <button class="btn sm primary" id="walk-step">한 단계 →</button>
+          <button class="btn sm" id="walk-run">끝까지 ⏭</button>
+        </div></div>
+      </div>
+      <div class="info-panel" id="walk-info"></div>
+      <div class="sim-note"><b>지금 읽은 PTE 고치기</b> <span class="dim small">(바꾸면 그 단계부터 다시 판정한다)</span>
+        <div class="bit-editor" id="walk-editor" style="margin-top:8px"></div>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">메모리 접근 횟수</span><span class="v" id="walk-accesses">0</span></div>
+        <div class="stat"><span class="k">현재 단계</span><span class="v" id="walk-level">—</span></div>
+        <div class="stat"><span class="k">결과</span><span class="v" id="walk-result">—</span></div>
+        <div class="stat"><span class="k">물리 주소</span><span class="v" id="walk-pa">—</span></div>
+      </div>
+      <figcaption><span class="try">따라가 보기</span>왼쪽 위가 가상 주소, 그 아래 상자들이 단계별 페이지 테이블이다. '한 단계'를 누를 때마다 PTW가 표 하나를 읽는다. PTE 주소는 (그 표의 PPN × 4096) + (VPN 조각 × 8)이다. 읽은 PTE가 포인터면 그 PPN이 다음 표가 된다. 리프면 PPN에 남은 VPN 조각과 오프셋을 붙여 물리 주소를 만든다. 시나리오를 바꾸거나 아래 칸에서 PTE 비트를 직접 고쳐서 어떤 조건에서 폴트가 나는지 확인하자. 이 장난감 표는 이 가상 주소가 지나가는 칸만 채워 두었다.</figcaption>
+    </div>
+
+    <div class="predict"><strong>슈퍼페이지는 워크를 얼마나 줄일까</strong>
+      <p>Sv48에서 4 KiB 페이지 하나를 찾으려면 PTE를 4번 읽는다. 1 GiB 슈퍼페이지라면 몇 번일까? 그리고 TLB 엔트리 하나가 덮는 주소 범위는 몇 배가 될까?</p>
+      <details><summary>답 보기</summary><p>단계 3(최상위)과 단계 2의 PTE만 읽으면 단계 2에서 리프가 나오므로 2번이다. 엔트리 하나가 4 KiB 대신 1 GiB를 덮으니 범위는 2<sup>18</sup> = 262,144배가 된다. 데이터베이스나 가상 머신처럼 큰 메모리를 쓰는 프로그램이 큰 페이지를 반기는 이유다. 시뮬레이터에서 '1 GiB 슈퍼페이지'를 골라 접근 횟수를 확인해 보자.</p></details>
+    </div>
+  </section>
+
+  <!-- ============================================================ 3 -->
+  <section id="tlb">
+    <h2>L1 TLB: 섹터 엔트리 48개</h2>
+    <p>페이지 워크를 매번 할 수는 없다. 곤명호 v3는 인출 쪽에 <b>ITLB</b> 하나, 메모리 쪽에 <b>DTLB</b> 셋을 둔다. DTLB는 적재용, 저장용, 프리페처용이다. 모두 48엔트리 완전 연관<span class="en">(fully associative)</span> 구조이고 교체 정책은 PLRU다. 적재 DTLB는 적재 유닛과 일부 프리페처가 함께 쓰고, 프리페치 DTLB는 SMS와 L2 프리페처의 요청을 받는다.</p>
+    <div class="table-wrap"><table>
+      <tr><th>TLB</th><th>엔트리</th><th>연관도·교체</th><th>위치</th></tr>
+      <tr><td>ITLB (인출)</td><td class="num">48</td><td class="mono">fa · plru, 포트 1개</td><td class="mono">Parameters.scala:218-224, frontend/Frontend.scala:194</td></tr>
+      <tr><td>적재 DTLB</td><td class="num">48</td><td class="mono">fa · plru</td><td class="mono">Parameters.scala:226-234, mem/MemBlock.scala:654</td></tr>
+      <tr><td>저장 DTLB</td><td class="num">48</td><td class="mono">fa · plru</td><td class="mono">Parameters.scala:235-243, MemBlock.scala:655</td></tr>
+      <tr><td>프리페치 DTLB</td><td class="num">48</td><td class="mono">fa · plru</td><td class="mono">Parameters.scala:253-261, MemBlock.scala:656</td></tr>
+    </table></div>
+    <p>XiangShan TLB의 특징은 <span class="term">섹터 엔트리</span><span class="en">(sector entry)</span>다. 엔트리 하나의 태그는 VPN에서 하위 3비트를 뺀 값이다. 그 대신 연속한 가상 페이지 8개에 대해 '유효 비트 8개'와 'PPN 하위 3비트 8개'를 따로 가진다. L2TLB가 PTE를 64바이트 캐시 라인 단위, 곧 PTE 8개씩 읽어 오므로, 그 8개를 한 엔트리에 한꺼번에 넣는 것이다. 순서대로 메모리를 훑는 프로그램이라면 엔트리 하나로 페이지 8개를 해결한다.</p>
+    <div class="callout code"><strong>TlbSectorEntry</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/cache/mmu/MMUBundle.scala:181-200</span>
+<span class="k">class</span> TlbSectorEntry(pageNormal: Boolean, pageSuper: Boolean) <span class="k">extends</span> TlbBundle {
+  <span class="k">val</span> tag      = UInt(sectorvpnLen.W)        <span class="c">// VPN에서 하위 3비트를 뺀 태그</span>
+  <span class="k">val</span> asid     = UInt(asidLen.W)
+  <span class="k">val</span> level    = Some(UInt(2.W))             <span class="c">// 11: 512GB, 10: 1GB, 01: 2MB, 00: 4KB</span>
+  <span class="k">val</span> ppn      = UInt(sectorppnLen.W)
+  ...
+  <span class="k">val</span> valididx = Vec(tlbcontiguous, Bool())    <span class="c">// tlbcontiguous = 8</span>
+  <span class="k">val</span> pteidx   = Vec(tlbcontiguous, Bool())
+  <span class="k">val</span> ppn_low  = Vec(tlbcontiguous, UInt(sectortlbwidth.W))</code></pre>
+    </div>
+
+    <div class="sim" id="sim-tlb">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>TLB 히트율 실험</h3>
+        <div class="seg" id="tlb-pattern"><button data-value="sequential" class="on">순차 스트림</button><button data-value="stride16">64 KiB 간격</button><button data-value="random">무작위</button><button data-value="hot">90/10 핫셋</button></div>
+      </div>
+      <div class="sim-view"><canvas id="cv-tlb"></canvas></div>
+      <div class="sim-controls">
+        <label class="ctrl"><span>TLB 엔트리 수 <output id="tlb-entries-out"></output></span><input type="range" id="tlb-entries" min="8" max="128" step="8" value="48"></label>
+        <label class="ctrl"><span>작업 집합 <output id="tlb-working-out"></output></span><input type="range" id="tlb-working" min="4" max="14" step="1" value="10"></label>
+        <div class="ctrl"><span>페이지 크기</span><div class="seg" id="tlb-page"><button data-value="4k" class="on">4 KiB</button><button data-value="2m">2 MiB 슈퍼페이지</button></div></div>
+        <div class="ctrl"><span>엔트리 방식</span><div class="seg" id="tlb-sector"><button data-value="sector" class="on">섹터 (8페이지)</button><button data-value="single">페이지 하나</button></div></div>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">히트율</span><span class="v" id="tlb-hit">—</span></div>
+        <div class="stat"><span class="k">접근 1000회당 미스</span><span class="v" id="tlb-mpki">—</span></div>
+        <div class="stat"><span class="k">TLB가 덮는 범위</span><span class="v" id="tlb-reach">—</span></div>
+      </div>
+      <figcaption><span class="try">만져 보기</span>64바이트씩 메모리를 읽는 접근 2만 번을 TLB 모델에 흘려 보낸다. 곡선은 엔트리 수에 따른 히트율이다. 실선은 섹터 엔트리, 점선은 페이지 하나짜리 엔트리이고, 세로 점선이 현재 엔트리 수다. 순차 스트림에서는 섹터 엔트리 덕에 미스가 8분의 1로 준다. 64 KiB 간격(16페이지마다 한 번)으로 건너뛰면 한 섹터 안에서 한 페이지만 쓰이므로 섹터의 이득이 사라진다. 교체는 실제 RTL의 PLRU 대신 LRU로 근사했다. 섹터의 8페이지가 모두 유효하고 물리적으로도 연속이라고 가정했다.</figcaption>
+    </div>
+  </section>
+
+  <!-- ============================================================ 4 -->
+  <section id="l2tlb">
+    <h2>L2TLB: 페이지 캐시와 세 명의 워커</h2>
+    <p>L1 TLB가 놓친 요청은 L2TLB로 간다. L2TLB는 큰 TLB 하나가 아니다. 페이지 테이블의 <b>각 단계를 따로 캐싱</b>하는 페이지 캐시<span class="en">(page cache)</span>가 있고, 그 뒤에 성격이 다른 워커 셋이 붙어 있다.</p>
+    <div class="table-wrap"><table>
+      <tr><th>페이지 캐시</th><th>무엇을 담나</th><th>구성</th><th class="num">덮는 범위</th></tr>
+      <tr><td class="mono">l3</td><td>Sv48 최상위 포인터 PTE</td><td class="mono">16엔트리 fa · plru</td><td class="num">엔트리당 512 GiB</td></tr>
+      <tr><td class="mono">l2</td><td>단계 2 포인터 PTE</td><td class="mono">16엔트리 fa · plru</td><td class="num">엔트리당 1 GiB</td></tr>
+      <tr><td class="mono">l1</td><td>단계 1 포인터 PTE, 8개 묶음</td><td class="mono">4세트 × 2웨이 SRAM</td><td class="num">8 × 2 MiB × 8 = 128 MiB</td></tr>
+      <tr><td class="mono">l0</td><td>단계 0 리프 PTE, 8개 묶음</td><td class="mono">64세트 × 4웨이 SRAM</td><td class="num">8 × 4 KiB × 256 = 8 MiB</td></tr>
+      <tr><td class="mono">sp</td><td>슈퍼페이지 리프</td><td class="mono">16엔트리 fa · plru</td><td class="num">엔트리당 2 MiB 이상</td></tr>
+    </table></div>
+    <p class="small dim">구성은 <code>MMUConst.scala:44-92</code>의 <code>L2TLBParameters</code> 기본값, 묶음 크기는 같은 파일 305-316행(64바이트 라인 ÷ 8바이트 PTE = 8)에서 왔다.</p>
+    <p>워커의 분업은 <code>PageTableWalker.scala</code> 첫머리 주석에 그대로 적혀 있다. <b>PTW</b>는 상태 기계 하나로, 리프가 아닌 위쪽 단계(1 GiB, 2 MiB 수준)를 한 번에 하나씩 걷는다. <b>LLPTW</b><span class="en">(Last Level PTW)</span>는 마지막 4 KiB 단계만 맡되, 기본 6개(<code>llptwsize = 6</code>) 요청을 동시에 처리한다. 마지막 단계는 요청이 가장 많고 서로 독립적이어서 병렬화하기 좋기 때문이다. <b>HPTW</b>는 하이퍼바이저 2단계 변환에서 게스트 물리 주소를 호스트 물리 주소로 바꾸는 G-stage 워크를 맡는다. 페이지 캐시에서 단계 1 포인터까지 적중한 요청은 PTW를 건너뛰고 곧바로 LLPTW로 간다. 그보다 위에서 놓친 요청은 미스 큐를 거쳐 PTW로 간다.</p>
+    <p>L2TLB에는 단순한 <b>다음 라인 프리페처</b>도 있다. 요청이 페이지 캐시에서 놓치면, 그 VPN이 속한 8페이지 묶음의 <b>다음 묶음</b>을 미리 걷는다(<code>L2TlbPrefetch.scala:45</code>, <code>get_next_line</code>). 최근 요청 4개를 기억해 같은 프리페치를 되풀이하지 않는다.</p>
+
+    <div class="sim" id="sim-l2tlb">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>L2TLB 페이지 캐시 적중 분포</h3>
+        <div class="seg" id="l2-pattern"><button data-value="sequential" class="on">순차 페이지</button><button data-value="random">무작위</button><button data-value="stride">2 MiB 간격</button></div>
+      </div>
+      <div class="sim-view"><canvas id="cv-l2tlb"></canvas></div>
+      <div class="sim-controls">
+        <label class="ctrl"><span>접근 영역 크기 <output id="l2-region-out"></output></span><input type="range" id="l2-region" min="20" max="38" step="1" value="30"></label>
+        <div class="ctrl"><span>다음 라인 프리페치</span><div class="seg" id="l2-prefetch"><button data-value="on" class="on">켬</button><button data-value="off">끔</button></div></div>
+        <div class="ctrl"><span>변환 모드</span><div class="seg" id="l2-mode"><button data-value="sv39">Sv39</button><button data-value="sv48" class="on">Sv48</button></div></div>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">요청당 평균 메모리 접근</span><span class="v" id="l2-average">—</span></div>
+        <div class="stat"><span class="k">l0 적중 (워크 없음)</span><span class="v" id="l2-l0hit">—</span></div>
+        <div class="stat"><span class="k">프리페치 접근</span><span class="v" id="l2-prefetch-count">—</span></div>
+      </div>
+      <figcaption><span class="try">만져 보기</span>L1 TLB에서 놓친 요청 4,000개가 L2TLB에 들어왔다고 가정한다. 위쪽 막대는 요청마다 '어느 페이지 캐시에서 처음 적중했는가'의 비율이다. 아래 상자는 각 경우에 실제로 메모리를 몇 번 읽는지 보여 준다. l0 적중이면 0번(리프가 이미 있음), l1 적중이면 LLPTW가 1번, l2 적중이면 PTW가 2번 읽는다. 영역을 넓히면 l0·l1이 감당하지 못하고 위쪽 단계까지 놓친다. 순차 접근에서 프리페치를 끄면 8페이지마다 한 번씩 l0 미스가 난다(요청 4,000개 중 l0 적중 3,500개). 켜면 16페이지마다 한 번으로 줄어든다(3,750개). 프리페치는 미스가 난 요청의 다음 묶음만 당겨 오기 때문이다. 모델은 4 KiB 페이지만 쓰고, 교체는 LRU로 근사했다.</figcaption>
+    </div>
+  </section>
+
+  <!-- ============================================================ 5 -->
+  <section id="twostage">
+    <h2>가상 머신 안의 가상 메모리: 2단계 변환</h2>
+    <p>하이퍼바이저 확장을 켜면 주소 변환이 두 겹이 된다. 게스트 운영체제는 자기 페이지 테이블(<code>vsatp</code>)로 게스트 가상 주소를 <b>게스트 물리 주소</b><span class="en">(GPA)</span>로 바꾼다. 이것이 VS-stage다. 하이퍼바이저는 또 다른 표(<code>hgatp</code>)로 GPA를 진짜 물리 주소로 바꾼다. 이것이 G-stage다. 문제는 게스트 페이지 테이블 자체도 게스트 물리 주소에 있다는 점이다. 그래서 VS-stage의 PTE를 하나 읽을 때마다 그 PTE의 주소부터 G-stage로 변환해야 한다.</p>
+    <p>XiangShan은 이 상황을 2비트 <code>s2xlate</code>로 구분한다. <code>noS2xlate</code>(변환 겹침 없음), <code>onlyStage1</code>, <code>onlyStage2</code>, <code>allStage</code>의 넷이다(<code>MMUConst.scala:182-185</code>). 가상화 모드에서 <code>vsatp</code>와 <code>hgatp</code>가 둘 다 켜져 있으면 <code>allStage</code>다. G-stage는 게스트 물리 주소가 2비트 더 넓어서(Sv39x4는 41비트, Sv48x4는 50비트) 최상위 표가 4배 크다.</p>
+    <div class="formula">$$N_{\text{접근}} = n\,(m + 1) + m = (n + 1)(m + 1) - 1$$
+      <div class="where">\(n\): VS-stage 단계 수, \(m\): G-stage 단계 수. VS-stage의 PTE \(n\)개를 읽을 때마다 그 주소를 G-stage로 \(m\)번 걸어 바꾸고 1번 읽는다. 마지막으로 얻은 게스트 물리 주소도 G-stage로 \(m\)번 더 걸어야 한다. Sv48 위에 Sv48x4면 \(5 \times 5 - 1 = 24\)번, Sv39 위에 Sv39x4면 \(4 \times 4 - 1 = 15\)번이다.</div></div>
+
+    <figure class="play" id="fig-nested">
+      <div class="play-view"><canvas id="cv-nested"></canvas></div>
+      <div class="play-ctrl">
+        <div class="ctrl"><span>VS-stage (게스트)</span><div class="seg" id="nested-vs"><button data-value="0">Bare</button><button data-value="3">Sv39</button><button data-value="4" class="on">Sv48</button></div></div>
+        <div class="ctrl"><span>G-stage (하이퍼바이저)</span><div class="seg" id="nested-g"><button data-value="0">Bare</button><button data-value="3">Sv39x4</button><button data-value="4" class="on">Sv48x4</button></div></div>
+        <label class="ctrl"><span>G-stage 캐시로 건너뛰는 단계 <output id="nested-skip-out"></output></span><input type="range" id="nested-skip" min="0" max="3" step="1" value="0"></label>
+        <div class="ctrl-row"><button class="btn sm" id="nested-play">▶ 순서대로 보기</button></div>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">메모리 접근 (최악)</span><span class="v" id="nested-worst">—</span></div>
+        <div class="stat"><span class="k">캐시 반영 후</span><span class="v" id="nested-cached">—</span></div>
+        <div class="stat"><span class="k">s2xlate</span><span class="v" id="nested-mode">—</span></div>
+      </div>
+      <figcaption><span class="try">만져 보기</span>행은 VS-stage의 각 단계와 마지막 GPA, 열은 그 주소를 바꾸는 G-stage 단계다. 칸 하나가 메모리 접근 한 번이다. 파란 칸은 G-stage PTE 읽기, 주황 칸은 VS-stage PTE 자체를 읽는 접근이다. '순서대로 보기'를 누르면 HPTW와 PTW가 번갈아 걷는 순서를 따라간다. 'G-stage 캐시로 건너뛰는 단계'는 L2TLB 페이지 캐시가 G-stage의 위쪽 단계를 이미 갖고 있다고 가정한 것이다. 실제로 곤명호 v3의 페이지 캐시는 엔트리마다 <code>h</code> 필드(2비트)로 어느 단계 변환의 결과인지 구분해 G-stage 결과도 함께 담는다.</figcaption>
+    </figure>
+    <div class="callout tip"><strong>왜 하이퍼바이저 워크 전용 HPTW가 따로 있나</strong>
+      <p>G-stage 워크는 VS-stage 워크 중간중간 끼어든다. PTW와 LLPTW는 각자 게스트 PTE 주소를 바꿔야 할 때 HPTW에 요청을 보내고(<code>hptw_req_arb</code>, <code>L2TLB.scala:170</code>), HPTW의 응답을 받아 자기 워크를 이어 간다. 워커를 나눠 두었기 때문에, 게스트 마지막 단계 요청 여러 개가 LLPTW에서 병렬로 진행되는 동안에도 G-stage 변환을 공유 자원 하나로 처리할 수 있다.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ 6 -->
+  <section id="permission">
+    <h2>권한 검사와 페이지 폴트</h2>
+    <p>변환에 성공해도 끝이 아니다. TLB는 리프 PTE의 권한 비트를 지금의 특권 모드와 접근 종류에 맞춰 검사한다. 핵심은 <code>TLB.scala</code>의 <code>perm_check</code>다.</p>
+    <div class="callout code"><strong>모드 검사와 접근별 권한</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/cache/mmu/TLB.scala:462-468</span>
+<span class="k">val</span> ldUpdate    = !perm.a && isLd                    <span class="c">// update A/D through exception</span>
+<span class="k">val</span> stUpdate    = (!perm.a || !perm.d) && isSt
+<span class="k">val</span> instrUpdate = !perm.a && isInst
+<span class="k">val</span> modeCheck = !(mode(idx) === ModeU && !perm.u ||
+                  mode(idx) === ModeS && perm.u && (!sum(idx) || ifetch))
+<span class="k">val</span> ldPermFail    = !(modeCheck && Mux(hlvx, perm.x, perm.r || mxr(idx) && perm.x))
+<span class="k">val</span> stPermFail    = !(modeCheck && perm.w)
+<span class="k">val</span> instrPermFail = !(modeCheck && perm.x)</code></pre>
+    </div>
+    <p>코드를 풀어 쓰면 다음과 같다. U 모드는 U=1인 페이지만 쓸 수 있다. S 모드는 U=1인 페이지를 기본적으로 못 쓴다. <code>sstatus.SUM</code>이 1이면 적재·저장은 허용되지만, 명령어 인출은 SUM과 무관하게 언제나 금지다. 적재는 R=1이어야 하는데, <code>MXR</code>이 켜져 있으면 실행 전용 페이지(X=1)도 읽을 수 있다. 하이퍼바이저의 <code>HLVX</code> 명령은 거꾸로 R이 아니라 X를 요구한다. 마지막으로 XiangShan은 A·D 비트를 하드웨어가 직접 고치지 않는다. A=0인 페이지에 접근하거나 D=0인 페이지에 쓰면 페이지 폴트를 내고, 운영체제가 비트를 세운 뒤 다시 실행하게 한다(코드 주석 "update A/D through exception").</p>
+
+    <figure class="play" id="fig-permission">
+      <div class="play-ctrl" style="border-top:0;border-bottom:1px solid var(--border)">
+        <div class="ctrl"><span>특권 모드</span><div class="seg" id="permission-mode"><button data-value="U">U</button><button data-value="S" class="on">S</button></div></div>
+        <div class="ctrl"><span>접근 종류</span><div class="seg" id="permission-access"><button data-value="load" class="on">적재</button><button data-value="store">저장</button><button data-value="fetch">인출</button><button data-value="hlvx">HLVX</button></div></div>
+      </div>
+      <div class="sim-note">
+        <div class="check-grid">
+          <div><b class="small">PTE 비트</b><div class="bit-editor" id="permission-pte" style="margin-top:6px"></div></div>
+          <div><b class="small">상태 비트</b><div class="bit-editor" id="permission-status" style="margin-top:6px"></div></div>
+        </div>
+      </div>
+      <div class="play-view"><canvas id="cv-permission"></canvas></div>
+      <div class="info-panel" id="permission-info"></div>
+      <figcaption><span class="try">눌러 보기</span>모드, 접근 종류, PTE 비트, SUM·MXR을 바꾸면 위 코드의 판정 순서대로 결과가 바뀐다. 그림의 사슬은 판정 순서이고, 처음 막힌 칸이 빨갛게 변한다. S 모드에서 U=1인 페이지를 SUM=1로 적재해 보고, 같은 조건에서 인출로 바꿔 보자. A나 D를 끄면 권한이 충분해도 '갱신 폴트'가 나는 것을 볼 수 있다. 2단계 변환의 G-stage 검사(<code>g_perm</code>)와 PMP·PMA 접근 폴트는 이 그림에서 뺐다.</figcaption>
+    </figure>
+
+    <h3>PMP와 PMA: 물리 주소에 대한 두 번째 문지기</h3>
+    <p>페이지 테이블이 가상 주소를 지킨다면, <b>PMP</b><span class="en">(Physical Memory Protection)</span>는 M 모드가 정한 물리 주소 영역 규칙을 지킨다. <b>PMA</b><span class="en">(Physical Memory Attributes)</span>는 주소 영역마다 캐시 가능 여부, 원자 연산 가능 여부, 실행 가능 여부 같은 성질을 정한다. 곤명호 v3는 PMP와 PMA를 각각 64개까지 정의할 수 있게 하고, 실제로는 32개씩 구현한다. 단위는 4 KiB다(<code>PMParameters.scala:29-34</code>). 기본 PMA 표는 <code>SoC.scala:58-73</code>에 있다. 엔트리마다 적힌 주소는 그 영역의 <b>끝</b>(TOR 방식)이다. 그래서 <code>PMAConfigEntry(0x80000000000L, c = true, atomic = true, ...)</code>는 0x8000_0000부터 0x7FF_FFFF_FFFF까지의 DDR 영역을 캐시 가능·원자 연산 가능·실행 가능으로 정한다. 같은 주소 지도가 <code>PMA.scala:114-143</code> 주석에 표로 정리되어 있다. TLB는 4 KiB 엔트리에 PMP 판정 결과 일부를 미리 담아 두는 '정적 PMP' 최적화도 쓴다(<code>partialStaticPMP = true</code>).</p>
+    <div class="callout deep"><strong>sfence.vma와 hfence</strong>
+      <p>운영체제가 페이지 테이블을 고친 뒤에는 TLB와 페이지 캐시에 남은 옛 변환을 지워야 한다. <code>sfence.vma rs1, rs2</code>에서 rs1이 0이 아니면 그 주소만, rs2가 0이 아니면 그 ASID만 지운다(<code>TLBStorage.scala:204-230</code>). 가상화 환경에서는 게스트용 <code>hfence.vvma</code>와 G-stage용 <code>hfence.gvma</code>가 따로 있다(<code>hv</code>, <code>hg</code> 비트). ASID는 16비트, VMID는 14비트다. 다만 L2TLB 페이지 캐시의 l1·l0는 ASID·VMID를 3비트로 해시해 저장한다(<code>hashAsidWidth = 3</code>). 해시가 같으면 지울 때 함께 지워질 수 있지만, 그 대가로 SRAM 폭을 크게 아낀다.</p>
+    </div>
+    <div class="callout warn"><strong>이 장에서 다루지 않은 것</strong>
+      <p>곤명호 v3는 기본 설정에서 <code>HasBitmapCheck = true</code>다. 그래서 페이지 워크에 메모리 격리용 비트맵 검사(<code>BitmapCheck.scala</code>, M 모드 CSR <code>mbmc</code>)가 끼어들 수 있다. 이 장의 시뮬레이터는 비트맵 검사가 꺼져 있다고 보고 그렸다.</p>
+    </div>
+  </section>
+
+  <section class="keypoints">
+    <h2>핵심 정리</h2>
+    <ol>
+      <li>Sv39·Sv48은 4 KiB 오프셋 아래로 VPN을 9비트씩 잘라 3단계·4단계 표의 인덱스로 쓴다. 곤명호 v3는 Sv48과 하이퍼바이저 확장을 기본으로 켜고, 물리 주소는 48비트다.</li>
+      <li>PTW는 PTE마다 리프·포인터·폴트를 판정한다. 예약 비트, 잘못된 PBMT, 포인터의 U/A/D, W만 있는 리프, 정렬 안 된 슈퍼페이지, 64 KiB가 아닌 NAPOT은 페이지 폴트다. PPN이 48비트 물리 주소를 넘으면 접근 폴트다.</li>
+      <li>L1 TLB는 ITLB 하나와 DTLB 셋(적재·저장·프리페치)이다. 모두 48엔트리 완전 연관이며, 엔트리 하나가 연속 페이지 8개를 덮는 섹터 구조다.</li>
+      <li>L2TLB는 단계별 페이지 캐시(l3·l2·l1·l0·sp) 뒤에 PTW(위쪽 단계, 하나씩), LLPTW(마지막 단계, 6개 병렬), HPTW(G-stage)를 둔다. 다음 라인 프리페처가 다음 8페이지 묶음을 미리 걷는다.</li>
+      <li>2단계 변환의 중첩 워크는 최악 (n+1)(m+1)−1번 메모리를 읽는다. Sv48+Sv48x4면 24번이다.</li>
+      <li>권한 검사는 U/S 모드, SUM(인출은 예외), MXR, HLVX 규칙을 따른다. A/D 비트는 하드웨어가 갱신하지 않고 페이지 폴트로 운영체제에 맡긴다.</li>
+    </ol>
+  </section>
+
+  <section id="quiz">
+    <h2>확인 퀴즈</h2>
+    <div class="quiz">
+      <div class="quiz-q" data-answer="2"><p>Q1. Sv48에서 VPN 조각 하나가 9비트인 이유는?</p><div class="opts">
+        <button class="opt">가상 주소가 48비트라서 4로 나누면 12비트, 거기서 3을 뺀 값이다</button><button class="opt">TLB 엔트리 수가 512개라서</button><button class="opt">4 KiB 표 한 장에 8바이트 PTE가 512개 들어가서</button><button class="opt">물리 주소 48비트를 맞추기 위해서</button></div>
+        <div class="quiz-exp">페이지 테이블 한 장은 4 KiB 페이지이고 PTE는 8바이트이므로 512 = 2<sup>9</sup>개가 들어간다. 그래서 단계마다 9비트가 인덱스가 된다.</div></div>
+      <div class="quiz-q" data-answer="1"><p>Q2. PTW가 단계 1에서 읽은 PTE가 여전히 포인터(R=W=X=0, V=1)라면 다음은?</p><div class="opts">
+        <button class="opt">페이지 폴트를 낸다</button><button class="opt">마지막 단계 워크를 LLPTW에 넘긴다</button><button class="opt">HPTW에 넘긴다</button><button class="opt">2 MiB 슈퍼페이지로 처리한다</button></div>
+        <div class="quiz-exp"><code>to_find_pte = level === 1.U && find_pte === false.B</code>이면 <code>io.llptw.valid</code>가 켜진다. PTW는 리프가 아닌 위쪽 단계만 걷고, 4 KiB 마지막 단계는 LLPTW가 병렬로 처리한다.</div></div>
+      <div class="quiz-q" data-answer="3"><p>Q3. 섹터 TLB 엔트리 하나가 연속 페이지 8개를 덮도록 만든 근거로 가장 알맞은 것은?</p><div class="opts">
+        <button class="opt">TLB 엔트리 수가 8의 배수라서</button><button class="opt">ASID가 3비트로 해시되기 때문에</button><button class="opt">LLPTW가 8개를 병렬로 처리하기 때문에</button><button class="opt">L2TLB가 PTE를 64바이트 라인(PTE 8개) 단위로 읽어 오기 때문에</button></div>
+        <div class="quiz-exp">64바이트 캐시 라인에는 8바이트 PTE가 8개 들어 있다. 한 번 읽은 8개를 한 엔트리에 담으면 같은 비용으로 페이지 8개를 덮는다. 페이지 캐시 l0·l1도 같은 8개 묶음을 쓴다.</div></div>
+      <div class="quiz-q" data-answer="0"><p>Q4. 게스트가 Sv48, 하이퍼바이저가 Sv48x4일 때 캐시가 모두 놓친 최악의 중첩 워크는 메모리를 몇 번 읽는가?</p><div class="opts">
+        <button class="opt">24번</button><button class="opt">16번</button><button class="opt">8번</button><button class="opt">20번</button></div>
+        <div class="quiz-exp">(n+1)(m+1)−1 = 5×5−1 = 24. VS-stage PTE 4개마다 G-stage 4번과 PTE 읽기 1번(5×4 = 20), 마지막 GPA의 G-stage 4번을 더하면 24번이다.</div></div>
+      <div class="quiz-q" data-answer="2"><p>Q5. S 모드에서 U=1인 페이지를 SUM=1 상태로 접근한다. 허용되지 않는 것은?</p><div class="opts">
+        <button class="opt">R=1 페이지에서 적재</button><button class="opt">W=1, D=1 페이지에 저장</button><button class="opt">X=1 페이지에서 명령어 인출</button><button class="opt">셋 다 허용된다</button></div>
+        <div class="quiz-exp"><code>modeCheck</code>는 S 모드에서 U 페이지에 대해 <code>!sum || ifetch</code>면 실패한다. SUM은 적재·저장만 허용하고 인출은 막는다.</div></div>
+    </div>
+  </section>
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ================================================================ 공통 상수 */
+  const PAGE_OFFSET_BITS = 12;
+  const VPN_PIECE_BITS = 9;
+  const PTE_BYTES = 8;
+  const PHYSICAL_ADDRESS_BITS = 48;
+  const PHYSICAL_PAGE_NUMBER_BITS = PHYSICAL_ADDRESS_BITS - PAGE_OFFSET_BITS; // 36
+  const LEVEL_COUNT = { sv39: 3, sv48: 4 };
+  const LEVEL_COLORS = ["accent", "accent-2", "ok", "warn"];
+  const hex = (value, digits) => "0x" + value.toString(16).padStart(digits || 1, "0");
+  const groupedHex = (value, digits) => {
+    const raw = value.toString(16).padStart(digits, "0");
+    return "0x" + raw.replace(/\B(?=(\w{4})+(?!\w))/g, "_");
+  };
+  const bitsOf = (value, low, width) => (value >> BigInt(low)) & ((1n << BigInt(width)) - 1n);
+
+  /* ================================================================ 그림 11-1: 주소와 PTE 비트 */
+  let splitMode = "sv48";
+  let splitAddress = 0x00007F3A5C612ABCn;
+  let splitSelection = null;
+  const PTE_FIELDS = [
+    { name: "N", low: 63, width: 1, text: "NAPOT. 1이면 연속한 페이지 묶음(곤명호 v3는 64 KiB만 지원)을 뜻한다." },
+    { name: "PBMT", low: 61, width: 2, text: "페이지 기반 메모리 타입(Svpbmt). 0=PMA 따름, 1=NC, 2=IO, 3=예약(폴트)." },
+    { name: "예약", low: 54, width: 7, text: "예약 비트. 0이 아니면 페이지 폴트." },
+    { name: "PPN", low: 10, width: 44, text: "물리 페이지 번호 44비트. 곤명호 v3는 PA 48비트라 하위 36비트만 쓰고, 상위가 0이 아니면 접근 폴트." },
+    { name: "RSW", low: 8, width: 2, text: "소프트웨어 예약. 하드웨어는 무시한다." },
+    { name: "D", low: 7, width: 1, text: "Dirty. 쓰인 적 있음. 0인 페이지에 쓰면 XiangShan은 페이지 폴트로 OS에 맡긴다." },
+    { name: "A", low: 6, width: 1, text: "Accessed. 접근한 적 있음. 0이면 접근 시 페이지 폴트." },
+    { name: "G", low: 5, width: 1, text: "Global. 모든 주소 공간에 공통인 매핑(ASID 무시)." },
+    { name: "U", low: 4, width: 1, text: "User. U 모드에서 접근 가능한 페이지." },
+    { name: "X", low: 3, width: 1, text: "eXecute. 명령어 인출 허용." },
+    { name: "W", low: 2, width: 1, text: "Write. 저장 허용. W=1인데 R=0이면 예약된 조합이라 폴트." },
+    { name: "R", low: 1, width: 1, text: "Read. 적재 허용. R·W·X가 모두 0이면 다음 단계 표를 가리키는 포인터." },
+    { name: "V", low: 0, width: 1, text: "Valid. 0이면 이 PTE는 비어 있고 페이지 폴트." },
+  ];
+  function addressFields(mode) {
+    const levels = LEVEL_COUNT[mode];
+    const fields = [{ name: "오프셋", low: 0, width: PAGE_OFFSET_BITS, color: "text-faint", text: "페이지 오프셋 12비트. 변환 없이 물리 주소로 그대로 간다." }];
+    for (let level = 0; level < levels; level++) {
+      fields.push({ name: `VPN[${level}]`, low: PAGE_OFFSET_BITS + VPN_PIECE_BITS * level, width: VPN_PIECE_BITS, color: LEVEL_COLORS[level],
+        text: `단계 ${level} 표의 인덱스 9비트. ${level === levels - 1 ? "satp가 가리키는 최상위 표에서 쓴다." : level === 0 ? "마지막(4 KiB) 단계 표에서 리프 PTE를 고른다." : "중간 단계 표에서 다음 표를 고른다."}` });
+    }
+    const topBit = PAGE_OFFSET_BITS + VPN_PIECE_BITS * levels;
+    fields.push({ name: "부호 확장", low: topBit, width: 64 - topBit, color: "surface-2", text: `비트 ${topBit}~63은 비트 ${topBit - 1}과 같아야 한다. 다르면 표를 볼 필요도 없이 폴트다.` });
+    return fields;
+  }
+  const SAMPLE_PTE = (0x0000_8A3C1n << 10n) | 0b11001111n; // D A - - X W R V
+  const splitView = MB.canvas("#cv-split", { aspect: 0.22, minHeight: 200, maxHeight: 205, draw: drawSplit });
+  function barGeometry(width) { const left = 14, right = width - 14; return { left, right, bitWidth: (right - left) / 64 }; }
+  function drawFieldBar(ctx, width, y, height, fields, value, label, isPte) {
+    const g = barGeometry(width);
+    MB.text(ctx, label, g.left, y - 10, { size: 12, color: MB.css("text-dim"), weight: 700 });
+    fields.forEach((field) => {
+      const x = g.left + (64 - field.low - field.width) * g.bitWidth;
+      const fieldWidth = field.width * g.bitWidth;
+      const isSelected = splitSelection && splitSelection.isPte === isPte && splitSelection.name === field.name;
+      const color = field.color ? MB.css(field.color) : MB.css("accent-2");
+      ctx.fillStyle = field.color === "surface-2" ? MB.css("surface-2") : MB.alpha(color, isSelected ? 0.42 : 0.2);
+      MB.roundRect(ctx, x + 1, y, fieldWidth - 2, height, 5); ctx.fill();
+      ctx.strokeStyle = isSelected ? MB.css("text") : color; ctx.lineWidth = isSelected ? 2 : 1; ctx.stroke();
+      const shown = value === null ? "" : bitsOf(value, field.low, field.width).toString(field.width > 4 ? 16 : 2);
+      const fontSize = fieldWidth < 30 ? 9 : 11.5;
+      MB.text(ctx, field.name, x + fieldWidth / 2, y + height * 0.34, { align: "center", size: fontSize, weight: 700 });
+      if (shown !== "" && fieldWidth > 22) MB.text(ctx, field.width > 4 ? "0x" + shown : shown, x + fieldWidth / 2, y + height * 0.72, { align: "center", size: fontSize - 1, mono: true, color: MB.css("text-dim") });
+      MB.text(ctx, String(field.low), x + fieldWidth - 2, y + height + 9, { align: "right", size: 9, mono: true, color: MB.css("text-faint") });
+    });
+  }
+  function drawSplit(ctx, width, height) {
+    drawFieldBar(ctx, width, 26, 46, addressFields(splitMode), splitAddress, `가상 주소 (${splitMode === "sv48" ? "Sv48" : "Sv39"})`, false);
+    drawFieldBar(ctx, width, 128, 46, PTE_FIELDS, SAMPLE_PTE, "PTE 64비트 (예: 4 KiB 리프, D·A·X·W·R·V 켜짐)", true);
+  }
+  function locateField(x, y) {
+    const g = barGeometry(splitView.width);
+    const bit = 63 - Math.floor((x - g.left) / g.bitWidth);
+    if (bit < 0 || bit > 63) return null;
+    const isPte = y > 110;
+    const list = isPte ? PTE_FIELDS : addressFields(splitMode);
+    const field = list.find((f) => bit >= f.low && bit < f.low + f.width);
+    return field ? { isPte, name: field.name, field } : null;
+  }
+  splitView.onPointer("click", (x, y) => {
+    const hit = locateField(x, y);
+    if (!hit) return;
+    splitSelection = hit;
+    const value = hit.isPte ? SAMPLE_PTE : splitAddress;
+    document.getElementById("split-info").innerHTML = `<b>${hit.field.name}</b> (비트 ${hit.field.low + hit.field.width - 1}~${hit.field.low}, ${hit.field.width}비트, 값 <span class="mono">${hex(bitsOf(value, hit.field.low, hit.field.width))}</span>) · ${hit.field.text}`;
+    splitView.redraw();
+  });
+  function parseAddress(text) {
+    try { return BigInt(text.replace(/_/g, "").trim()) & ((1n << 64n) - 1n); } catch (error) { return null; }
+  }
+  document.getElementById("split-va").addEventListener("input", (event) => {
+    const value = parseAddress(event.target.value);
+    if (value !== null) { splitAddress = value; splitView.redraw(); }
+  });
+  document.getElementById("split-random").onclick = () => {
+    const levels = LEVEL_COUNT[splitMode];
+    const usedBits = PAGE_OFFSET_BITS + VPN_PIECE_BITS * levels;
+    let value = 0n;
+    for (let k = 0; k < usedBits - 1; k++) if (Math.random() < 0.5) value |= 1n << BigInt(k);
+    splitAddress = value;
+    document.getElementById("split-va").value = groupedHex(value, 16);
+    splitView.redraw();
+  };
+  MB.seg("#split-mode", (value) => { splitMode = value; splitSelection = null; splitView.redraw(); });
+
+  /* ================================================================ 그림 11-2: 페이지 워크 */
+  const ROOT_PPN = 0x80000n;
+  const WALK_ADDRESS = { sv48: 0x00007F3A5C612ABCn, sv39: 0x0000003A5C612ABCn };
+  function makePte(fields) {
+    return Object.assign({ v: 1, r: 0, w: 0, x: 0, u: 0, g: 0, a: 0, d: 0, n: 0, pbmt: 0, reserved: 0, ppn: 0n }, fields);
+  }
+  /** 시나리오별로, 이 가상 주소가 지나가는 칸의 PTE를 단계 순서(위→아래)로 만든다. */
+  function buildScenario(name, levels) {
+    const pointers = [];
+    for (let k = 0; k < levels; k++) pointers.push(makePte({ ppn: 0x80100n + BigInt(k) * 0x10n }));
+    const leafLevel = name === "giga" ? 2 : name === "mega" || name === "misaligned" ? 1 : 0;
+    const leafIndex = levels - 1 - leafLevel; // 배열은 최상위 단계가 0번
+    const leaf = makePte({ r: 1, w: 1, x: 0, a: 1, d: 1, ppn: 0x9C3A40n });
+    if (leafLevel === 1) leaf.ppn = 0x9C3A00n & ~((1n << 9n) - 1n);
+    if (leafLevel === 2) leaf.ppn = 0x9C0000n & ~((1n << 18n) - 1n);
+    if (name === "misaligned") leaf.ppn = 0x9C3A13n;
+    if (name === "napot") { leaf.n = 1; leaf.ppn = (0x9C3A40n & ~0xFn) | 0x8n; }
+    if (name === "writeonly") { leaf.r = 0; leaf.w = 1; }
+    if (name === "toohigh") leaf.ppn = (1n << 40n) | 0x9C3A40n;
+    const path = pointers.slice(0, leafIndex).concat([leaf]);
+    if (name === "invalid") path[Math.min(1, path.length - 1)].v = 0;
+    if (name === "pointerA") path[0].a = 1;
+    return path;
+  }
+  function isLeaf(pte) { return pte.v === 1 && (pte.r === 1 || pte.w === 1 || pte.x === 1); }
+  function isPointer(pte) { return pte.v === 1 && pte.r === 0 && pte.w === 0 && pte.x === 0; }
+  /** MMUBundle.scala isPf와 같은 순서로 판정한다. 결과가 null이면 폴트 없음. */
+  function pageFaultReason(pte, level) {
+    if (pte.reserved !== 0) return "예약 비트가 0이 아님";
+    if (pte.pbmt === 3) return "PBMT=3(예약)";
+    if (isPointer(pte)) {
+      if (pte.u || pte.a || pte.d || pte.n || pte.pbmt) return "포인터 PTE에 U/A/D/N/PBMT가 켜짐";
+      return null;
+    }
+    if (pte.v === 0) return "V=0 (빈 PTE)";
+    if (pte.r === 0 && pte.w === 1) return "W=1인데 R=0 (예약된 조합)";
+    if (pte.n && ((pte.ppn & 0xFn) !== 0x8n || level !== 0)) return "NAPOT은 단계 0의 64 KiB(PPN 하위 4비트=1000)만 허용";
+    if (level > 0 && (pte.ppn & ((1n << BigInt(VPN_PIECE_BITS * level)) - 1n)) !== 0n) return `슈퍼페이지 PPN 하위 ${VPN_PIECE_BITS * level}비트가 0이 아님 (정렬 안 됨)`;
+    return null;
+  }
+  function accessFaultReason(pte) {
+    if (pte.v === 1 && (pte.ppn >> BigInt(PHYSICAL_PAGE_NUMBER_BITS)) !== 0n) return `PPN 상위 비트가 0이 아님 (물리 주소 ${PHYSICAL_ADDRESS_BITS}비트 초과)`;
+    return null;
+  }
+  let walkMode = "sv48", walkScenarioName = "normal", walkPath = [], walkStep = 0, walkTrace = [];
+  const walkView = MB.canvas("#cv-walk", { aspect: 0.56, minHeight: 330, maxHeight: 470, draw: drawWalk });
+  function vpnPiece(address, level) { return Number(bitsOf(address, PAGE_OFFSET_BITS + VPN_PIECE_BITS * level, VPN_PIECE_BITS)); }
+  /** 경로 전체를 처음부터 판정해 단계별 기록을 만든다. walkStep까지만 화면에 보인다. */
+  function computeTrace() {
+    const levels = LEVEL_COUNT[walkMode];
+    const address = WALK_ADDRESS[walkMode];
+    const trace = [];
+    let tablePpn = ROOT_PPN;
+    for (let index = 0; index < walkPath.length; index++) {
+      const level = levels - 1 - index;
+      const pte = walkPath[index];
+      const pteAddress = tablePpn * 4096n + BigInt(vpnPiece(address, level) * PTE_BYTES);
+      const accessFault = accessFaultReason(pte);
+      const pageFault = accessFault ? null : pageFaultReason(pte, level);
+      const entry = { level, tablePpn, pteAddress, pte, accessFault, pageFault, outcome: "pointer" };
+      if (accessFault) entry.outcome = "access-fault";
+      else if (pageFault) entry.outcome = "page-fault";
+      else if (isLeaf(pte)) {
+        entry.outcome = "leaf";
+        const keptBits = BigInt(VPN_PIECE_BITS * level + (pte.n ? 4 : 0));
+        const vpnLow = (address >> BigInt(PAGE_OFFSET_BITS)) & ((1n << keptBits) - 1n);
+        const physicalPage = ((pte.ppn >> keptBits) << keptBits) | vpnLow;
+        entry.physicalAddress = (physicalPage << BigInt(PAGE_OFFSET_BITS)) | (address & 0xFFFn);
+        entry.pageSize = pte.n ? "64 KiB (NAPOT)" : ["4 KiB", "2 MiB", "1 GiB", "512 GiB"][level];
+      } else if (level === 0) {
+        entry.outcome = "page-fault";
+        entry.pageFault = "마지막 단계인데도 포인터";
+      }
+      trace.push(entry);
+      if (entry.outcome !== "pointer") break;
+      tablePpn = pte.ppn;
+    }
+    return trace;
+  }
+  function resetWalk(keepPath) {
+    if (!keepPath) walkPath = buildScenario(walkScenarioName, LEVEL_COUNT[walkMode]);
+    walkTrace = computeTrace();
+    walkStep = 0;
+    paintWalk();
+  }
+  function paintWalk() {
+    const shown = walkTrace.slice(0, walkStep);
+    const last = shown[shown.length - 1];
+    MB.set("walk-accesses", String(shown.length));
+    MB.set("walk-level", last ? `단계 ${last.level}` : "—");
+    let result = "—", resultClass = "";
+    if (last && last.outcome === "leaf") { result = `리프 · ${last.pageSize}`; resultClass = "good"; }
+    else if (last && last.outcome === "page-fault") { result = "페이지 폴트"; resultClass = "bad"; }
+    else if (last && last.outcome === "access-fault") { result = "접근 폴트"; resultClass = "bad"; }
+    else if (last) result = "포인터 → 다음 단계";
+    MB.set("walk-result", result, resultClass);
+    MB.set("walk-pa", last && last.physicalAddress !== undefined ? groupedHex(last.physicalAddress, 12) : "—");
+    const info = document.getElementById("walk-info");
+    if (!last) info.innerHTML = `satp.PPN = <span class="mono">${hex(ROOT_PPN)}</span>에서 시작한다. '한 단계 →'를 눌러 첫 PTE를 읽자.`;
+    else {
+      const flags = ["v", "r", "w", "x", "u", "a", "d", "n"].filter((k) => last.pte[k]).map((k) => k.toUpperCase()).join("") || "없음";
+      let verdict = "포인터: 이 PPN이 다음 단계 표다.";
+      if (last.outcome === "leaf") verdict = `리프: ${last.pageSize} 페이지. 남은 VPN 조각과 오프셋을 PPN 뒤에 붙인다.`;
+      if (last.outcome === "page-fault") verdict = `<b style="color:var(--bad)">페이지 폴트</b> — ${last.pageFault}`;
+      if (last.outcome === "access-fault") verdict = `<b style="color:var(--bad)">접근 폴트</b> — ${last.accessFault}`;
+      info.innerHTML = `단계 ${last.level}: 표 PPN <span class="mono">${hex(last.tablePpn)}</span> + VPN[${last.level}] <span class="mono">${hex(vpnPiece(WALK_ADDRESS[walkMode], last.level))}</span>×8 → PTE 주소 <span class="mono">${groupedHex(last.pteAddress, 10)}</span> · 켜진 비트 <span class="mono">${flags}</span>, PPN <span class="mono">${hex(last.pte.ppn)}</span> → ${verdict}`;
+    }
+    buildEditor(last);
+    document.getElementById("walk-step").disabled = walkStep >= walkTrace.length;
+    walkView.redraw();
+  }
+  function buildEditor(entry) {
+    const editor = document.getElementById("walk-editor");
+    if (!entry) { editor.innerHTML = `<span class="dim small">아직 읽은 PTE가 없다.</span>`; return; }
+    const keys = ["v", "r", "w", "x", "u", "a", "d", "n"];
+    editor.innerHTML = keys.map((k) => `<label><input type="checkbox" data-key="${k}" ${entry.pte[k] ? "checked" : ""}>${k.toUpperCase()}</label>`).join("") +
+      `<label>PPN 하위 비트 0 (정렬) <input type="checkbox" data-key="aligned" ${(entry.pte.ppn & 0x1FFn) === 0n ? "checked" : ""}></label>`;
+  }
+  document.getElementById("walk-editor").addEventListener("change", (event) => {
+    const key = event.target.dataset.key;
+    const index = walkStep - 1;
+    if (index < 0) return;
+    const pte = walkPath[index];
+    if (key === "aligned") pte.ppn = event.target.checked ? pte.ppn & ~0x1FFn : (pte.ppn & ~0x1FFn) | 0x13n;
+    else pte[key] = event.target.checked ? 1 : 0;
+    // 포인터였던 PTE가 리프가 되거나 그 반대가 되면 그 아래 경로를 다시 만든다.
+    const levels = LEVEL_COUNT[walkMode];
+    if (isPointer(pte) && index === walkPath.length - 1 && levels - 1 - index > 0) {
+      walkPath.push(makePte({ r: 1, w: 1, a: 1, d: 1, ppn: 0x9C3A40n }));
+    }
+    if (!isPointer(pte)) walkPath.length = index + 1;
+    const keepStep = walkStep;
+    walkTrace = computeTrace();
+    walkStep = Math.min(keepStep, walkTrace.length);
+    paintWalk();
+  });
+  function drawWalk(ctx, width, height) {
+    const levels = LEVEL_COUNT[walkMode];
+    const address = WALK_ADDRESS[walkMode];
+    const isNarrow = width < 560;
+    // 위쪽: 가상 주소 조각
+    const pieceWidth = (width - 28) / (levels + 1);
+    MB.text(ctx, `가상 주소 ${groupedHex(address, walkMode === "sv48" ? 12 : 10)}`, 14, 14, { size: 12, weight: 700, color: MB.css("text-dim") });
+    for (let k = 0; k <= levels; k++) {
+      const isOffset = k === levels;
+      const level = levels - 1 - k;
+      const x = 14 + k * pieceWidth;
+      const color = isOffset ? MB.css("text-faint") : MB.css(LEVEL_COLORS[level]);
+      ctx.fillStyle = MB.alpha(color, 0.18);
+      MB.roundRect(ctx, x + 2, 26, pieceWidth - 4, 30, 6); ctx.fill();
+      ctx.strokeStyle = color; ctx.lineWidth = 1; ctx.stroke();
+      const label = isOffset ? `오프셋 ${hex(Number(address & 0xFFFn), 3)}` : `VPN[${level}] ${hex(vpnPiece(address, level), 3)}`;
+      MB.text(ctx, label, x + pieceWidth / 2, 41, { align: "center", size: isNarrow ? 9.5 : 11.5, mono: true, weight: 700 });
+    }
+    // 단계별 표
+    const top = 76, tableHeight = height - top - 64;
+    const columnWidth = (width - 28) / levels;
+    walkTrace.forEach((entry, index) => {
+      const x = 14 + index * columnWidth + 6, w = columnWidth - 12;
+      const isShown = index < walkStep;
+      const color = MB.css(LEVEL_COLORS[entry.level]);
+      ctx.globalAlpha = isShown ? 1 : 0.35;
+      ctx.fillStyle = MB.css("surface");
+      MB.roundRect(ctx, x, top, w, tableHeight, 8); ctx.fill();
+      ctx.strokeStyle = isShown ? color : MB.css("border"); ctx.lineWidth = isShown ? 1.6 : 1; ctx.stroke();
+      MB.text(ctx, `단계 ${entry.level} 표`, x + w / 2, top + 14, { align: "center", size: isNarrow ? 10 : 12, weight: 700, color });
+      MB.text(ctx, `PPN ${hex(entry.tablePpn)}`, x + w / 2, top + 30, { align: "center", size: isNarrow ? 8.5 : 10.5, mono: true, color: MB.css("text-dim") });
+      // 512칸 중 일부를 줄무늬로 그리고, 고른 칸을 강조한다.
+      const rows = 12, rowTop = top + 44, rowHeight = (tableHeight - 56) / rows;
+      const selectedRow = Math.round((vpnPiece(address, entry.level) / 511) * (rows - 1));
+      for (let r = 0; r < rows; r++) {
+        ctx.fillStyle = r === selectedRow && isShown ? MB.alpha(color, 0.35) : r % 2 ? MB.css("bg-elev") : MB.css("surface-2");
+        ctx.fillRect(x + 6, rowTop + r * rowHeight, w - 12, rowHeight - 1);
+      }
+      if (isShown) {
+        const y = rowTop + selectedRow * rowHeight + rowHeight / 2;
+        let tag = "포인터";
+        if (entry.outcome === "leaf") tag = "리프";
+        if (entry.outcome === "page-fault") tag = "PF";
+        if (entry.outcome === "access-fault") tag = "AF";
+        const tagColor = entry.outcome === "leaf" ? MB.css("ok") : entry.outcome === "pointer" ? MB.css("text") : MB.css("bad");
+        MB.text(ctx, tag, x + w / 2, y, { align: "center", size: isNarrow ? 9 : 11, weight: 800, color: tagColor });
+        if (entry.outcome === "pointer" && index + 1 < walkTrace.length) {
+          MB.arrow(ctx, x + w - 4, y, x + w + 14, top + tableHeight / 2, MB.css("text-faint"), 1.4, 6);
+        }
+      }
+      ctx.globalAlpha = 1;
+    });
+    // 아래: 결과
+    const last = walkTrace[walkStep - 1];
+    const resultY = height - 40;
+    ctx.fillStyle = MB.css("surface"); MB.roundRect(ctx, 14, resultY, width - 28, 28, 7); ctx.fill();
+    let resultText = "satp → 최상위 표에서 출발";
+    let resultColor = MB.css("text-dim");
+    if (last && last.outcome === "leaf") { resultText = `물리 주소 ${groupedHex(last.physicalAddress, 12)}  (${last.pageSize}, 접근 ${walkStep}번)`; resultColor = MB.css("ok"); }
+    else if (last && last.outcome !== "pointer") { resultText = `${last.outcome === "page-fault" ? "페이지 폴트" : "접근 폴트"}: ${last.pageFault || last.accessFault}`; resultColor = MB.css("bad"); }
+    else if (last) resultText = `단계 ${last.level}에서 포인터 → 계속`;
+    MB.text(ctx, resultText, width / 2, resultY + 14, { align: "center", size: isNarrow ? 10.5 : 12.5, mono: true, weight: 700, color: resultColor });
+  }
+  MB.seg("#walk-mode", (value) => { walkMode = value; resetWalk(false); });
+  document.getElementById("walk-scenario").addEventListener("change", (event) => { walkScenarioName = event.target.value; resetWalk(false); });
+  document.getElementById("walk-reset").onclick = () => resetWalk(false);
+  document.getElementById("walk-step").onclick = () => { if (walkStep < walkTrace.length) { walkStep++; paintWalk(); } };
+  document.getElementById("walk-run").onclick = () => { walkStep = walkTrace.length; paintWalk(); };
+  resetWalk(false);
+
+  /* ================================================================ 그림 11-3: TLB 히트율 */
+  const TLB_ACCESS_COUNT = 20000;
+  const CACHE_LINE_BYTES = 64;
+  const PAGES_PER_SECTOR = 8;
+  const PAGES_PER_SUPERPAGE = 512;
+  let tlbPattern = "sequential", tlbEntries = 48, tlbWorkingExponent = 10, tlbPageKind = "4k", tlbSectorKind = "sector";
+  /** 접근할 4 KiB 가상 페이지 번호 열을 만든다. 작업 집합은 2^exponent 페이지. */
+  function tlbAddressStream(pattern, workingPages) {
+    const random = MB.rng(13);
+    const pages = new Int32Array(TLB_ACCESS_COUNT);
+    const linesPerPage = 4096 / CACHE_LINE_BYTES;
+    let cursor = 0;
+    for (let i = 0; i < TLB_ACCESS_COUNT; i++) {
+      if (pattern === "sequential") { pages[i] = Math.floor(cursor / linesPerPage) % workingPages; cursor++; }
+      else if (pattern === "stride16") { pages[i] = (Math.floor(cursor / 4) * 16) % Math.max(16, workingPages); cursor++; }
+      else if (pattern === "random") pages[i] = Math.floor(random() * workingPages);
+      else {
+        const hotPages = Math.max(1, Math.floor(workingPages / 10));
+        pages[i] = random() < 0.9 ? Math.floor(random() * hotPages) : Math.floor(random() * workingPages);
+      }
+    }
+    return pages;
+  }
+  /** 완전 연관 TLB를 LRU로 돌려 히트율을 잰다. 태그는 엔트리 하나가 덮는 페이지 수로 나눈 값. */
+  function simulateTlb(pages, entries, pagesPerEntry) {
+    const lastUse = new Map();
+    let hits = 0;
+    for (let i = 0; i < pages.length; i++) {
+      const tag = Math.floor(pages[i] / pagesPerEntry);
+      if (lastUse.has(tag)) { hits++; lastUse.delete(tag); }
+      else if (lastUse.size >= entries) lastUse.delete(lastUse.keys().next().value);
+      lastUse.set(tag, i);
+    }
+    return hits / pages.length;
+  }
+  function pagesPerEntry(pageKind, sectorKind) {
+    const base = pageKind === "2m" ? PAGES_PER_SUPERPAGE : 1;
+    return sectorKind === "sector" && pageKind === "4k" ? base * PAGES_PER_SECTOR : base;
+  }
+  const tlbCurveCache = {};
+  function tlbCurves() {
+    const key = `${tlbPattern}|${tlbWorkingExponent}|${tlbPageKind}`;
+    if (tlbCurveCache[key]) return tlbCurveCache[key];
+    const pages = tlbAddressStream(tlbPattern, 1 << tlbWorkingExponent);
+    const sector = [], single = [];
+    for (let entries = 8; entries <= 128; entries += 8) {
+      sector.push([entries, simulateTlb(pages, entries, pagesPerEntry(tlbPageKind, "sector"))]);
+      single.push([entries, simulateTlb(pages, entries, pagesPerEntry(tlbPageKind, "single"))]);
+    }
+    tlbCurveCache[key] = { sector, single, pages };
+    return tlbCurveCache[key];
+  }
+  const tlbView = MB.canvas("#cv-tlb", { aspect: 0.42, minHeight: 230, maxHeight: 320, draw(ctx, width, height) {
+    const curves = tlbCurves();
+    const axes = MB.lineChart(ctx, width, height, [
+      { color: MB.css("accent"), data: curves.sector, width: 2.4 },
+      { color: MB.css("accent-2"), data: curves.single, dash: [5, 4] },
+    ], { xMin: 8, xMax: 128, yMin: 0, yMax: 1, yFormat: (v) => Math.round(v * 100) + "%", xLabel: "TLB 엔트리 수", yLabel: "히트율", marks: [{ x: tlbEntries, label: tlbEntries === 48 ? "곤명호 v3 = 48" : "" }] });
+    MB.text(ctx, "— 섹터 엔트리", axes.right - 130, axes.bottom - 30, { size: 12, color: MB.css("accent"), weight: 700 });
+    MB.text(ctx, "- - 페이지 하나", axes.right - 130, axes.bottom - 12, { size: 12, color: MB.css("accent-2"), weight: 700 });
+  } });
+  function formatBytes(bytes) {
+    const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let k = 0;
+    while (bytes >= 1024 && k < units.length - 1) { bytes /= 1024; k++; }
+    return (bytes >= 100 ? Math.round(bytes) : Number(bytes.toFixed(1))) + " " + units[k];
+  }
+  function paintTlb() {
+    const curves = tlbCurves();
+    const hitRate = simulateTlb(curves.pages, tlbEntries, pagesPerEntry(tlbPageKind, tlbSectorKind));
+    MB.set("tlb-hit", MB.pct(hitRate, 2));
+    MB.set("tlb-mpki", MB.fmt((1 - hitRate) * 1000, 1));
+    MB.set("tlb-reach", formatBytes(tlbEntries * pagesPerEntry(tlbPageKind, tlbSectorKind) * 4096));
+    tlbView.redraw();
+  }
+  MB.range("tlb-entries", (value) => { tlbEntries = value; paintTlb(); });
+  MB.range("tlb-working", (value) => { tlbWorkingExponent = value; paintTlb(); }, (value) => `${formatBytes((1 << value) * 4096)} (${(1 << value).toLocaleString()} 페이지)`);
+  MB.seg("#tlb-pattern", (value) => { tlbPattern = value; paintTlb(); });
+  MB.seg("#tlb-page", (value) => { tlbPageKind = value; paintTlb(); });
+  MB.seg("#tlb-sector", (value) => { tlbSectorKind = value; paintTlb(); });
+  paintTlb();
+
+  /* ================================================================ 그림 11-4: L2TLB 페이지 캐시 */
+  const L2TLB_REQUEST_COUNT = 4000;
+  const PAGE_CACHE = {
+    l3: { entries: 16 },             // 완전 연관
+    l2: { entries: 16 },
+    l1: { sets: 4, ways: 2 },        // 엔트리 하나에 포인터 PTE 8개
+    l0: { sets: 64, ways: 4 },       // 엔트리 하나에 리프 PTE 8개
+  };
+  let l2Pattern = "sequential", l2RegionExponent = 30, l2Prefetch = "on", l2Mode = "sv48";
+  class LruSet {
+    constructor(capacity) { this.capacity = capacity; this.order = new Map(); }
+    has(key) { if (!this.order.has(key)) return false; this.order.delete(key); this.order.set(key, 1); return true; }
+    insert(key) { if (this.order.has(key)) this.order.delete(key); else if (this.order.size >= this.capacity) this.order.delete(this.order.keys().next().value); this.order.set(key, 1); }
+  }
+  class SetAssociative {
+    constructor(sets, ways) { this.sets = sets; this.lines = Array.from({ length: sets }, () => new LruSet(ways)); }
+    has(tag) { return this.lines[tag % this.sets].has(tag); }
+    insert(tag) { this.lines[tag % this.sets].insert(tag); }
+  }
+  /** 요청마다 처음 적중한 캐시 단계와 메모리 접근 수를 센다. VPN은 4 KiB 페이지 번호. */
+  function simulateL2Tlb(pattern, regionExponent, isPrefetchOn, mode) {
+    const levels = LEVEL_COUNT[mode];
+    const caches = { l3: new LruSet(PAGE_CACHE.l3.entries), l2: new LruSet(PAGE_CACHE.l2.entries), l1: new SetAssociative(PAGE_CACHE.l1.sets, PAGE_CACHE.l1.ways), l0: new SetAssociative(PAGE_CACHE.l0.sets, PAGE_CACHE.l0.ways) };
+    const random = MB.rng(29);
+    const regionPages = Math.max(8, Math.pow(2, regionExponent - PAGE_OFFSET_BITS));
+    const counts = { l0: 0, l1: 0, l2: 0, l3: 0, none: 0 };
+    let accesses = 0, prefetchAccesses = 0, cursor = 0;
+    const recentPrefetch = [];
+    // 단계별 키: l0·l1은 8개 묶음 단위, l2·l3는 PTE 하나 단위
+    const keyOf = (vpn) => ({ l0: Math.floor(vpn / 8), l1: Math.floor(vpn / 512 / 8), l2: Math.floor(vpn / 512 / 512), l3: Math.floor(vpn / 512 / 512 / 512) });
+    function refill(vpn) { const key = keyOf(vpn); caches.l0.insert(key.l0); caches.l1.insert(key.l1); caches.l2.insert(key.l2); caches.l3.insert(key.l3); }
+    /** 처음 적중한 단계에 따라 필요한 메모리 접근 수를 돌려준다. */
+    function lookup(vpn) {
+      const key = keyOf(vpn);
+      if (caches.l0.has(key.l0)) return { level: "l0", cost: 0 };
+      if (caches.l1.has(key.l1)) return { level: "l1", cost: 1 };
+      if (caches.l2.has(key.l2)) return { level: "l2", cost: 2 };
+      if (levels === 4 && caches.l3.has(key.l3)) return { level: "l3", cost: 3 };
+      return { level: "none", cost: levels };
+    }
+    for (let i = 0; i < L2TLB_REQUEST_COUNT; i++) {
+      let vpn;
+      if (pattern === "sequential") vpn = cursor++ % regionPages;
+      else if (pattern === "stride") vpn = (cursor++ * 512) % Math.max(512, regionPages);
+      else vpn = Math.floor(random() * regionPages);
+      const result = lookup(vpn);
+      counts[result.level]++;
+      accesses += result.cost;
+      if (result.cost > 0) refill(vpn);
+      // 다음 라인 프리페치: 놓친 요청의 다음 8페이지 묶음을 걷는다(최근 4개는 중복 방지).
+      if (isPrefetchOn && result.level !== "l0") {
+        const nextVpn = (Math.floor(vpn / 8) + 1) * 8;
+        if (!recentPrefetch.includes(nextVpn)) {
+          recentPrefetch.push(nextVpn); if (recentPrefetch.length > 4) recentPrefetch.shift();
+          const prefetchResult = lookup(nextVpn);
+          if (prefetchResult.cost > 0) { prefetchAccesses += prefetchResult.cost; refill(nextVpn); }
+        }
+      }
+    }
+    return { counts, average: accesses / L2TLB_REQUEST_COUNT, prefetchAccesses, levels };
+  }
+  let l2Result = null;
+  const L2_LEVEL_STYLE = [
+    { key: "l0", label: "l0 적중", color: "ok", cost: "0번 (리프 보유)" },
+    { key: "l1", label: "l1 적중", color: "accent", cost: "LLPTW 1번" },
+    { key: "l2", label: "l2 적중", color: "accent-2", cost: "PTW 2번" },
+    { key: "l3", label: "l3 적중", color: "warn", cost: "PTW 3번" },
+    { key: "none", label: "모두 놓침", color: "bad", cost: "PTW 단계 수만큼" },
+  ];
+  const l2View = MB.canvas("#cv-l2tlb", { aspect: 0.36, minHeight: 210, maxHeight: 280, draw(ctx, width, height) {
+    if (!l2Result) return;
+    const total = L2TLB_REQUEST_COUNT;
+    const left = 14, right = width - 14, barTop = 30, barHeight = 34;
+    MB.text(ctx, "요청이 처음 적중한 페이지 캐시", left, 14, { size: 12, color: MB.css("text-dim"), weight: 700 });
+    let x = left;
+    L2_LEVEL_STYLE.forEach((style) => {
+      const count = l2Result.counts[style.key];
+      if (style.key === "l3" && l2Result.levels === 3) return;
+      const w = (count / total) * (right - left);
+      ctx.fillStyle = MB.css(style.color);
+      ctx.fillRect(x, barTop, Math.max(0, w), barHeight);
+      if (w > 46) MB.text(ctx, MB.pct(count / total, 0), x + w / 2, barTop + barHeight / 2, { align: "center", size: 12, weight: 800, color: "#fff" });
+      x += w;
+    });
+    const boxTop = barTop + barHeight + 22, styles = L2_LEVEL_STYLE.filter((s) => !(s.key === "l3" && l2Result.levels === 3));
+    const boxWidth = (right - left) / styles.length;
+    styles.forEach((style, k) => {
+      const bx = left + k * boxWidth + 3;
+      ctx.fillStyle = MB.alpha(MB.css(style.color), 0.14);
+      MB.roundRect(ctx, bx, boxTop, boxWidth - 6, height - boxTop - 10, 8); ctx.fill();
+      ctx.strokeStyle = MB.css(style.color); ctx.lineWidth = 1; ctx.stroke();
+      const isSmall = boxWidth < 110;
+      MB.text(ctx, style.label, bx + (boxWidth - 6) / 2, boxTop + 18, { align: "center", size: isSmall ? 10 : 12, weight: 700 });
+      MB.text(ctx, style.cost, bx + (boxWidth - 6) / 2, boxTop + 38, { align: "center", size: isSmall ? 9 : 11, color: MB.css("text-dim") });
+      MB.text(ctx, String(l2Result.counts[style.key]), bx + (boxWidth - 6) / 2, boxTop + 62, { align: "center", size: isSmall ? 13 : 17, mono: true, weight: 800, color: MB.css(style.color) });
+    });
+  } });
+  function paintL2Tlb() {
+    l2Result = simulateL2Tlb(l2Pattern, l2RegionExponent, l2Prefetch === "on", l2Mode);
+    MB.set("l2-average", MB.fmt(l2Result.average, 3) + " <small>번</small>");
+    MB.set("l2-l0hit", MB.pct(l2Result.counts.l0 / L2TLB_REQUEST_COUNT, 1));
+    MB.set("l2-prefetch-count", String(l2Result.prefetchAccesses));
+    l2View.redraw();
+  }
+  MB.range("l2-region", (value) => { l2RegionExponent = value; paintL2Tlb(); }, (value) => formatBytes(Math.pow(2, value)));
+  MB.seg("#l2-pattern", (value) => { l2Pattern = value; paintL2Tlb(); });
+  MB.seg("#l2-prefetch", (value) => { l2Prefetch = value; paintL2Tlb(); });
+  MB.seg("#l2-mode", (value) => { l2Mode = value; paintL2Tlb(); });
+  paintL2Tlb();
+
+  /* ================================================================ 그림 11-5: 2단계 중첩 워크 */
+  let nestedVsLevels = 4, nestedGLevels = 4, nestedSkip = 0, nestedCursor = -1;
+  const nestedView = MB.canvas("#cv-nested", { aspect: 0.36, minHeight: 250, maxHeight: 300, draw: drawNested });
+  /** 접근 순서 목록: VS 단계마다 G-stage m번 → VS PTE 1번, 마지막 GPA에 G-stage m번 */
+  function nestedSequence() {
+    const sequence = [];
+    const rows = nestedVsLevels + 1;
+    for (let row = 0; row < rows; row++) {
+      const isFinal = row === nestedVsLevels;
+      for (let column = 0; column < nestedGLevels; column++) sequence.push({ row, column, kind: "g", isSkipped: column < Math.min(nestedSkip, nestedGLevels - 1) });
+      if (!isFinal) sequence.push({ row, column: nestedGLevels, kind: "vs", isSkipped: false });
+    }
+    return sequence;
+  }
+  function drawNested(ctx, width, height) {
+    const sequence = nestedSequence();
+    const rows = nestedVsLevels + 1, columns = nestedGLevels + 1;
+    const left = 120, top = 42, right = width - 14, bottom = height - 16;
+    const isNarrow = width < 520;
+    const leftPad = isNarrow ? 84 : left;
+    const cellWidth = (right - leftPad) / columns, cellHeight = Math.min(44, (bottom - top) / rows);
+    MB.text(ctx, "G-stage 단계 →", leftPad, 14, { size: 11.5, color: MB.css("text-dim") });
+    for (let column = 0; column < nestedGLevels; column++) MB.text(ctx, `G${nestedGLevels - 1 - column}`, leftPad + column * cellWidth + cellWidth / 2, top - 6, { align: "center", size: 11, mono: true, color: MB.css("nottaken") });
+    if (nestedVsLevels > 0) MB.text(ctx, "PTE 읽기", leftPad + nestedGLevels * cellWidth + cellWidth / 2, top - 6, { align: "center", size: 11, color: MB.css("taken") });
+    for (let row = 0; row < rows; row++) {
+      const label = row === nestedVsLevels ? "최종 GPA" : `VS 단계 ${nestedVsLevels - 1 - row}`;
+      MB.text(ctx, label, 10, top + row * cellHeight + cellHeight / 2, { size: isNarrow ? 10 : 12, weight: 700, color: MB.css("text-dim") });
+    }
+    sequence.forEach((cell, order) => {
+      const x = leftPad + cell.column * cellWidth + 3, y = top + cell.row * cellHeight + 3;
+      const isDone = order <= nestedCursor;
+      const color = cell.kind === "g" ? MB.css("nottaken") : MB.css("taken");
+      ctx.fillStyle = cell.isSkipped ? MB.css("surface") : MB.alpha(color, isDone ? 0.85 : 0.22);
+      MB.roundRect(ctx, x, y, cellWidth - 6, cellHeight - 6, 6); ctx.fill();
+      ctx.strokeStyle = cell.isSkipped ? MB.css("border") : color; ctx.lineWidth = 1; ctx.stroke();
+      MB.text(ctx, cell.isSkipped ? "캐시" : String(order + 1), x + (cellWidth - 6) / 2, y + (cellHeight - 6) / 2, { align: "center", size: 11, mono: true, weight: 700, color: isDone && !cell.isSkipped ? "#fff" : MB.css("text-dim") });
+    });
+    if (nestedGLevels === 0 && nestedVsLevels === 0) MB.text(ctx, "변환 없음 (Bare/Bare): 메모리 접근 0번", width / 2, height / 2, { align: "center", color: MB.css("text-faint") });
+  }
+  function paintNested() {
+    const worst = (nestedVsLevels + 1) * (nestedGLevels + 1) - 1;
+    const cached = nestedSequence().filter((cell) => !cell.isSkipped).length;
+    MB.set("nested-worst", `${worst} <small>번</small>`);
+    MB.set("nested-cached", `${cached} <small>번</small>`);
+    let mode = "noS2xlate";
+    if (nestedVsLevels && nestedGLevels) mode = "allStage";
+    else if (nestedVsLevels) mode = "onlyStage1";
+    else if (nestedGLevels) mode = "onlyStage2";
+    MB.set("nested-mode", mode);
+    nestedView.redraw();
+  }
+  MB.seg("#nested-vs", (value) => { nestedVsLevels = +value; nestedCursor = -1; paintNested(); });
+  MB.seg("#nested-g", (value) => { nestedGLevels = +value; nestedCursor = -1; paintNested(); });
+  MB.range("nested-skip", (value) => { nestedSkip = value; paintNested(); }, (value) => `${value}단계`);
+  const nestedLoop = MB.loop(document.getElementById("fig-nested"), (() => {
+    let accumulated = 0;
+    return (dt) => {
+      accumulated += dt;
+      if (accumulated < 0.28) return;
+      accumulated = 0;
+      nestedCursor++;
+      if (nestedCursor >= nestedSequence().length + 3) nestedCursor = -1;
+      nestedView.redraw();
+    };
+  })());
+  nestedLoop.running = false;
+  MB.playButton("nested-play", nestedLoop, ["⏸ 멈춤", "▶ 순서대로 보기"]);
+  paintNested();
+
+  /* ================================================================ 그림 11-6: 권한 검사 */
+  const permissionPte = { r: 1, w: 0, x: 0, u: 1, a: 1, d: 0 };
+  const permissionStatus = { sum: 0, mxr: 0 };
+  let permissionMode = "S", permissionAccess = "load";
+  function renderPermissionEditors() {
+    document.getElementById("permission-pte").innerHTML = Object.keys(permissionPte).map((k) => `<label><input type="checkbox" data-group="pte" data-key="${k}" ${permissionPte[k] ? "checked" : ""}>${k.toUpperCase()}</label>`).join("");
+    document.getElementById("permission-status").innerHTML = Object.keys(permissionStatus).map((k) => `<label><input type="checkbox" data-group="status" data-key="${k}" ${permissionStatus[k] ? "checked" : ""}>${k.toUpperCase()}</label>`).join("");
+  }
+  /** TLB.scala perm_check의 1단계 검사 순서를 따른다. 단계별 통과 여부와 최종 결과를 돌려준다. */
+  function evaluatePermission() {
+    const pte = permissionPte, isFetch = permissionAccess === "fetch", isStore = permissionAccess === "store";
+    const isLoad = permissionAccess === "load" || permissionAccess === "hlvx";
+    const steps = [];
+    const modeFail = (permissionMode === "U" && !pte.u) || (permissionMode === "S" && pte.u && (!permissionStatus.sum || isFetch));
+    let modeReason = "통과";
+    if (permissionMode === "U" && !pte.u) modeReason = "U 모드인데 U=0 페이지";
+    else if (permissionMode === "S" && pte.u && isFetch) modeReason = "S 모드는 U 페이지에서 인출할 수 없다(SUM 무관)";
+    else if (permissionMode === "S" && pte.u && !permissionStatus.sum) modeReason = "S 모드에서 U 페이지인데 SUM=0";
+    steps.push({ name: "모드 검사", isPass: !modeFail, reason: modeReason });
+    let accessPass, accessReason;
+    if (permissionAccess === "hlvx") { accessPass = !!pte.x; accessReason = accessPass ? "X=1 (HLVX는 X를 요구)" : "HLVX인데 X=0"; }
+    else if (isLoad) { accessPass = !!(pte.r || (permissionStatus.mxr && pte.x)); accessReason = pte.r ? "R=1" : accessPass ? "R=0이지만 MXR=1이고 X=1" : "R=0 (MXR로도 안 됨)"; }
+    else if (isStore) { accessPass = !!pte.w; accessReason = accessPass ? "W=1" : "W=0"; }
+    else { accessPass = !!pte.x; accessReason = accessPass ? "X=1" : "X=0"; }
+    steps.push({ name: "접근 권한", isPass: accessPass, reason: accessReason });
+    const needsDirty = isStore;
+    const updatePass = !!pte.a && (!needsDirty || !!pte.d);
+    steps.push({ name: "A/D 비트", isPass: updatePass, reason: updatePass ? (needsDirty ? "A=1, D=1" : "A=1") : !pte.a ? "A=0 → 예외로 갱신 요청" : "저장인데 D=0 → 예외로 갱신 요청" });
+    const isAllowed = steps.every((s) => s.isPass);
+    const faultName = isFetch ? "명령어 페이지 폴트" : isStore ? "저장/AMO 페이지 폴트" : "적재 페이지 폴트";
+    return { steps, isAllowed, faultName };
+  }
+  const permissionView = MB.canvas("#cv-permission", { aspect: 0.2, minHeight: 120, maxHeight: 150, draw(ctx, width, height) {
+    const result = evaluatePermission();
+    const nodes = result.steps.concat([{ name: result.isAllowed ? "허용" : result.faultName, isPass: result.isAllowed, isFinal: true }]);
+    const gap = 16, nodeWidth = (width - 28 - gap * (nodes.length - 1)) / nodes.length, y = height / 2 - 24;
+    let firstFailSeen = false;
+    nodes.forEach((node, k) => {
+      const x = 14 + k * (nodeWidth + gap);
+      const isFail = !node.isPass && !firstFailSeen && !node.isFinal;
+      if (isFail) firstFailSeen = true;
+      const color = node.isFinal ? (node.isPass ? MB.css("ok") : MB.css("bad")) : node.isPass ? MB.css("ok") : MB.css("bad");
+      ctx.fillStyle = MB.alpha(color, node.isFinal ? 0.25 : 0.12);
+      MB.roundRect(ctx, x, y, nodeWidth, 48, 9); ctx.fill();
+      ctx.strokeStyle = color; ctx.lineWidth = isFail || node.isFinal ? 2 : 1; ctx.stroke();
+      MB.text(ctx, node.name, x + nodeWidth / 2, y + 18, { align: "center", size: width < 520 ? 10 : 12.5, weight: 800, color });
+      MB.text(ctx, node.isFinal ? "" : node.isPass ? "통과" : "막힘", x + nodeWidth / 2, y + 35, { align: "center", size: 11, color: MB.css("text-dim") });
+      if (k < nodes.length - 1) MB.arrow(ctx, x + nodeWidth + 2, y + 24, x + nodeWidth + gap - 2, y + 24, MB.css("text-faint"), 1.3, 5);
+    });
+  } });
+  function paintPermission() {
+    const result = evaluatePermission();
+    const chip = result.isAllowed ? `<span class="result-chip allowed">허용</span>` : `<span class="result-chip fault">${result.faultName}</span>`;
+    document.getElementById("permission-info").innerHTML = `${chip}<ul class="reason-list">` + result.steps.map((s) => `<li>${s.name}: ${s.isPass ? "✓" : "✗"} ${s.reason}</li>`).join("") + "</ul>";
+    permissionView.redraw();
+  }
+  document.getElementById("fig-permission").addEventListener("change", (event) => {
+    const input = event.target;
+    if (!input.dataset.group) return;
+    const target = input.dataset.group === "pte" ? permissionPte : permissionStatus;
+    target[input.dataset.key] = input.checked ? 1 : 0;
+    paintPermission();
+  });
+  MB.seg("#permission-mode", (value) => { permissionMode = value; paintPermission(); });
+  MB.seg("#permission-access", (value) => { permissionAccess = value; paintPermission(); });
+  renderPermissionEditors();
+  paintPermission();
+})();
+</script>
+</body>
+</html>

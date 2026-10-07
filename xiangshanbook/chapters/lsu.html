@@ -1,0 +1,825 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>로드·스토어 유닛 · XiangShanBook</title>
+<meta name="description" content="XiangShan 곤명호 v3 메모리 블록의 로드·스토어 유닛. 5단 로드 파이프라인과 재실행(replay), 로드·스토어 큐, 스토어→로드 포워딩, 메모리 순서 위반과 StoreSet 의존 예측, 스토어 버퍼(sbuffer).">
+<link rel="icon" type="image/svg+xml" href="../favicon.svg">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/common.js"></script>
+<style>
+  .cause-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 6px; padding: 12px 18px; }
+  .cause-grid label { display: flex; gap: 8px; align-items: center; font-size: 13.5px; padding: 6px 9px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); cursor: pointer; }
+  .cause-grid label.win { border-color: var(--accent); background: var(--accent-soft); font-weight: 700; }
+  .cause-grid .code { font-family: var(--mono); font-size: 11.5px; color: var(--text-faint); min-width: 22px; }
+  .store-rows { display: grid; gap: 8px; padding: 12px 18px; }
+  .store-row { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; font-size: 13.5px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg); }
+  .store-row b { font-family: var(--mono); min-width: 40px; }
+  .store-row select { font: inherit; font-size: 13px; padding: 3px 6px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg-elev); color: var(--text); }
+</style>
+</head>
+<body data-chapter="lsu">
+<main class="chapter">
+  <header class="chapter-hero">
+    <div class="eyebrow">Chapter 09</div>
+    <h1>로드·스토어 유닛</h1>
+    <p class="lead">덧셈은 순서를 바꿔 실행해도 레지스터 이름만 맞추면 안전하다. 메모리는 다르다. 로드가 읽으려는 주소에 앞선 스토어가 이미 무언가를 썼는지는 두 명령의 주소를 계산해 봐야 알 수 있다. 그런데 비순차 코어는 그 주소가 나오기도 전에 로드를 먼저 보내고 싶어 한다. XiangShan 곤명호 v3의 메모리 블록<span class="en">(MemBlock)</span>은 이 위험한 추측을 감당하는 장치들의 모음이다. 로드를 일단 보내고, 틀리면 다시 실행하고, 그래도 틀렸으면 파이프라인을 비운다. 자주 틀리는 짝은 기억해 두었다가 기다리게 한다.</p>
+    <ul class="objectives">
+      <li>5단 로드 파이프라인(s0~s4)에서 TLB·DCache·포워딩이 어떻게 겹쳐 진행되는지 따라간다.</li>
+      <li>로드가 실패하는 13가지 재실행 원인과 그 우선순위, 빠른 재실행과 큐 재실행의 차이를 익힌다.</li>
+      <li>앞선 스토어의 데이터를 바이트 단위로 가져오는 스토어→로드 포워딩을 직접 조합해 본다.</li>
+      <li>주소를 모른 채 먼저 실행한 로드가 순서 위반을 일으키는 과정과, StoreSet 예측기가 그것을 막는 방법을 시뮬레이션한다.</li>
+      <li>커밋된 스토어가 스토어 버퍼(sbuffer)에서 합쳐지고 캐시로 내려가는 흐름을 관찰한다.</li>
+    </ul>
+  </header>
+
+  <!-- ============================================================ 1 -->
+  <section id="map">
+    <h2>메모리 블록의 지도</h2>
+    <p>백엔드 이슈 큐에서 나온 메모리 명령은 세 종류의 파이프라인으로 들어간다. 로드는 <b>로드 유닛</b> 3개, 스토어 주소는 <b>STA</b><span class="en">(Store Address)</span> 유닛 2개, 스토어 데이터는 <b>STD</b><span class="en">(Store Data)</span> 유닛이 맡는다. 스토어를 주소와 데이터 두 개의 마이크로 연산으로 쪼개는 이유는 간단하다. 주소 레지스터와 데이터 레지스터가 준비되는 시점이 다르기 때문이다. 주소만 먼저 알아도 뒤의 로드들이 이 스토어와 겹치는지 미리 검사할 수 있다.</p>
+    <p>명령어마다 순서를 기억하는 자리도 필요하다. 로드는 디스패치 때 <b>가상 로드 큐</b><span class="en">(VirtualLoadQueue)</span>에, 스토어는 <b>가상 스토어 큐</b>에 프로그램 순서대로 자리를 받는다. 실행 중 문제가 생긴 로드는 <b>재실행 큐</b><span class="en">(LoadQueueReplay)</span>에서 기다린다. 순서 위반을 검사하려고 주소를 적어 두는 <b>RAR·RAW 큐</b>도 따로 있다. 커밋된 스토어는 스토어 큐에서 <b>스토어 버퍼</b><span class="en">(sbuffer)</span>로 옮겨져 캐시 라인 단위로 합쳐진 뒤 DCache에 쓰인다.</p>
+    <div class="table-wrap"><table>
+      <tr><th>구조</th><th class="num">DefaultConfig 크기</th><th>역할</th><th>위치</th></tr>
+      <tr><td>로드 파이프라인</td><td class="num">3</td><td>LoadUnit 3개, 각 5단(s0~s4)</td><td class="mono">Parameters.scala:166</td></tr>
+      <tr><td>스토어 파이프라인</td><td class="num">2</td><td>STA 유닛(주소). 데이터는 STD가 따로</td><td class="mono">Parameters.scala:167</td></tr>
+      <tr><td>가상 로드 큐</td><td class="num">120</td><td>로드의 프로그램 순서와 상태</td><td class="mono">Parameters.scala:101</td></tr>
+      <tr><td>RAR 큐</td><td class="num">96</td><td>로드-로드 순서 위반 검사용 주소</td><td class="mono">Parameters.scala:102</td></tr>
+      <tr><td>RAW 큐</td><td class="num">56</td><td>스토어-로드 순서 위반 검사용 주소</td><td class="mono">Parameters.scala:103</td></tr>
+      <tr><td>재실행 큐</td><td class="num">120</td><td>실패한 로드가 원인 해소를 기다리는 곳</td><td class="mono">Parameters.scala:105</td></tr>
+      <tr><td>스토어 큐</td><td class="num">64 × 2</td><td>물리 64칸(주소·데이터), 순서 포인터 공간은 2배인 128</td><td class="mono">Parameters.scala:109-110</td></tr>
+      <tr><td>스토어 버퍼</td><td class="num">16</td><td>64 B 라인 단위로 커밋된 스토어를 합침, 9칸부터 내보냄</td><td class="mono">Parameters.scala:176-177</td></tr>
+      <tr><td>StoreSet SSIT / LFST</td><td class="num">1024 / 64</td><td>메모리 의존 예측표</td><td class="mono">Parameters.scala:896-903</td></tr>
+    </table></div>
+    <div class="callout code"><strong>MemBlock이 실제로 쓰는 유닛</strong>
+      <p>소스 트리에는 옛 <code>LoadUnit</code>과 새 <code>NewLoadUnit</code>이 함께 있다. 곤명호 v3의 MemBlock이 만드는 것은 단계별 모듈로 나뉜 새 유닛이다.</p>
+<pre><code><span class="c">// src/main/scala/xiangshan/mem/MemBlock.scala:512-513, 588-589</span>
+<span class="k">val</span> newLoadUnits = Seq.tabulate(LduCnt)(i =&gt; Module(<span class="k">new</span> NewLoadUnit(ldaParams(i))))
+<span class="k">val</span> storeUnits   = Seq.tabulate(StaCnt)(i =&gt; Module(<span class="k">new</span> NewStoreUnit(staParams(i))))
+<span class="c">...</span>
+<span class="k">val</span> lsq     = Module(<span class="k">new</span> LsqWrapper)
+<span class="k">val</span> sbuffer = Module(<span class="k">new</span> Sbuffer)</code></pre>
+    </div>
+  </section>
+
+  <!-- ============================================================ 2 -->
+  <section id="loadpipe">
+    <h2>로드 파이프라인 다섯 단</h2>
+    <p><code>NewLoadUnit</code>은 <code>LoadUnitS0</code>부터 <code>LoadUnitS4</code>까지 다섯 개의 단계 모듈을 이어 붙인 구조다. 각 단의 일은 다음과 같다.</p>
+    <ul>
+      <li><b>s0</b>: 일곱 가지 요청원 중 하나를 고른다. 고른 요청으로 주소를 만들어 TLB와 DCache에 동시에 요청을 보낸다. 같은 사이클에 스토어 큐·sbuffer·MSHR로 포워딩 질의도 띄운다. 결과를 기다릴 이슈 큐의 의존 명령에는 <b>미리 깨우기</b><span class="en">(wakeup)</span> 신호를 보낸다.</li>
+      <li><b>s1</b>: TLB가 물리 주소를 돌려준다. DCache는 태그를 비교하고, 포워딩 질의에 물리 주소가 붙는다. 같은 주소에 막 들어온 스토어가 있는지 확인하는 <b>nuke</b> 검사도 이 단에서 한다.</li>
+      <li><b>s2</b>: 물리 메모리 보호(PMP)를 검사하고 포워딩 응답과 DCache 데이터를 받는다. 이 로드가 정상 완료인지, 재실행해야 하는지, 예외인지를 여기서 1차로 판정한다.</li>
+      <li><b>s3</b>: 결과를 백엔드에 쓰고, 재실행이 필요하면 빠른 재실행이나 재실행 큐로 보낸다. s0에서 보낸 미리 깨우기를 취소하는 일도 이 단에서 한다.</li>
+      <li><b>s4</b>: 16 B 경계를 넘는 비정렬 접근을 두 번에 나눠 처리했을 때 머리와 꼬리를 합친다.</li>
+    </ul>
+    <div class="callout code"><strong>s0의 요청원 우선순위</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/mem/pipeline/NewLoadUnit.scala:93-101</span>
+<span class="c">/**
+  * Request sources arbitration, in order of priority:
+  * 0. unalign tail inject from s1
+  * 1. high-priority replay from LRQ, including NC / MMIO replay
+  * 2. fast replay from s3
+  * 3. low-priority replay from LRQ
+  * 4. high-confidence prefetch
+  * 5. loads issued from IQ
+  * 6. low-confidence prefetch
+  */</span></code></pre>
+      <p>이슈 큐에서 갓 나온 로드(5번)는 재실행 로드와 고신뢰 프리페치보다 뒤다. 이미 자원을 붙들고 있는 오래된 로드를 먼저 끝내야 큐가 막히지 않기 때문이다.</p>
+    </div>
+
+    <div class="sim" id="sim-pipe">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>로드 하나의 일생</h3>
+        <div class="seg" id="lp-event"><button data-value="hit" class="on">DCache 적중</button><button data-value="bank">뱅크 충돌</button><button data-value="miss">DCache 미스</button><button data-value="tlb">TLB 미스</button><button data-value="forward">포워딩 실패</button></div>
+      </div>
+      <div class="sim-view"><canvas id="cv-pipe"></canvas></div>
+      <div class="sim-controls">
+        <label class="ctrl"><span>DCache 미스 처리 시간 <output id="lp-miss-out"></output></span><input type="range" id="lp-miss" min="8" max="60" step="1" value="20"></label>
+        <label class="ctrl"><span>TLB 미스 처리 시간 <output id="lp-tlb-out"></output></span><input type="range" id="lp-tlb" min="6" max="60" step="1" value="16"></label>
+        <label class="ctrl"><span>스토어 데이터 준비까지 <output id="lp-std-out"></output></span><input type="range" id="lp-std" min="2" max="20" step="1" value="6"></label>
+        <div class="ctrl-row"><button class="btn sm" id="lp-back">← 한 사이클</button><button class="btn sm primary" id="lp-step">한 사이클 →</button><button class="btn sm" id="lp-play">▶ 자동</button><button class="btn sm" id="lp-end">끝까지 ⏭</button></div>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">현재 사이클</span><span class="v" id="lp-cycle">0</span></div>
+        <div class="stat"><span class="k">시도 횟수</span><span class="v" id="lp-tries">—</span></div>
+        <div class="stat"><span class="k">재실행 원인</span><span class="v" id="lp-cause">—</span></div>
+        <div class="stat"><span class="k">s0 → 결과 기록</span><span class="v" id="lp-total">—</span></div>
+      </div>
+      <div class="info-panel" id="lp-info"></div>
+      <figcaption><span class="try">따라가 보기</span>가로가 사이클, 세로가 같은 로드의 시도 순서다. 첫 시도에서 미리 깨우기(▲)를 보내고, s2에서 문제가 드러나면 s3에서 그 깨우기를 취소한다(✕). <b>뱅크 충돌</b>은 원인이 금방 사라지므로 s3에서 곧장 s0으로 되돌아가는 빠른 재실행을 탄다. <b>DCache 미스</b>, <b>TLB 미스</b>, <b>포워딩 실패</b>는 재실행 큐(LRQ)에 들어가 원인이 풀릴 때까지 기다린다. 미스의 경우 재실행 로드는 리필 데이터를 MSHR·TileLink D 채널 포워딩으로 받는다. 웹 모델은 단계 순서와 재실행 경로만 보여 주며, 사이클 수는 슬라이더로 정한 가정값이다.</figcaption>
+    </div>
+  </section>
+
+  <!-- ============================================================ 3 -->
+  <section id="replay">
+    <h2>재실행: 실패를 정상으로 다루기</h2>
+    <p>로드가 s2에 왔을 때 일을 끝낼 수 없는 이유는 많다. 물리 주소가 아직 없을 수 있다(TLB 미스). 캐시에 데이터가 없을 수도 있다(DCache 미스). 앞선 스토어의 데이터가 아직 안 왔을 수도 있다(포워딩 실패). 같은 사이클에 다른 로드와 같은 SRAM 뱅크를 두드렸을 수도 있다(뱅크 충돌). XiangShan은 이 모두를 예외가 아니라 <span class="term">재실행</span><span class="en">(replay)</span>으로 처리한다. 결과를 버리고 나중에 s0부터 다시 실행하는 것이다. 원인이 여러 개 겹칠 수 있으므로 원인마다 번호가 있고, 번호가 작을수록 먼저 처리한다.</p>
+    <div class="callout warn"><strong>우선순위는 교착 방지 장치다</strong>
+      <p><code>LoadQueueReplay.scala</code>는 이 번호표 위에 "우선순위를 바꾸면 교착(deadlock)이 생길 수 있다"고 굵게 경고해 둔다. 예를 들어 TLB 미스(3)는 DCache 미스(6)보다 먼저 처리해야 한다. 물리 주소가 없으면 캐시 미스 여부 자체를 확정할 수 없기 때문이다.</p>
+    </div>
+    <figure class="play" id="fig-cause">
+      <div class="cause-grid" id="cause-grid"></div>
+      <div class="play-view"><canvas id="cv-cause"></canvas></div>
+      <figcaption><span class="try">눌러 보기</span>동시에 일어난 원인을 여러 개 골라 보자. 테두리가 강조된 칸이 로드가 기록하는 대표 원인(가장 작은 번호)이다. 아래 띠는 이 로드가 어느 길로 재실행되는지 보여 준다. 뱅크 충돌(8), MSHR 거절(5), nuke(11) 중 하나만 있으면 s3에서 바로 다시 들어가는 빠른 재실행 후보가 된다. 다만 이미 한 번 빠른 재실행을 탔거나 비정렬 접근이면 재실행 큐로 간다. 빠른 재실행 후보라도 s0 중재에서 지면 재실행 큐로 간다.</figcaption>
+    </figure>
+    <div class="callout code"><strong>재실행 원인 번호표</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/mem/lsqueue/LoadQueueReplay.scala:46-71 (요약)</span>
+<span class="k">val</span> C_UNCACHE = 0  <span class="c">// uncache</span>
+<span class="k">val</span> C_SMF = 1      <span class="c">// storeQueue multi forward invalid</span>
+<span class="k">val</span> C_MA  = 2      <span class="c">// st-ld violation re-execute check</span>
+<span class="k">val</span> C_TM  = 3      <span class="c">// tlb miss check</span>
+<span class="k">val</span> C_FF  = 4      <span class="c">// store-to-load-forwarding check</span>
+<span class="k">val</span> C_DR  = 5      <span class="c">// dcache replay check</span>
+<span class="k">val</span> C_DM  = 6      <span class="c">// dcache miss check</span>
+<span class="k">val</span> C_WF  = 7      <span class="c">// wpu predict fail</span>
+<span class="k">val</span> C_BC  = 8      <span class="c">// dcache bank conflict check / unalign tail split fail</span>
+<span class="k">val</span> C_RAR = 9      <span class="c">// RAR queue accept check</span>
+<span class="k">val</span> C_RAW = 10     <span class="c">// RAW queue accept check</span>
+<span class="k">val</span> C_NK  = 11     <span class="c">// st-ld violation</span>
+<span class="k">val</span> C_MF  = 12     <span class="c">// misalignBuffer Full</span></code></pre>
+    </div>
+    <div class="predict"><strong>미리 깨운 의존 명령은 어떻게 되나</strong>
+      <p>s0에서 미리 깨우기를 받은 덧셈 명령이 이미 이슈 큐를 떠났는데, 로드가 s2에서 DCache 미스로 판정났다. 이 덧셈은 어떻게 될까?</p>
+      <details><summary>답 보기</summary><p>로드 유닛이 s3에서 <b>취소</b><span class="en">(load cancel)</span> 신호를 보낸다. 이미 이슈된 의존 명령은 실행 결과를 쓰지 못하고 이슈 큐로 돌아가 다시 기다린다. 로드 결과를 쓰는 명령을 로드와 거의 동시에 보내야 로드 적중 시 지연이 짧아진다. 그래서 XiangShan은 적중을 낙관적으로 가정하고, 틀리면 취소하는 쪽을 택했다.</p></details>
+    </div>
+  </section>
+
+  <!-- ============================================================ 4 -->
+  <section id="forward">
+    <h2>스토어→로드 포워딩</h2>
+    <p>스토어는 커밋된 뒤에야 캐시에 쓰인다. 그 전에 같은 주소를 읽는 로드는 캐시가 아니라 <b>스토어 큐에 있는 앞선 스토어의 데이터</b>를 받아야 한다. 이것이 <span class="term">스토어→로드 포워딩</span><span class="en">(STLF)</span>이다. 곤명호 v3의 스토어 큐는 주소와 바이트 범위가 겹치는 앞선 스토어 중 <b>가장 최근 스토어 하나</b>를 선택한다. 일치하는 스토어가 하나라면 그 스토어가 덮는 바이트를 받고, 나머지는 sbuffer와 DCache에서 채울 수 있다. 여러 스토어가 일치하면 선택된 스토어가 로드 전체를 덮을 때만 안전하게 포워딩한다. 그렇지 않으면 여러 스토어의 바이트를 합치지 않고 <b>C_SMF(원인 1번)</b>로 재실행한다(<code>NewStoreQueue.scala:509-520, 633-658</code>). 선택된 스토어의 데이터가 준비되지 않았다면 C_FF(원인 4번)도 발생하며, 두 원인이 겹치면 C_SMF가 우선한다.</p>
+    <figure class="play" id="fig-stlf">
+      <div class="store-rows" id="stlf-rows"></div>
+      <div class="play-view"><canvas id="cv-stlf"></canvas></div>
+      <div class="play-ctrl">
+        <label class="ctrl"><span>로드 시작 바이트 <output id="stlf-offset-out"></output></span><input type="range" id="stlf-offset" min="0" max="8" step="1" value="0"></label>
+        <div class="ctrl"><span>로드 크기</span><div class="seg" id="stlf-size"><button data-value="1">1 B</button><button data-value="2">2 B</button><button data-value="4">4 B</button><button data-value="8" class="on">8 B</button></div></div>
+        <label class="check"><input type="checkbox" id="stlf-sbuffer" checked> sbuffer에 같은 라인의 커밋된 바이트가 있음</label>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">스토어 큐 후보</span><span class="v" id="stlf-sq">—</span></div>
+        <div class="stat"><span class="k">sbuffer 후보</span><span class="v" id="stlf-sb">—</span></div>
+        <div class="stat"><span class="k">DCache 후보</span><span class="v" id="stlf-dc">—</span></div>
+        <div class="stat"><span class="k">판정</span><span class="v" id="stlf-verdict">—</span></div>
+      </div>
+      <figcaption><span class="try">조합해 보기</span>위 줄은 오래된 순서로 쌓인 스토어 네 개다. 시작 바이트, 크기, 주소·데이터 준비 여부를 바꿔 보자. 아래 지도는 선택된 스토어 하나와 sbuffer·DCache에서 가져올 바이트 후보를 보여 준다. 재실행 판정이면 이 후보 데이터는 사용하지 않으며, 줄 테두리가 빨갛게 표시된다. 예를 들어 [0,4)와 [4,8)을 쓰는 두 스토어 뒤의 8바이트 로드는 C_SMF다. 가장 최근 스토어가 [0,8) 전체를 덮으면 다중 일치여도 진행할 수 있다. 이 모델은 모든 스토어가 로드보다 오래되었고 가상·물리 주소가 일치한다고 가정하며, CBO·페이지 경계 접근과 메모리 의존 예측에 따른 기다림은 생략했다. 주소를 모르는 스토어는 추측으로 지나가며 이후 RAW 검사를 받는다.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ============================================================ 5 -->
+  <section id="violation">
+    <h2>순서 위반과 StoreSet 의존 예측</h2>
+    <p>로드가 실행될 때 앞선 스토어의 주소가 아직 계산되지 않았다면 두 가지 길이 있다. 그 스토어를 기다리거나, 겹치지 않으리라 믿고 먼저 가는 것이다. 대부분의 로드-스토어 짝은 실제로 겹치지 않으므로 XiangShan은 기본적으로 먼저 간다. 대신 먼저 간 로드의 물리 주소와 바이트 마스크를 <b>RAW 큐</b>에 적어 둔다. 나중에 STA 유닛이 스토어 주소를 계산하면 RAW 큐에서 자기보다 뒤에 있으면서 주소가 겹치는 로드를 찾는다. 찾으면 그 로드는 틀린 값을 읽은 것이므로, 로드부터 그 뒤 명령을 모두 버리고 다시 가져오는 <span class="term">롤백</span><span class="en">(rollback)</span>이 일어난다.</p>
+    <p>롤백은 비싸다. 같은 짝이 매번 겹친다면 차라리 기다리는 편이 낫다. <span class="term">StoreSet</span><span class="en">(Chrysos·Emer, ISCA 1998)</span>은 이 경험을 기억하는 예측기다. 두 개의 표로 이루어진다.</p>
+    <ul>
+      <li><b>SSIT</b><span class="en">(Store Set Identifier Table)</span>: PC로 찾는 1024칸 표다. 위반을 일으킨 로드와 스토어의 PC에 같은 <b>스토어 집합 번호</b>(SSID)를 적는다.</li>
+      <li><b>LFST</b><span class="en">(Last Fetched Store Table)</span>: SSID로 찾는 64칸 표다. 각 집합에서 아직 주소를 내지 않은 최근 스토어를 칸마다 최대 2개까지 기억한다.</li>
+    </ul>
+    <p>리네임 단계에서 로드의 SSID로 LFST를 찾았는데 유효한 스토어가 있으면 그 스토어의 SQ 번호를 받는다. 로드는 이슈 큐에서 그 스토어가 주소를 낼 때까지 기다린다.</p>
+    <div class="callout code"><strong>위반이 학습되는 네 가지 경우</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/mem/mdp/StoreSet.scala:221-227, 273-311 (요약)</span>
+<span class="k">val</span> s2_ldSsidAllocate = XORFold(s2_mempred_update_req.ldpc, SSIDWidth)
+<span class="k">val</span> s2_stSsidAllocate = XORFold(s2_mempred_update_req.stpc, SSIDWidth)
+<span class="k">val</span> s2_allocSsid = Mux(s2_ldSsidAllocate &lt; s2_stSsidAllocate, s2_ldSsidAllocate, s2_stSsidAllocate)
+<span class="k">val</span> s2_winnerSSID = Mux(s2_loadOldSSID &lt; s2_storeOldSSID, s2_loadOldSSID, s2_storeOldSSID)
+<span class="c">// b00: 둘 다 집합 없음   → 새 SSID를 둘에게
+// b10: 로드만 집합 있음  → 스토어를 로드의 집합에
+// b01: 스토어만 집합 있음 → 로드를 스토어의 집합에
+// b11: 둘 다 있음        → 번호가 작은 쪽이 승자, 둘 다 승자 집합으로</span></code></pre>
+      <p>SSIT는 시간이 지나면 통째로 비운다. 한때 겹쳤던 짝이 영원히 기다리지 않도록 하기 위해서다. 초기화 주기는 사용자 CSR(<code>lvpred_timeout</code>)로 정하며, 2<sup>14</sup>~2<sup>20</sup> 사이클 범위에서 고른다(<code>Parameters.scala:893-894</code>, <code>StoreSet.scala:148-172</code>).</p>
+    </div>
+
+    <div class="sim" id="sim-mdp">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>위반과 기다림의 저울질</h3>
+        <div class="seg" id="mdp-mode"><button data-value="none">예측 없음 (항상 먼저)</button><button data-value="storeset" class="on">StoreSet</button><button data-value="always">항상 기다림</button></div>
+      </div>
+      <div class="sim-view"><canvas id="cv-mdp"></canvas></div>
+      <div class="sim-controls">
+        <label class="ctrl"><span>겹침 확률 (로드 A) <output id="mdp-alias-out"></output></span><input type="range" id="mdp-alias" min="0" max="1" step="0.05" value="0.3"></label>
+        <label class="ctrl"><span>스토어 주소 계산 지연 <output id="mdp-delay-out"></output></span><input type="range" id="mdp-delay" min="2" max="30" step="1" value="12"></label>
+        <label class="ctrl"><span>롤백 비용 <output id="mdp-penalty-out"></output></span><input type="range" id="mdp-penalty" min="5" max="40" step="1" value="20"></label>
+        <label class="ctrl"><span>기다림이 드러나는 비율 <output id="mdp-exposure-out"></output></span><input type="range" id="mdp-exposure" min="0" max="1" step="0.05" value="0.25"></label>
+        <label class="ctrl"><span>SSIT 초기화 주기 (반복) <output id="mdp-reset-out"></output></span><input type="range" id="mdp-reset" min="0" max="400" step="20" value="0"></label>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">롤백(위반)</span><span class="v" id="mdp-violation">—</span></div>
+        <div class="stat"><span class="k">기다림</span><span class="v" id="mdp-wait">—</span></div>
+        <div class="stat"><span class="k">헛기다림</span><span class="v" id="mdp-false">—</span></div>
+        <div class="stat"><span class="k">추정 손실 사이클</span><span class="v" id="mdp-lost">—</span></div>
+      </div>
+      <div class="play-view"><canvas id="cv-mdp-compare"></canvas></div>
+      <figcaption><span class="try">저울질해 보기</span>500번 도는 루프의 반복마다 스토어 하나와 로드 두 개가 있다. 로드 A는 정해진 확률로 스토어와 같은 주소를 읽고, 로드 B는 절대 겹치지 않는다. 위 그림은 마지막 24번 반복이다. 회색 막대는 스토어 주소가 나오기까지의 구간이고, ●은 로드가 실행된 시점이다. 빨간 ✕는 롤백, 노란 막대는 기다림이다. 아래 막대는 세 정책의 손실을 나란히 비교한다. 손실은 '롤백 수 × 롤백 비용 + 기다린 사이클 합 × 드러나는 비율'로 셈한 단순 모델이다. 롤백은 뒤 명령을 모두 버리므로 비용이 그대로 드러나지만, 기다림은 비순차 실행이 다른 명령으로 일부를 메운다. StoreSet은 첫 위반 뒤 로드 A만 기다리게 하고, 로드 B는 계속 먼저 보낸다. 겹침 확률이 낮은데 A가 늘 기다리면 '헛기다림'이 쌓인다. SSIT 초기화 주기를 짧게 하면 이 둘 사이의 균형이 바뀐다(0은 초기화 없음). 기본값(롤백 20, 드러나는 비율 25%)에서 겹침 확률 30%면 손실은 예측 없음 2,920 · StoreSet 1,392 · 항상 기다림 2,750 사이클이다. 겹침 확률을 5%로 낮추면 예측 없음이 740으로 가장 낫다. 이 수치는 웹 모델의 값이다.</figcaption>
+    </div>
+    <div class="callout deep"><strong>RAR 큐: 로드와 로드 사이의 순서</strong>
+      <p>RISC-V의 메모리 모델 RVWMO는 같은 주소를 읽는 두 로드의 순서도 지키라고 요구한다. 뒤의 로드가 먼저 실행되어 옛 값을 읽었다고 하자. 그 뒤 다른 코어가 그 라인을 고쳐 이 코어의 캐시에서 내보냈다(release/probe). 그다음 앞의 로드가 새 값을 읽으면 두 로드의 순서가 뒤집혀 보인다. RAR 큐는 아직 앞선 로드가 끝나지 않은 상태에서 먼저 실행된 로드의 주소와 'released' 표시를 기록한다. 앞의 로드가 나중에 실행될 때 같은 주소의 뒤 로드가 released 상태면 뒤 로드부터 다시 실행시킨다(<code>LoadQueueRAR.scala:87-96, 140-142, 239-262</code>). 주소 비교에는 물리 주소 전체가 아니라 XOR로 줄인 부분 주소를 쓴다.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ 6 -->
+  <section id="queues">
+    <h2>큐가 가득 차면</h2>
+    <p>로드 큐와 스토어 큐는 디스패치에서 자리를 받고 커밋에서 자리를 돌려준다. 한 명령이 큐에 머무는 시간은 디스패치에서 커밋까지다. 앞에 캐시 미스가 하나 걸려 커밋이 막히면 그 뒤 모든 메모리 명령이 큐에 쌓인다. 리틀의 법칙<span class="en">(Little's law)</span>에 따르면 평균 점유 칸 수는 들어오는 속도 × 머무는 시간이다. 큐 크기보다 이 값이 크면 디스패치가 멈춘다.</p>
+    <div class="formula">$$N_{\text{점유}} = \lambda \times W \quad\Rightarrow\quad \lambda_{\max} = \frac{N_{\text{큐}}}{W}$$
+      <div class="where">\(\lambda\): 사이클당 들어오는 로드(또는 스토어) 수, \(W\): 디스패치부터 커밋까지 평균 사이클. 큐 크기 \(N_{\text{큐}}\)가 받쳐 줄 수 있는 최대 유입 속도가 \(\lambda_{\max}\)다.</div></div>
+    <figure class="play" id="fig-queue">
+      <div class="play-view"><canvas id="cv-queue"></canvas></div>
+      <div class="play-ctrl">
+        <label class="ctrl"><span>사이클당 메모리 명령 <output id="q-rate-out"></output></span><input type="range" id="q-rate" min="0.5" max="4" step="0.1" value="2"></label>
+        <label class="ctrl"><span>로드 비율 <output id="q-load-out"></output></span><input type="range" id="q-load" min="0.3" max="0.9" step="0.05" value="0.65"></label>
+        <label class="ctrl"><span>평균 머무는 시간 W <output id="q-wait-out"></output></span><input type="range" id="q-wait" min="10" max="200" step="5" value="60"></label>
+        <div class="ctrl"><span>설정</span><div class="seg" id="q-config"><button data-value="default" class="on">DefaultConfig</button><button data-value="minimal">MinimalConfig</button></div></div>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">로드 큐 점유</span><span class="v" id="q-lq">—</span></div>
+        <div class="stat"><span class="k">스토어 큐 점유</span><span class="v" id="q-sq">—</span></div>
+        <div class="stat"><span class="k">먼저 차는 큐</span><span class="v" id="q-first">—</span></div>
+      </div>
+      <figcaption><span class="try">만져 보기</span>원 두 개는 가상 로드 큐와 스토어 큐(물리 칸 기준)다. 색칠된 칸이 리틀의 법칙으로 계산한 평균 점유이고, 넘친 부분은 빨갛게 바깥으로 삐져나온다. 머무는 시간 W를 늘려 보자. 긴 캐시 미스가 커밋을 막는 상황이다. 스토어 비율이 높은 코드는 64칸 스토어 큐가 먼저 찬다. MinimalConfig(로드 큐 24, 스토어 큐 16)로 바꾸면 같은 부하에서도 훨씬 일찍 막힌다.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ============================================================ 7 -->
+  <section id="sbuffer">
+    <h2>스토어 버퍼: 커밋된 스토어의 대기실</h2>
+    <p>ROB가 스토어를 커밋하면 그 스토어는 더 이상 취소되지 않는다. 하지만 DCache에 바로 쓰기에는 캐시 쓰기 포트가 귀하다. 커밋된 스토어는 사이클당 최대 2개씩(<code>EnsbufferWidth = 2</code>) 스토어 큐를 떠나 <span class="term">sbuffer</span>로 들어간다. sbuffer의 16칸은 각각 64 B 캐시 라인 하나와 바이트 마스크를 담는다. 같은 라인에 대한 스토어는 기존 칸에 <b>합쳐진다</b>. 그래서 memcpy처럼 연속으로 쓰는 코드는 8바이트 스토어 8개가 캐시 쓰기 한 번이 된다.</p>
+    <p>칸을 비우는 규칙은 다음과 같다. 쓰기 대기 중인 칸이 문턱(기본 9) 이상이 되거나, 15칸이 되거나, 16칸이 모두 차면 하나씩 DCache로 내보낸다. 고르는 순서는 PLRU다. 오래 머문 칸은 시간 초과(사용자 CSR <code>sbuffer_timeout</code>)로도 내보낸다. 문턱 값은 Constantin 런타임 손잡이로 바꿀 수 있다.</p>
+    <div class="callout code"><strong>내보내기 조건</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/mem/sbuffer/Sbuffer.scala:544-550</span>
+threshold := Constantin.createRecord(<span class="s">s"StoreBufferThreshold_${...HartId}"</span>, initValue = 9)
+<span class="c">...</span>
+<span class="k">val</span> ActiveCount = PopCount(activeMask)
+<span class="k">val</span> ValidCount = PopCount(validMask)
+<span class="k">val</span> forceThreshold = Mux(io.force_write, threshold - base, threshold)
+<span class="k">val</span> do_eviction = GatedValidRegNext(ActiveCount &gt;= forceThreshold ||
+  ActiveCount === (StoreBufferSize-1).U || ValidCount === (StoreBufferSize).U, init = false.B)</code></pre>
+    </div>
+    <div class="sim" id="sim-sbuffer">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>sbuffer 16칸</h3>
+        <div class="seg" id="sb-pattern"><button data-value="sequential" class="on">연속 쓰기 (memcpy)</button><button data-value="hot">몇 라인 반복</button><button data-value="scatter">흩어진 쓰기</button></div>
+      </div>
+      <div class="sim-view"><canvas id="cv-sbuffer"></canvas></div>
+      <div class="sim-controls">
+        <label class="ctrl"><span>사이클당 커밋 스토어 <output id="sb-rate-out"></output></span><input type="range" id="sb-rate" min="0.2" max="2" step="0.1" value="1"></label>
+        <label class="ctrl"><span>내보내기 문턱 <output id="sb-threshold-out"></output></span><input type="range" id="sb-threshold" min="2" max="15" step="1" value="9"></label>
+        <label class="ctrl"><span>DCache 쓰기 소요 <output id="sb-latency-out"></output></span><input type="range" id="sb-latency" min="2" max="30" step="1" value="6"></label>
+        <div class="ctrl-row"><button class="btn sm" id="sb-reset">⏮ 처음</button><button class="btn sm" id="sb-play">▶ 재생</button><button class="btn sm" id="sb-fast">+500 사이클</button></div>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">들어온 스토어</span><span class="v" id="sb-stores">0</span></div>
+        <div class="stat"><span class="k">합쳐진 비율</span><span class="v" id="sb-merge">—</span></div>
+        <div class="stat"><span class="k">DCache 쓰기</span><span class="v" id="sb-writes">0</span></div>
+        <div class="stat"><span class="k">꽉 차서 멈춘 사이클</span><span class="v" id="sb-stall">0</span></div>
+      </div>
+      <figcaption><span class="try">돌려 보기</span>칸 하나가 sbuffer 엔트리 하나다. 안쪽의 8칸 띠는 64 B 라인을 8 B 단위로 나눈 것이고, 채워진 칸은 이미 쓰인 바이트다. 주황 테두리는 DCache로 내보내는 중(inflight)인 칸이다. '연속 쓰기'에서는 대부분의 스토어가 합쳐져 캐시 쓰기 수가 스토어 수의 약 8분의 1로 줄어든다. '흩어진 쓰기'에서는 거의 합쳐지지 않는다. 이때 쓰기 소요를 20 사이클로 늘리면 sbuffer가 가득 차 스토어가 거의 매 사이클 멈춘다(웹 모델 5,000 사이클 중 4,984 사이클). '몇 라인 반복'은 4개 라인만 계속 고쳐 써서 쓰기 대기 칸이 문턱에 닿지 않는다. 그래서 웹 모델에서는 DCache 쓰기가 한 번도 일어나지 않는다. 실제 RTL은 이런 칸을 시간 초과(<code>sbuffer_timeout</code>)로 내보낸다. 웹 모델은 교체 순서를 PLRU 대신 LRU로 근사했고, 시간 초과 내보내기는 생략했다.</figcaption>
+    </div>
+  </section>
+
+  <section class="keypoints">
+    <h2>핵심 정리</h2>
+    <ol>
+      <li>곤명호 v3 MemBlock은 로드 유닛 3개(각 5단, s0~s4)와 STA 유닛 2개, STD를 두고, 스토어를 주소와 데이터로 나눠 실행한다.</li>
+      <li>로드는 s0에서 TLB·DCache·포워딩을 동시에 시작하고, 의존 명령을 낙관적으로 미리 깨운다. 실패하면 s3에서 깨우기를 취소한다.</li>
+      <li>실패한 로드는 13가지 원인 번호 중 가장 작은 것으로 분류되어 빠른 재실행이나 재실행 큐(120칸)로 간다. 이 우선순위는 교착 방지를 위해 고정되어 있다.</li>
+      <li>스토어 큐는 가장 최근의 일치 스토어 하나를 고른다. 여러 스토어가 겹치는데 선택된 스토어가 로드 전체를 덮지 못하면 C_SMF로 재실행한다. 안전한 경우에만 나머지 바이트를 sbuffer·DCache에서 채우며, 선택된 스토어의 데이터가 없으면 C_FF로 재실행한다.</li>
+      <li>먼저 실행한 로드는 RAW 큐에 적혀 스토어 주소가 나올 때 검사받고, 겹치면 롤백한다. StoreSet(SSIT 1024, LFST 64)은 위반을 일으킨 짝을 기억해 다음부터 기다리게 한다.</li>
+      <li>커밋된 스토어는 16칸 sbuffer에서 라인 단위로 합쳐지고, 문턱(기본 9) 이상 차면 PLRU 순서로 DCache에 쓰인다.</li>
+    </ol>
+  </section>
+
+  <section id="quiz">
+    <h2>확인 퀴즈</h2>
+    <div class="quiz">
+      <div class="quiz-q" data-answer="2"><p>Q1. s0의 요청원 중재에서 가장 우선순위가 높은 것은?</p><div class="opts">
+        <button class="opt">이슈 큐에서 갓 나온 로드</button><button class="opt">고신뢰 프리페치</button><button class="opt">s1에서 되돌아온 비정렬 꼬리</button><button class="opt">저우선 재실행</button></div>
+        <div class="quiz-exp">0번이 비정렬 꼬리(unalign tail)다. 이미 머리가 파이프라인에 들어간 접근을 마무리해야 하기 때문이다. 이슈 큐 로드는 5번이다.</div></div>
+      <div class="quiz-q" data-answer="1"><p>Q2. 같은 로드에서 TLB 미스(3)와 뱅크 충돌(8)이 함께 일어났다. 기록되는 대표 원인과 경로는?</p><div class="opts">
+        <button class="opt">뱅크 충돌 · 빠른 재실행</button><button class="opt">TLB 미스 · 재실행 큐</button><button class="opt">둘 다 기록 · 예외</button></div>
+        <div class="quiz-exp">번호가 작은 TLB 미스가 대표 원인이다. 물리 주소가 없으면 다른 판정이 의미가 없으므로 재실행 큐에서 TLB 응답을 기다린다.</div></div>
+      <div class="quiz-q" data-answer="3"><p>Q3. 8바이트 로드의 하위 4바이트는 앞선 4바이트 스토어가, 상위 4바이트는 아무 스토어도 덮지 않는다. sbuffer에도 해당 바이트가 없다면?</p><div class="opts">
+        <button class="opt">포워딩 실패로 재실행</button><button class="opt">전부 DCache에서 읽는다</button><button class="opt">전부 스토어 큐에서 읽는다</button><button class="opt">하위는 스토어 큐, 상위는 DCache에서 합친다</button></div>
+        <div class="quiz-exp">포워딩은 바이트 마스크 단위다. 덮인 바이트는 스토어 큐가, 나머지는 DCache 데이터가 채운다. 스토어 데이터가 준비되어 있다면 재실행할 필요가 없다.</div></div>
+      <div class="quiz-q" data-answer="0"><p>Q4. 로드와 스토어가 모두 이미 서로 다른 스토어 집합에 속한 상태에서 위반이 일어났다. SSIT는 어떻게 바뀌나?</p><div class="opts">
+        <button class="opt">SSID가 작은 쪽 집합으로 둘 다 옮긴다</button><button class="opt">로드만 스토어의 집합으로 옮긴다</button><button class="opt">새 SSID를 둘 다에게 준다</button><button class="opt">아무것도 바꾸지 않는다</button></div>
+        <div class="quiz-exp">b11 경우다. 번호가 작은 쪽이 승자가 되고 둘 다 승자 집합으로 들어간다. 같은 집합에서 또 위반이 나면 strict 표시가 켜진다.</div></div>
+      <div class="quiz-q" data-answer="2"><p>Q5. sbuffer가 DCache로 칸을 내보내기 시작하는 조건이 아닌 것은?</p><div class="opts">
+        <button class="opt">쓰기 대기 칸 수가 문턱(기본 9) 이상</button><button class="opt">16칸이 모두 유효</button><button class="opt">로드가 sbuffer의 바이트를 포워딩해 갔을 때</button><button class="opt">칸이 sbuffer_timeout보다 오래 머물렀을 때</button></div>
+        <div class="quiz-exp">포워딩은 데이터를 읽어 갈 뿐 칸을 비우지 않는다. 내보내기는 점유 문턱, 거의 가득 참, 시간 초과, 그리고 펜스 같은 비우기(drain) 요청으로 일어난다.</div></div>
+    </div>
+  </section>
+</main>
+
+<script>
+/* ENGINE START: 노드에서 따로 돌려 볼 수 있도록 DOM에 의존하지 않는 모델만 둔다. */
+var LoadStoreEngine = (function () {
+  "use strict";
+  const CAUSES = [
+    { code: 0, name: "C_UNCACHE", label: "uncache 접근", isFastReplayable: false },
+    { code: 1, name: "C_SMF", label: "다중 포워딩 무효", isFastReplayable: false },
+    { code: 2, name: "C_MA", label: "위반 재검사", isFastReplayable: false },
+    { code: 3, name: "C_TM", label: "TLB 미스", isFastReplayable: false },
+    { code: 4, name: "C_FF", label: "포워딩 실패", isFastReplayable: false },
+    { code: 5, name: "C_DR", label: "DCache 거절(MSHR)", isFastReplayable: true },
+    { code: 6, name: "C_DM", label: "DCache 미스", isFastReplayable: false },
+    { code: 7, name: "C_WF", label: "웨이 예측 실패", isFastReplayable: false },
+    { code: 8, name: "C_BC", label: "뱅크 충돌", isFastReplayable: true },
+    { code: 9, name: "C_RAR", label: "RAR 큐 가득", isFastReplayable: false },
+    { code: 10, name: "C_RAW", label: "RAW 큐 가득", isFastReplayable: false },
+    { code: 11, name: "C_NK", label: "nuke(스토어 충돌)", isFastReplayable: true },
+    { code: 12, name: "C_MF", label: "비정렬 버퍼 가득", isFastReplayable: false },
+  ];
+
+  /** 같은 주소 영역의 앞선 스토어들 중 가장 최근 일치 하나를 선택한다. */
+  function resolveForwarding(stores, loadOffset, loadSize, hasSbufferBytes) {
+    const matches = stores.map((store, index) => ({ store, index })).filter(({ store }) =>
+      store.isAddressReady && store.offset < loadOffset + loadSize && loadOffset < store.offset + store.size);
+    const selected = matches[matches.length - 1];
+    const isFullOverlap = !!selected && selected.store.offset <= loadOffset &&
+      selected.store.offset + selected.store.size >= loadOffset + loadSize;
+    const isMultiForwardInvalid = matches.length > 1 && !isFullOverlap;
+    const isDataInvalid = !!selected && !selected.store.isDataReady;
+    const replayCause = isMultiForwardInvalid ? "C_SMF" : isDataInvalid ? "C_FF" : null;
+    const bytes = [];
+    for (let byte = loadOffset; byte < loadOffset + loadSize; byte++) {
+      const covered = selected && byte >= selected.store.offset && byte < selected.store.offset + selected.store.size;
+      if (covered) bytes.push({ byte, source: "store", storeIndex: selected.index, isDataMissing: isDataInvalid });
+      else bytes.push({ byte, source: hasSbufferBytes ? "sbuffer" : "dcache", storeIndex: -1, isDataMissing: false });
+    }
+    const hasUnknownOlderStore = stores.some((store) => !store.isAddressReady);
+    return { bytes, hasUnknownOlderStore, selectedStoreIndex: selected ? selected.index : -1,
+      isMultiForwardInvalid, isDataInvalid, replayCause, isForwardFail: replayCause !== null };
+  }
+
+  /**
+   * StoreSet 시뮬레이션. 반복마다 스토어 S, 로드 A(확률 aliasRate로 S와 같은 주소), 로드 B(겹치지 않음).
+   * 스토어 주소는 디스패치 후 storeAddressDelay 사이클에 나오고, 로드는 기다리지 않으면 2사이클에 실행된다.
+   * mode: "none" | "storeset" | "always"
+   */
+  function simulateMemoryDependence(options) {
+    const settings = Object.assign({ iterations: 500, aliasRate: 0.3, storeAddressDelay: 12, flushPenalty: 20, waitExposure: 0.25, mode: "storeset", resetPeriod: 0, seed: 3 }, options);
+    const LOAD_READY_DELAY = 2;
+    const SSIT_SIZE = 1024, SSID_WIDTH = 6;
+    const STORE_PC = 0x80001208, LOAD_A_PC = 0x80001210, LOAD_B_PC = 0x8000121c;
+    let state = settings.seed >>> 0 || 1;
+    const random = () => { state ^= state << 13; state >>>= 0; state ^= state >>> 17; state ^= state << 5; state >>>= 0; return state / 4294967296; };
+    const ssitValid = new Uint8Array(SSIT_SIZE), ssitId = new Uint8Array(SSIT_SIZE);
+    const ssitIndex = (pc) => ((pc >>> 1) ^ (pc >>> 11)) & (SSIT_SIZE - 1);
+    const xorFold = (value, width) => { let folded = 0; let v = value >>> 0; while (v) { folded ^= v & ((1 << width) - 1); v >>>= width; } return folded; };
+    const stats = { violations: 0, waits: 0, falseWaits: 0, waitCycles: 0, lostCycles: 0 };
+    const events = [];
+    for (let iteration = 0; iteration < settings.iterations; iteration++) {
+      if (settings.resetPeriod > 0 && iteration > 0 && iteration % settings.resetPeriod === 0) ssitValid.fill(0);
+      const isAliasing = random() < settings.aliasRate;
+      const storeReady = settings.storeAddressDelay;
+      const record = { iteration, isAliasing, storeReady, loads: [] };
+      [[LOAD_A_PC, isAliasing], [LOAD_B_PC, false]].forEach(([loadPc, isLoadAliasing]) => {
+        let shouldWait;
+        if (settings.mode === "none") shouldWait = false;
+        else if (settings.mode === "always") shouldWait = true;
+        else {
+          const loadEntry = ssitIndex(loadPc), storeEntry = ssitIndex(STORE_PC);
+          shouldWait = ssitValid[loadEntry] && ssitValid[storeEntry] && ssitId[loadEntry] === ssitId[storeEntry];
+        }
+        let issueTime = LOAD_READY_DELAY, isViolation = false;
+        if (shouldWait) {
+          issueTime = Math.max(LOAD_READY_DELAY, storeReady + 1);
+          stats.waits++;
+          stats.waitCycles += issueTime - LOAD_READY_DELAY;
+          if (!isLoadAliasing) stats.falseWaits++;
+        } else if (isLoadAliasing && issueTime < storeReady) {
+          isViolation = true;
+          stats.violations++;
+          if (settings.mode === "storeset") {
+            // 위반 학습: 두 PC 모두 집합이 없으면 XOR로 접은 PC 중 작은 값을 새 SSID로 준다.
+            const loadEntry = ssitIndex(loadPc), storeEntry = ssitIndex(STORE_PC);
+            const loadAssigned = ssitValid[loadEntry], storeAssigned = ssitValid[storeEntry];
+            let identifier;
+            if (!loadAssigned && !storeAssigned) identifier = Math.min(xorFold(loadPc, SSID_WIDTH), xorFold(STORE_PC, SSID_WIDTH));
+            else if (loadAssigned && !storeAssigned) identifier = ssitId[loadEntry];
+            else if (!loadAssigned && storeAssigned) identifier = ssitId[storeEntry];
+            else identifier = Math.min(ssitId[loadEntry], ssitId[storeEntry]);
+            ssitValid[loadEntry] = 1; ssitValid[storeEntry] = 1; ssitId[loadEntry] = identifier; ssitId[storeEntry] = identifier;
+          }
+        }
+        record.loads.push({ pc: loadPc, isAliasing: isLoadAliasing, shouldWait, issueTime, isViolation });
+      });
+      events.push(record);
+    }
+    // 롤백은 그 뒤 명령을 모두 버리므로 비용이 그대로 드러난다. 기다림은 다른 명령이 메워 일부만 드러난다.
+    stats.lostCycles = Math.round(stats.violations * settings.flushPenalty + stats.waitCycles * settings.waitExposure);
+    return { stats, events };
+  }
+
+  /** sbuffer 모델: 16칸, 칸마다 64 B 라인과 8 B 단위 마스크. 교체는 LRU로 근사한다. */
+  class StoreBufferModel {
+    constructor(options) {
+      this.settings = Object.assign({ entries: 16, threshold: 9, writeLatency: 6, storeRate: 1, pattern: "sequential", seed: 5, enqueueWidth: 2 }, options);
+      this.entries = Array.from({ length: this.settings.entries }, () => ({ isValid: false, isInflight: false, line: 0, mask: 0, lastUse: 0, finishAt: 0 }));
+      this.cycle = 0; this.stores = 0; this.merges = 0; this.writes = 0; this.stallCycles = 0;
+      this.credit = 0; this.cursor = 0; this.pending = [];
+      let state = this.settings.seed >>> 0 || 1;
+      this.random = () => { state ^= state << 13; state >>>= 0; state ^= state >>> 17; state ^= state << 5; state >>>= 0; return state / 4294967296; };
+    }
+    nextStoreAddress() {
+      const pattern = this.settings.pattern;
+      if (pattern === "sequential") { const address = this.cursor; this.cursor += 8; return address; }
+      if (pattern === "hot") { const line = Math.floor(this.random() * 4); return line * 64 + Math.floor(this.random() * 8) * 8; }
+      return Math.floor(this.random() * 4096) * 64 + Math.floor(this.random() * 8) * 8;
+    }
+    step() {
+      const settings = this.settings;
+      this.cycle++;
+      // DCache 쓰기가 끝난 칸을 비운다.
+      this.entries.forEach((entry) => { if (entry.isInflight && entry.finishAt <= this.cycle) { entry.isValid = false; entry.isInflight = false; entry.mask = 0; } });
+      // 커밋된 스토어가 도착한다(사이클당 최대 enqueueWidth개).
+      this.credit += settings.storeRate;
+      let enqueued = 0, isStalled = false;
+      while (this.credit >= 1 && enqueued < settings.enqueueWidth) {
+        if (!this.pending.length) this.pending.push(this.nextStoreAddress());
+        const address = this.pending[0];
+        const line = Math.floor(address / 64), word = Math.floor((address % 64) / 8);
+        let target = this.entries.find((entry) => entry.isValid && !entry.isInflight && entry.line === line);
+        if (target) this.merges++;
+        else {
+          target = this.entries.find((entry) => !entry.isValid);
+          if (!target) { isStalled = true; break; }
+          target.isValid = true; target.line = line; target.mask = 0;
+        }
+        target.mask |= 1 << word; target.lastUse = this.cycle;
+        this.pending.shift(); this.credit -= 1; enqueued++; this.stores++;
+      }
+      if (isStalled) this.stallCycles++;
+      if (this.credit > settings.enqueueWidth) this.credit = settings.enqueueWidth;
+      // 내보내기 판단: 쓰기 대기(active) 칸 수가 문턱 이상, 15칸, 또는 16칸이 모두 유효
+      const active = this.entries.filter((entry) => entry.isValid && !entry.isInflight);
+      const validCount = this.entries.filter((entry) => entry.isValid).length;
+      const shouldEvict = active.length >= settings.threshold || active.length === settings.entries - 1 || validCount === settings.entries;
+      if (shouldEvict && active.length) {
+        const victim = active.reduce((oldest, entry) => (entry.lastUse < oldest.lastUse ? entry : oldest));
+        victim.isInflight = true; victim.finishAt = this.cycle + settings.writeLatency; this.writes++;
+      }
+      return { isStalled };
+    }
+  }
+  return { CAUSES, resolveForwarding, simulateMemoryDependence, StoreBufferModel };
+})();
+/* ENGINE END */
+
+(function () {
+  "use strict";
+  const STAGES = ["s0", "s1", "s2", "s3", "s4"];
+  const STAGE_COLOR = ["accent-2", "accent-2", "accent", "ok", "text-faint"];
+
+  /* ---------------------------------------------------- 그림 9-1: 로드 하나의 일생 */
+  const STAGE_TEXT = {
+    s0: "요청원 중재 → 주소 생성, TLB·DCache 요청, 포워딩 질의 시작",
+    s1: "TLB가 물리 주소를 돌려줌 · DCache 태그 비교 · nuke 검사",
+    s2: "PMP 검사 · 포워딩 응답과 DCache 데이터 도착 · 성공/재실행 1차 판정",
+    s3: "결과 기록 또는 재실행 결정 · 미리 깨우기 취소",
+    s4: "비정렬 접근이면 머리와 꼬리를 합침",
+  };
+  let pipeEvent = "hit", pipeCycle = 0, missLatency = 20, tlbLatency = 16, storeDataDelay = 6;
+  function buildTimeline() {
+    // 시도마다 시작 사이클과 끝 단계, 결과를 계산한다.
+    const attempts = [];
+    const add = (start, outcome, cause) => attempts.push({ start, outcome, cause });
+    if (pipeEvent === "hit") add(0, "writeback", null);
+    else if (pipeEvent === "bank") { add(0, "fast", "C_BC (8) 뱅크 충돌"); add(4, "writeback", null); }
+    else if (pipeEvent === "miss") { add(0, "queue", "C_DM (6) DCache 미스"); add(3 + missLatency, "writeback", null); }
+    else if (pipeEvent === "tlb") { add(0, "queue", "C_TM (3) TLB 미스"); add(3 + tlbLatency, "writeback", null); }
+    else { add(0, "queue", "C_FF (4) 포워딩 실패"); add(3 + storeDataDelay, "writeback", null); }
+    const total = attempts[attempts.length - 1].start + 4;
+    return { attempts, total };
+  }
+  const pipeView = MB.canvas("#cv-pipe", { aspect: 0.2, minHeight: 170, maxHeight: 200, draw: drawPipe });
+  function drawPipe(ctx, width, height) {
+    const timeline = buildTimeline();
+    const columns = Math.max(timeline.total + 4, 12);
+    const left = 70, right = width - 10, top = 26, rowHeight = Math.min(46, (height - 56) / Math.max(2, timeline.attempts.length));
+    const cellWidth = (right - left) / columns;
+    for (let c = 0; c < columns; c++) {
+      if (columns <= 40 || c % 5 === 0) MB.text(ctx, String(c), left + c * cellWidth + cellWidth / 2, 12, { align: "center", size: 10, mono: true, color: MB.css("text-faint") });
+    }
+    ctx.fillStyle = MB.alpha(MB.css("accent"), 0.08);
+    ctx.fillRect(left + pipeCycle * cellWidth, top - 4, cellWidth, timeline.attempts.length * rowHeight + 8);
+    timeline.attempts.forEach((attempt, row) => {
+      const y = top + row * rowHeight;
+      MB.text(ctx, `시도 ${row + 1}`, 8, y + rowHeight / 2, { size: 12, color: MB.css("text-dim"), weight: 700 });
+      const lastStage = attempt.outcome === "writeback" ? 3 : 3;
+      for (let s = 0; s <= lastStage; s++) {
+        const cycle = attempt.start + s;
+        if (cycle > pipeCycle) continue;
+        const x = left + cycle * cellWidth;
+        ctx.fillStyle = MB.alpha(MB.css(STAGE_COLOR[s]), 0.22);
+        MB.roundRect(ctx, x + 1, y + 4, cellWidth - 2, rowHeight - 8, 5); ctx.fill();
+        MB.text(ctx, STAGES[s], x + cellWidth / 2, y + rowHeight / 2, { align: "center", size: cellWidth < 22 ? 8.5 : 11, mono: true, weight: 700 });
+        if (s === 0 && row === 0) MB.text(ctx, "▲", x + cellWidth / 2, y + 2, { align: "center", size: 10, color: MB.css("ok") });
+        if (s === 3 && attempt.outcome !== "writeback") MB.text(ctx, "✕", x + cellWidth - 6, y + 8, { align: "center", size: 11, color: MB.css("bad"), weight: 800 });
+      }
+      // 재실행 경로 표시
+      if (attempt.outcome !== "writeback" && pipeCycle >= attempt.start + 3) {
+        const next = timeline.attempts[row + 1];
+        const fromX = left + (attempt.start + 3.5) * cellWidth, toX = left + (next.start + 0.5) * cellWidth;
+        const yBottom = y + rowHeight - 4;
+        ctx.strokeStyle = attempt.outcome === "fast" ? MB.css("accent") : MB.css("warn");
+        ctx.setLineDash(attempt.outcome === "fast" ? [] : [4, 3]); ctx.lineWidth = 1.6;
+        ctx.beginPath(); ctx.moveTo(fromX, yBottom); ctx.lineTo(fromX, yBottom + 6); ctx.lineTo(toX, yBottom + 6); ctx.lineTo(toX, yBottom + 10); ctx.stroke(); ctx.setLineDash([]);
+        MB.text(ctx, attempt.outcome === "fast" ? "빠른 재실행" : "재실행 큐(LRQ)에서 대기", (fromX + toX) / 2, yBottom + 14, { align: "center", size: 10.5, color: ctx.strokeStyle, weight: 700 });
+      }
+      if (attempt.outcome === "writeback" && pipeCycle >= attempt.start + 3) MB.text(ctx, "결과 기록 ✓", left + (attempt.start + 4) * cellWidth + 4, y + rowHeight / 2, { size: 11.5, color: MB.css("ok"), weight: 700 });
+    });
+  }
+  function paintPipe() {
+    const timeline = buildTimeline();
+    pipeCycle = MB.clamp(pipeCycle, 0, timeline.total);
+    MB.set("lp-cycle", pipeCycle);
+    MB.set("lp-tries", timeline.attempts.length);
+    MB.set("lp-cause", timeline.attempts[0].cause ? timeline.attempts[0].cause.split(" ")[0] : "없음");
+    MB.set("lp-total", `${timeline.total - 1} <small>사이클</small>`);
+    let text = "";
+    timeline.attempts.forEach((attempt, row) => {
+      const stage = pipeCycle - attempt.start;
+      if (stage >= 0 && stage <= 3) text = `<b>시도 ${row + 1} · ${STAGES[stage]}</b>: ${STAGE_TEXT[STAGES[stage]]}` + (stage === 2 && attempt.cause ? ` → <b style="color:var(--bad)">${attempt.cause}</b>` : "");
+    });
+    if (!text) text = pipeCycle >= timeline.total - 1 ? "로드 완료. 데이터가 백엔드에 기록되었다." : "원인이 풀리기를 기다리는 중…";
+    document.getElementById("lp-info").innerHTML = text;
+    pipeView.redraw();
+  }
+  MB.seg("#lp-event", (v) => { pipeEvent = v; pipeCycle = 0; paintPipe(); });
+  MB.range("lp-miss", (v) => { missLatency = v; paintPipe(); }, (v) => v + " cyc");
+  MB.range("lp-tlb", (v) => { tlbLatency = v; paintPipe(); }, (v) => v + " cyc");
+  MB.range("lp-std", (v) => { storeDataDelay = v; paintPipe(); }, (v) => v + " cyc");
+  document.getElementById("lp-step").onclick = () => { pipeCycle++; paintPipe(); };
+  document.getElementById("lp-back").onclick = () => { pipeCycle = Math.max(0, pipeCycle - 1); paintPipe(); };
+  document.getElementById("lp-end").onclick = () => { pipeCycle = buildTimeline().total; paintPipe(); };
+  let pipeAccumulator = 0;
+  const pipeLoop = MB.loop(document.getElementById("sim-pipe"), (dt) => {
+    pipeAccumulator += dt;
+    if (pipeAccumulator > 0.35) { pipeAccumulator = 0; pipeCycle = pipeCycle >= buildTimeline().total ? 0 : pipeCycle + 1; paintPipe(); }
+  });
+  pipeLoop.running = false;
+  MB.playButton("lp-play", pipeLoop, ["⏸ 멈춤", "▶ 자동"]);
+  paintPipe();
+
+  /* ---------------------------------------------------- 그림 9-2: 재실행 원인 우선순위 */
+  const selectedCauses = new Set([6, 8]);
+  const causeGrid = document.getElementById("cause-grid");
+  causeGrid.innerHTML = LoadStoreEngine.CAUSES.map((cause) => `<label data-code="${cause.code}"><input type="checkbox" data-code="${cause.code}" ${selectedCauses.has(cause.code) ? "checked" : ""}><span class="code">${cause.code}</span>${cause.label}</label>`).join("");
+  causeGrid.addEventListener("change", (event) => {
+    const code = +event.target.dataset.code;
+    if (event.target.checked) selectedCauses.add(code); else selectedCauses.delete(code);
+    paintCause();
+  });
+  const causeView = MB.canvas("#cv-cause", { aspect: 0.16, minHeight: 110, maxHeight: 150, draw: drawCause });
+  let hasFastReplayedBefore = false;
+  function causeDecision() {
+    if (!selectedCauses.size) return { winner: null, path: "writeback" };
+    const winner = Math.min(...selectedCauses);
+    const isFast = LoadStoreEngine.CAUSES[winner].isFastReplayable && !hasFastReplayedBefore;
+    return { winner, path: isFast ? "fast" : "queue" };
+  }
+  function drawCause(ctx, width, height) {
+    const decision = causeDecision();
+    const boxes = [["s2 판정", "accent"], ["s3", "ok"], [decision.path === "fast" ? "빠른 재실행 → s0" : decision.path === "queue" ? "재실행 큐(120칸) → 원인 해소 → s0" : "결과 기록 (재실행 없음)", decision.path === "fast" ? "accent" : decision.path === "queue" ? "warn" : "ok"]];
+    const gap = 14, boxWidth = (width - 40 - gap * 2) / 3;
+    boxes.forEach(([label, color], index) => {
+      const x = 20 + index * (boxWidth + gap), y = height / 2 - 22;
+      ctx.fillStyle = MB.alpha(MB.css(color), 0.16); MB.roundRect(ctx, x, y, boxWidth, 44, 9); ctx.fill();
+      ctx.strokeStyle = MB.css(color); ctx.lineWidth = 1.5; ctx.stroke();
+      MB.text(ctx, label, x + boxWidth / 2, y + 22, { align: "center", size: width < 500 ? 10.5 : 13, weight: 700 });
+      if (index < 2) MB.arrow(ctx, x + boxWidth + 2, height / 2, x + boxWidth + gap - 2, height / 2, MB.css("text-faint"), 1.5, 6);
+    });
+    if (decision.winner !== null) MB.text(ctx, `대표 원인: ${LoadStoreEngine.CAUSES[decision.winner].name} (${decision.winner})`, 20, 12, { size: 12, color: MB.css("text-dim"), weight: 700 });
+  }
+  function paintCause() {
+    const decision = causeDecision();
+    causeGrid.querySelectorAll("label").forEach((label) => label.classList.toggle("win", +label.dataset.code === decision.winner));
+    causeView.redraw();
+  }
+  paintCause();
+
+  /* ---------------------------------------------------- 그림 9-3: 포워딩 바이트 지도 */
+  const WINDOW_BYTES = 16;
+  const stores = [
+    { offset: 0, size: 8, isAddressReady: true, isDataReady: true },
+    { offset: 2, size: 2, isAddressReady: true, isDataReady: true },
+    { offset: 4, size: 4, isAddressReady: true, isDataReady: false },
+    { offset: 10, size: 1, isAddressReady: false, isDataReady: true },
+  ];
+  const STORE_COLORS = ["t-tage", "color-pink", "warn", "color-purple"];
+  let loadOffset = 0, loadSize = 8, hasSbufferBytes = true;
+  const storeRows = document.getElementById("stlf-rows");
+  function renderStoreRows() {
+    storeRows.innerHTML = stores.map((store, index) => `<div class="store-row" data-i="${index}"><b style="color:var(--${STORE_COLORS[index]})">ST${index}</b>` +
+      `<label>시작 <select data-field="offset">${Array.from({ length: WINDOW_BYTES }, (_, k) => `<option ${k === store.offset ? "selected" : ""}>${k}</option>`).join("")}</select></label>` +
+      `<label>크기 <select data-field="size">${[1, 2, 4, 8].map((s) => `<option ${s === store.size ? "selected" : ""}>${s}</option>`).join("")}</select></label>` +
+      `<label class="check"><input type="checkbox" data-field="isAddressReady" ${store.isAddressReady ? "checked" : ""}> 주소 준비</label>` +
+      `<label class="check"><input type="checkbox" data-field="isDataReady" ${store.isDataReady ? "checked" : ""}> 데이터 준비</label>` +
+      `<span class="dim small">${index === 0 ? "가장 오래됨" : index === stores.length - 1 ? "가장 최근" : ""}</span></div>`).join("");
+  }
+  storeRows.addEventListener("change", (event) => {
+    const row = event.target.closest(".store-row"); if (!row) return;
+    const store = stores[+row.dataset.i], field = event.target.dataset.field;
+    if (event.target.type === "checkbox") store[field] = event.target.checked;
+    else store[field] = +event.target.value;
+    if (store.offset + store.size > WINDOW_BYTES) { store.offset = WINDOW_BYTES - store.size; renderStoreRows(); }
+    paintForward();
+  });
+  renderStoreRows();
+  const forwardView = MB.canvas("#cv-stlf", { aspect: 0.25, minHeight: 200, maxHeight: 240, draw: drawForward });
+  function drawForward(ctx, width, height) {
+    const result = LoadStoreEngine.resolveForwarding(stores, loadOffset, loadSize, hasSbufferBytes);
+    const left = 58, right = width - 12, cellWidth = (right - left) / WINDOW_BYTES;
+    const rowHeight = Math.min(30, (height - 40) / (stores.length + 1.6));
+    for (let b = 0; b < WINDOW_BYTES; b++) MB.text(ctx, String(b), left + b * cellWidth + cellWidth / 2, 10, { align: "center", size: 10, mono: true, color: MB.css("text-faint") });
+    stores.forEach((store, index) => {
+      const y = 20 + index * rowHeight;
+      MB.text(ctx, `ST${index}`, 8, y + rowHeight / 2, { size: 11.5, weight: 700, color: MB.css(STORE_COLORS[index]) });
+      const x = left + store.offset * cellWidth;
+      ctx.fillStyle = store.isAddressReady ? MB.alpha(MB.css(STORE_COLORS[index]), store.isDataReady ? 0.55 : 0.2) : "transparent";
+      MB.roundRect(ctx, x + 1, y + 3, store.size * cellWidth - 2, rowHeight - 6, 5); ctx.fill();
+      ctx.strokeStyle = MB.css(STORE_COLORS[index]); ctx.setLineDash(store.isAddressReady ? [] : [4, 3]); ctx.lineWidth = 1.4; ctx.stroke(); ctx.setLineDash([]);
+      const note = !store.isAddressReady ? "주소 모름" : !store.isDataReady ? "데이터 미도착" : "";
+      if (note) MB.text(ctx, note, x + store.size * cellWidth / 2, y + rowHeight / 2, { align: "center", size: 10, color: MB.css("text-dim") });
+    });
+    const loadY = 20 + stores.length * rowHeight + 10;
+    MB.text(ctx, "LOAD", 8, loadY + rowHeight / 2, { size: 11.5, weight: 800 });
+    result.bytes.forEach((entry) => {
+      const x = left + entry.byte * cellWidth;
+      let color;
+      if (entry.source === "store") color = MB.css(STORE_COLORS[entry.storeIndex]);
+      else if (entry.source === "sbuffer") color = MB.css("ok");
+      else color = MB.css("text-faint");
+      ctx.fillStyle = MB.alpha(color, entry.isDataMissing ? 0.2 : 0.75);
+      MB.roundRect(ctx, x + 1, loadY + 2, cellWidth - 2, rowHeight - 4, 4); ctx.fill();
+      if (entry.isDataMissing) MB.text(ctx, "?", x + cellWidth / 2, loadY + rowHeight / 2, { align: "center", size: 13, weight: 800, color: MB.css("bad") });
+      const label = entry.source === "store" ? `S${entry.storeIndex}` : entry.source === "sbuffer" ? "SB" : "D$";
+      if (!entry.isDataMissing && cellWidth > 18) MB.text(ctx, label, x + cellWidth / 2, loadY + rowHeight / 2, { align: "center", size: 9.5, weight: 700, color: "#fff" });
+    });
+    ctx.strokeStyle = MB.css(result.isForwardFail ? "bad" : "text"); ctx.lineWidth = 2;
+    MB.roundRect(ctx, left + loadOffset * cellWidth, loadY, loadSize * cellWidth, rowHeight, 5); ctx.stroke();
+  }
+  function paintForward() {
+    if (loadOffset + loadSize > WINDOW_BYTES) loadOffset = WINDOW_BYTES - loadSize;
+    const result = LoadStoreEngine.resolveForwarding(stores, loadOffset, loadSize, hasSbufferBytes);
+    const count = (source) => result.bytes.filter((b) => b.source === source).length;
+    MB.set("stlf-sq", `${count("store")} <small>B</small>`);
+    MB.set("stlf-sb", `${count("sbuffer")} <small>B</small>`);
+    MB.set("stlf-dc", `${count("dcache")} <small>B</small>`);
+    if (result.isForwardFail) MB.set("stlf-verdict", `${result.isMultiForwardInvalid ? "다중 일치·부분 덮임" : "데이터 미도착"} <small>${result.replayCause} 재실행 · 후보 데이터 사용 안 함</small>`, "bad");
+    else if (result.hasUnknownOlderStore) MB.set("stlf-verdict", "추측 진행 <small>RAW 검사 대상</small>", "");
+    else MB.set("stlf-verdict", "성공", "good");
+    forwardView.redraw();
+  }
+  const offsetSlider = MB.range("stlf-offset", (v) => { loadOffset = v; paintForward(); });
+  MB.seg("#stlf-size", (v) => { loadSize = +v; offsetSlider.element.max = WINDOW_BYTES - loadSize; paintForward(); });
+  document.getElementById("stlf-sbuffer").addEventListener("change", (event) => { hasSbufferBytes = event.target.checked; paintForward(); });
+  paintForward();
+
+  /* ---------------------------------------------------- 그림 9-4: StoreSet */
+  let dependenceMode = "storeset";
+  const dependenceSettings = { aliasRate: 0.3, storeAddressDelay: 12, flushPenalty: 20, waitExposure: 0.25, resetPeriod: 0 };
+  let dependenceResult = null, compareResults = null;
+  function runDependence() {
+    dependenceResult = LoadStoreEngine.simulateMemoryDependence(Object.assign({ mode: dependenceMode }, dependenceSettings));
+    compareResults = ["none", "storeset", "always"].map((mode) => LoadStoreEngine.simulateMemoryDependence(Object.assign({ mode }, dependenceSettings)).stats);
+    const stats = dependenceResult.stats;
+    MB.set("mdp-violation", stats.violations);
+    MB.set("mdp-wait", stats.waits);
+    MB.set("mdp-false", stats.falseWaits);
+    MB.set("mdp-lost", stats.lostCycles.toLocaleString("en-US"));
+    dependenceView.redraw(); compareView.redraw();
+  }
+  const dependenceView = MB.canvas("#cv-mdp", { aspect: 0.34, minHeight: 230, maxHeight: 300, draw(ctx, width, height) {
+    if (!dependenceResult) return;
+    const shown = dependenceResult.events.slice(-24);
+    const maxTime = Math.max(dependenceSettings.storeAddressDelay + 4, 8);
+    const left = 54, right = width - 12, top = 18;
+    const rowHeight = (height - top - 18) / shown.length;
+    const sx = (t) => left + (t / maxTime) * (right - left);
+    for (let t = 0; t <= maxTime; t += Math.max(1, Math.round(maxTime / 8))) MB.text(ctx, String(t), sx(t), 8, { align: "center", size: 10, mono: true, color: MB.css("text-faint") });
+    shown.forEach((event, index) => {
+      const y = top + index * rowHeight;
+      MB.text(ctx, `#${event.iteration}`, 6, y + rowHeight / 2, { size: 9.5, mono: true, color: MB.css("text-faint") });
+      ctx.fillStyle = MB.alpha(MB.css("text-faint"), 0.25);
+      ctx.fillRect(sx(0), y + rowHeight * 0.3, sx(event.storeReady) - sx(0), rowHeight * 0.4);
+      ctx.fillStyle = MB.css("text-dim"); ctx.fillRect(sx(event.storeReady) - 1, y + 1, 2, rowHeight - 2);
+      event.loads.forEach((load, loadIndex) => {
+        const yLoad = y + rowHeight * (loadIndex ? 0.72 : 0.3);
+        if (load.shouldWait) { ctx.fillStyle = MB.alpha(MB.css("warn"), 0.45); ctx.fillRect(sx(2), yLoad - 2, sx(load.issueTime) - sx(2), 4); }
+        ctx.fillStyle = loadIndex === 0 ? (load.isAliasing ? MB.css("taken") : MB.css("t-tage")) : MB.css("text-faint");
+        ctx.beginPath(); ctx.arc(sx(load.issueTime), yLoad, Math.min(4, rowHeight * 0.22), 0, Math.PI * 2); ctx.fill();
+        if (load.isViolation) MB.text(ctx, "✕", sx(load.issueTime) + 9, yLoad, { size: 11, weight: 800, color: MB.css("bad") });
+      });
+    });
+    MB.text(ctx, "● 로드 A(주황=겹침) · ● 로드 B · 회색 막대 끝=스토어 주소 확정", right, height - 6, { align: "right", size: 10.5, color: MB.css("text-dim") });
+  } });
+  const compareView = MB.canvas("#cv-mdp-compare", { aspect: 0.2, minHeight: 130, maxHeight: 170, draw(ctx, width, height) {
+    if (!compareResults) return;
+    MB.barChart(ctx, width, height, [
+      { label: "예측 없음", value: compareResults[0].lostCycles, color: MB.css("bad") },
+      { label: "StoreSet", value: compareResults[1].lostCycles, color: MB.css("accent") },
+      { label: "항상 기다림", value: compareResults[2].lostCycles, color: MB.css("warn") },
+    ], { pad: { l: 92, r: 70, t: 8, b: 8 }, format: (v) => v.toLocaleString("en-US") + " cyc", min: 0 });
+  } });
+  MB.seg("#mdp-mode", (v) => { dependenceMode = v; runDependence(); });
+  MB.range("mdp-alias", (v) => { dependenceSettings.aliasRate = v; runDependence(); }, (v) => MB.pct(v, 0));
+  MB.range("mdp-delay", (v) => { dependenceSettings.storeAddressDelay = v; runDependence(); }, (v) => v + " cyc");
+  MB.range("mdp-penalty", (v) => { dependenceSettings.flushPenalty = v; runDependence(); }, (v) => v + " cyc");
+  MB.range("mdp-exposure", (v) => { dependenceSettings.waitExposure = v; runDependence(); }, (v) => MB.pct(v, 0));
+  MB.range("mdp-reset", (v) => { dependenceSettings.resetPeriod = v; runDependence(); }, (v) => (v ? v + "회" : "없음"));
+  runDependence();
+
+  /* ---------------------------------------------------- 그림 9-5: 큐 점유 */
+  const QUEUE_CONFIGS = { default: { load: 120, store: 64 }, minimal: { load: 24, store: 16 } };
+  let queueConfig = "default", memoryRate = 2, loadFraction = 0.65, residence = 60;
+  const queueView = MB.canvas("#cv-queue", { aspect: 0.38, minHeight: 230, maxHeight: 320, draw(ctx, width, height) {
+    const config = QUEUE_CONFIGS[queueConfig];
+    const loadOccupancy = memoryRate * loadFraction * residence, storeOccupancy = memoryRate * (1 - loadFraction) * residence;
+    const rings = [["가상 로드 큐", config.load, loadOccupancy, "accent-2"], ["스토어 큐(물리)", config.store, storeOccupancy, "accent"]];
+    const radius = Math.min(height * 0.36, width * 0.19);
+    rings.forEach(([label, size, occupancy, color], index) => {
+      const cx = width * (index ? 0.72 : 0.28), cy = height / 2 + 6;
+      const filled = Math.min(size, Math.round(occupancy));
+      for (let k = 0; k < size; k++) {
+        const angle = -Math.PI / 2 + (k / size) * Math.PI * 2;
+        const isFilled = k < filled;
+        ctx.fillStyle = isFilled ? MB.css(color) : MB.css("surface-2");
+        const dot = Math.max(1.6, Math.min(5, (Math.PI * 2 * radius) / size / 2.4));
+        ctx.beginPath(); ctx.arc(cx + Math.cos(angle) * radius, cy + Math.sin(angle) * radius, dot, 0, Math.PI * 2); ctx.fill();
+      }
+      const overflow = Math.max(0, Math.round(occupancy) - size);
+      for (let k = 0; k < Math.min(overflow, 160); k++) {
+        const angle = -Math.PI / 2 + (k / size) * Math.PI * 2;
+        ctx.fillStyle = MB.css("bad");
+        ctx.beginPath(); ctx.arc(cx + Math.cos(angle) * (radius + 12 + 6 * Math.floor(k / size)), cy + Math.sin(angle) * (radius + 12 + 6 * Math.floor(k / size)), 2.2, 0, Math.PI * 2); ctx.fill();
+      }
+      MB.text(ctx, label, cx, cy - 10, { align: "center", size: 12.5, weight: 700 });
+      MB.text(ctx, `${Math.round(occupancy)} / ${size}`, cx, cy + 10, { align: "center", size: 14, mono: true, weight: 800, color: occupancy > size ? MB.css("bad") : MB.css("text") });
+    });
+  } });
+  function paintQueue() {
+    const config = QUEUE_CONFIGS[queueConfig];
+    const loadOccupancy = memoryRate * loadFraction * residence, storeOccupancy = memoryRate * (1 - loadFraction) * residence;
+    MB.set("q-lq", `${Math.round(loadOccupancy)} <small>/ ${config.load}</small>`, loadOccupancy > config.load ? "bad" : "");
+    MB.set("q-sq", `${Math.round(storeOccupancy)} <small>/ ${config.store}</small>`, storeOccupancy > config.store ? "bad" : "");
+    const loadRatio = loadOccupancy / config.load, storeRatio = storeOccupancy / config.store;
+    MB.set("q-first", loadRatio >= storeRatio ? `로드 큐 <small>${MB.pct(loadRatio, 0)}</small>` : `스토어 큐 <small>${MB.pct(storeRatio, 0)}</small>`);
+    queueView.redraw();
+  }
+  MB.range("q-rate", (v) => { memoryRate = v; paintQueue(); }, (v) => v.toFixed(1));
+  MB.range("q-load", (v) => { loadFraction = v; paintQueue(); }, (v) => MB.pct(v, 0));
+  MB.range("q-wait", (v) => { residence = v; paintQueue(); }, (v) => v + " cyc");
+  MB.seg("#q-config", (v) => { queueConfig = v; paintQueue(); });
+  paintQueue();
+
+  /* ---------------------------------------------------- 그림 9-6: sbuffer */
+  const bufferSettings = { pattern: "sequential", storeRate: 1, threshold: 9, writeLatency: 6 };
+  let bufferModel;
+  function resetBuffer() { bufferModel = new LoadStoreEngine.StoreBufferModel(Object.assign({}, bufferSettings)); paintBuffer(); }
+  const bufferView = MB.canvas("#cv-sbuffer", { aspect: 0.3, minHeight: 200, maxHeight: 280, draw(ctx, width, height) {
+    if (!bufferModel) return;
+    const columns = width < 520 ? 4 : 8, rows = 16 / columns;
+    const gap = 8, cellWidth = (width - 24 - gap * (columns - 1)) / columns, cellHeight = (height - 30 - gap * (rows - 1)) / rows;
+    const active = bufferModel.entries.filter((entry) => entry.isValid && !entry.isInflight).length;
+    MB.text(ctx, `쓰기 대기 ${active}칸 · 문턱 ${bufferModel.settings.threshold}`, 12, 12, { size: 12, color: active >= bufferModel.settings.threshold ? MB.css("warn") : MB.css("text-dim"), weight: 700 });
+    bufferModel.entries.forEach((entry, index) => {
+      const x = 12 + (index % columns) * (cellWidth + gap), y = 24 + Math.floor(index / columns) * (cellHeight + gap);
+      ctx.fillStyle = entry.isValid ? MB.css("bg-elev") : MB.css("surface");
+      MB.roundRect(ctx, x, y, cellWidth, cellHeight, 7); ctx.fill();
+      ctx.strokeStyle = entry.isInflight ? MB.css("warn") : entry.isValid ? MB.css("accent-2") : MB.css("border");
+      ctx.lineWidth = entry.isInflight ? 2.4 : 1.2; ctx.stroke();
+      if (!entry.isValid) return;
+      MB.text(ctx, `line ${entry.line.toString(16)}`, x + 6, y + 11, { size: 9.5, mono: true, color: MB.css("text-dim") });
+      const slotWidth = (cellWidth - 12) / 8;
+      for (let word = 0; word < 8; word++) {
+        ctx.fillStyle = entry.mask & (1 << word) ? MB.css("accent") : MB.css("surface-2");
+        ctx.fillRect(x + 6 + word * slotWidth, y + cellHeight - 16, slotWidth - 1.5, 10);
+      }
+    });
+  } });
+  function paintBuffer() {
+    MB.set("sb-stores", bufferModel.stores);
+    MB.set("sb-merge", bufferModel.stores ? MB.pct(bufferModel.merges / bufferModel.stores) : "—");
+    MB.set("sb-writes", bufferModel.writes);
+    MB.set("sb-stall", bufferModel.stallCycles, bufferModel.stallCycles ? "bad" : "");
+    bufferView.redraw();
+  }
+  MB.seg("#sb-pattern", (v) => { bufferSettings.pattern = v; resetBuffer(); });
+  MB.range("sb-rate", (v) => { bufferSettings.storeRate = v; if (bufferModel) bufferModel.settings.storeRate = v; }, (v) => v.toFixed(1));
+  MB.range("sb-threshold", (v) => { bufferSettings.threshold = v; if (bufferModel) bufferModel.settings.threshold = v; paintBuffer(); });
+  MB.range("sb-latency", (v) => { bufferSettings.writeLatency = v; if (bufferModel) bufferModel.settings.writeLatency = v; }, (v) => v + " cyc");
+  document.getElementById("sb-reset").onclick = resetBuffer;
+  document.getElementById("sb-fast").onclick = () => { for (let k = 0; k < 500; k++) bufferModel.step(); paintBuffer(); };
+  let bufferAccumulator = 0;
+  const bufferLoop = MB.loop(document.getElementById("sim-sbuffer"), (dt) => {
+    bufferAccumulator += dt;
+    while (bufferAccumulator > 0.12) { bufferAccumulator -= 0.12; bufferModel.step(); }
+    paintBuffer();
+  });
+  bufferLoop.running = false;
+  MB.playButton("sb-play", bufferLoop, ["⏸ 멈춤", "▶ 재생"]);
+  resetBuffer();
+})();
+</script>
+</body>
+</html>

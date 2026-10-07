@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>XiangShanBook · 오픈소스 RISC-V 코어 해부</title>
+<meta name="description" content="오픈소스 RISC-V 고성능 코어 XiangShan 곤명호(Kunminghu) v3를 kunminghu-v3 브랜치 소스 기준으로 해부하는 인터랙티브 해설서. 분기 예측, 인출, 리네임, 이슈, ROB, 로드·스토어, 캐시, MMU, 특권 구조, 성능 카운터, 검증.">
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<meta name="theme-color" content="#c8283c">
+<link rel="stylesheet" href="css/style.css">
+<script src="js/common.js"></script>
+</head>
+<body data-root="">
+<section class="home-hero">
+  <div class="inner">
+    <div>
+      <div class="eyebrow">Interactive RISC-V Core Book</div>
+      <h1>오픈소스 고성능 코어를<br><span class="grad">한 블록씩 뜯어 보기</span></h1>
+      <p>XiangShan은 Chisel로 작성된 오픈소스 RISC-V 비순차 코어다. 이 책은 그 최신 세대인 <strong>곤명호(Kunminghu) v3</strong>를 <code>kunminghu-v3</code> 브랜치의 실제 소스 코드 기준으로 해부한다. 분기를 예측하고 명령어를 가져오는 프런트엔드, 레지스터를 바꿔 달고 순서를 바꿔 실행하는 백엔드, 로드·스토어와 캐시·TLB로 이루어진 메모리 시스템, 그리고 특권 구조와 검증 방법까지 다룬다. 각 장의 그림은 실제로 움직인다. 명령어를 파이프라인에 흘려 보내고, 캐시 라인을 채우고, 페이지 테이블을 걸어 내려가며 코어가 어떻게 움직이는지 직접 확인한다.</p>
+      <div class="cta">
+        <a class="primary" href="chapters/overview.html">1장부터 시작하기 →</a>
+        <a class="ghost" href="chapters/pipeline.html">명령어의 여정 보기</a>
+      </div>
+      <div class="hero-badges"><span>16개 챕터</span><span>인터랙티브 시뮬레이터</span><span>kunminghu-v3 @ a13efc877</span><span>실제 Chisel 코드 인용</span></div>
+    </div>
+    <div class="hero-viz" id="hero">
+      <div class="cv"><canvas id="hero-cv"></canvas></div>
+      <div class="bar" id="hero-bar"></div>
+      <div class="cap" id="hero-cap"></div>
+    </div>
+  </div>
+</section>
+
+<section class="home-section">
+  <h2>숫자로 보는 이 책</h2>
+  <p class="sub">이 책을 끝내면 아래 숫자가 어디서 나오는지, 서로 어떻게 얽혀 있는지 설명할 수 있게 됩니다.</p>
+  <div class="numbers" id="numbers">
+    <div><b>8-wide</b><span>디코드·리네임·커밋 폭. 사이클마다 명령어 8개를 이름 바꾸고 8개를 확정한다(2·6·8장)</span></div>
+    <div><b>352</b><span>ROB 크기. 한꺼번에 날아다닐 수 있는 명령어 수다(8장)</span></div>
+    <div><b>224</b><span>정수 물리 레지스터 수. 아키텍처 레지스터 32개를 이만큼으로 바꿔 달아 거짓 의존을 지운다(6장)</span></div>
+    <div><b>64 KB</b><span>L1 데이터 캐시. 4웨이로, 로드가 TLB와 함께 병렬로 두드린다(9·10장)</span></div>
+    <div><b>2 MB</b><span>코어마다 붙는 L2(CoupledL2). 4뱅크, 포함(inclusive) 정책(12장)</span></div>
+    <div><b>32 MB</b><span>여러 코어가 나눠 쓰는 L3(OpenLLC). 16웨이 4뱅크, CHI로 연결된다(12장)</span></div>
+  </div>
+</section>
+
+<section class="home-section" style="padding-top:0">
+  <h2>전체 챕터</h2>
+  <p class="sub">순서대로 읽어도 좋고, 관심 있는 블록부터 골라 읽어도 됩니다. 각 장은 직관 → 만져 보기 → 수식 → 실제 RTL과 측정값 → 퀴즈 순서로 구성됩니다.</p>
+  <div id="chgrid"></div>
+</section>
+
+<section class="home-section" style="padding-top:0">
+  <h2>추천 학습 경로</h2>
+  <p class="sub">목적에 따라 이렇게 읽어 보세요.</p>
+  <div class="paths">
+    <div class="path"><h3>입문 · 전체 그림</h3><p>비순차 코어가 처음이라면. 지도와 파이프라인, 그리고 검증 방법.</p><div class="steps"><a href="chapters/overview.html">01</a><a href="chapters/pipeline.html">02</a><a href="chapters/rob.html">08</a><a href="chapters/method.html">15</a></div></div>
+    <div class="path"><h3>프런트엔드</h3><p>분기 예측과 명령어 인출.</p><div class="steps"><a href="chapters/bpu.html">03</a><a href="chapters/predictors.html">04</a><a href="chapters/fetch.html">05</a></div></div>
+    <div class="path"><h3>백엔드</h3><p>리네임에서 이슈·실행·커밋까지.</p><div class="steps"><a href="chapters/rename.html">06</a><a href="chapters/issue.html">07</a><a href="chapters/rob.html">08</a></div></div>
+    <div class="path"><h3>메모리 시스템</h3><p>로드·스토어, 캐시, 가상 메모리, 일관성.</p><div class="steps"><a href="chapters/lsu.html">09</a><a href="chapters/dcache.html">10</a><a href="chapters/mmu.html">11</a><a href="chapters/cache.html">12</a></div></div>
+    <div class="path"><h3>시스템 소프트웨어 관점</h3><p>특권 모드, 인터럽트, 성능 카운터.</p><div class="steps"><a href="chapters/system.html">13</a><a href="chapters/perf.html">14</a></div></div>
+  </div>
+</section>
+
+<section class="home-section" style="padding-top:0">
+  <h2>이 사이트 사용법</h2>
+  <div class="flow">
+    <div><b>읽기</b>개념과 직관을 먼저. 영어 용어는 괄호로 병기합니다.</div>
+    <div><b>만져 보기</b>그림 속 슬라이더와 버튼은 움직이라고 있는 것입니다. 시뮬레이터는 브라우저 안에서 실제로 계산합니다.</div>
+    <div><b>예측하기</b>"예측해 보기" 상자에서 답을 먼저 짐작한 뒤 시뮬레이터로 확인하세요.</div>
+    <div><b>RTL 들여다보기</b>회색 상자는 실제 XiangShan Chisel 코드입니다. 웹 모델과 다른 점은 본문에 밝혀 두었습니다.</div>
+    <div><b>코드로 확인하기</b>모든 파라미터는 kunminghu-v3 소스의 파일과 줄 번호를 함께 적었습니다.</div>
+  </div>
+</section>
+
+<script>
+(function () {
+  "use strict";
+  /* ---------------------------------------------------- 챕터 카드 */
+  const grid = document.getElementById("chgrid");
+  const tagName = { sim: "인터랙티브", RTL: "RTL 코드" };
+  let html = "", part = null;
+  MB.CHAPTERS.forEach((chapter) => {
+    if (chapter.part !== part) { if (part !== null) html += "</div>"; part = chapter.part; html += `<div class="part-h">${part}</div><div class="ch-grid">`; }
+    html += `<a class="ch-card" href="chapters/${chapter.slug}.html"><span class="num">CHAPTER ${chapter.num}</span><h3>${chapter.title}</h3><p>${chapter.desc}</p><span class="tags">` +
+      chapter.tags.map((tag) => `<span class="${tag === "sim" ? "sim" : tag === "RTL" ? "rtl" : ""}">${tagName[tag] || tag}</span>`).join("") + "</span></a>";
+  });
+  grid.innerHTML = html + "</div>";
+
+  /* ---------------------------------------------------- 히어로: 코어 지도 위의 흐름
+     블록 좌표는 가로 100 × 세로 60 눈금 기준이다. 장면마다 토큰이 지나는 블록 순서가 다르다. */
+  const BLOCKS = {
+    bpu:      { x: 2,  y: 3,  w: 13, h: 9, name: "BPU",       area: "front", chapter: "bpu" },
+    ftq:      { x: 18, y: 3,  w: 10, h: 9, name: "FTQ",       area: "front", chapter: "bpu" },
+    ifu:      { x: 31, y: 3,  w: 11, h: 9, name: "IFU",       area: "front", chapter: "fetch" },
+    icache:   { x: 31, y: 15, w: 11, h: 7, name: "L1 I$",     area: "mem",   chapter: "fetch" },
+    ibuffer:  { x: 45, y: 3,  w: 11, h: 9, name: "IBuffer",   area: "front", chapter: "fetch" },
+    decode:   { x: 59, y: 3,  w: 11, h: 9, name: "Decode",    area: "back",  chapter: "rename" },
+    rename:   { x: 73, y: 3,  w: 11, h: 9, name: "Rename",    area: "back",  chapter: "rename" },
+    dispatch: { x: 87, y: 3,  w: 11, h: 9, name: "Dispatch",  area: "back",  chapter: "issue" },
+    issue:    { x: 87, y: 17, w: 11, h: 8, name: "IssueQ",    area: "back",  chapter: "issue" },
+    execute:  { x: 72, y: 17, w: 12, h: 8, name: "EXU",       area: "back",  chapter: "issue" },
+    rob:      { x: 57, y: 17, w: 12, h: 8, name: "ROB",       area: "back",  chapter: "rob" },
+    csr:      { x: 45, y: 17, w: 9,  h: 8, name: "CSR",       area: "obs",   chapter: "system" },
+    lsu:      { x: 72, y: 30, w: 12, h: 8, name: "LSU",       area: "mem",   chapter: "lsu" },
+    dcache:   { x: 57, y: 30, w: 12, h: 8, name: "L1 D$",     area: "mem",   chapter: "dcache" },
+    l2:       { x: 42, y: 30, w: 12, h: 8, name: "L2",        area: "mem",   chapter: "cache" },
+    l3:       { x: 27, y: 30, w: 12, h: 8, name: "OpenLLC",   area: "soc",   chapter: "cache" },
+    chi:      { x: 22, y: 45, w: 32, h: 8, name: "CHI 인터커넥트", area: "soc", chapter: "cache" },
+    dram:     { x: 2,  y: 45, w: 16, h: 8, name: "DRAM",      area: "soc",   chapter: "cache" },
+    interrupt:{ x: 2,  y: 30, w: 16, h: 8, name: "인터럽트",   area: "soc",   chapter: "system" },
+    pmu:      { x: 87, y: 30, w: 11, h: 8, name: "HPM",       area: "obs",   chapter: "perf" },
+    mmu:      { x: 72, y: 45, w: 26, h: 8, name: "TLB · PTW", area: "mem",   chapter: "mmu" },
+  };
+  const AREA_COLOR = { front: "accent", back: "accent-2", mem: "ok", soc: "warn", obs: "text-dim" };
+  const SCENES = [
+    { name: "정상 흐름", chapter: "pipeline", path: ["bpu", "ftq", "ifu", "ibuffer", "decode", "rename", "dispatch", "issue", "execute", "rob"], color: "accent-2", rate: 2.2,
+      text: "BPU가 다음 페치 블록을 예측해 FTQ에 넣으면, IFU가 가져와 디코드·리네임·디스패치를 거쳐 실행되고 ROB에서 순서대로 커밋된다(2장)." },
+    { name: "분기 오예측", chapter: "rob", path: ["bpu", "ftq", "ifu", "ibuffer", "decode", "rename", "dispatch", "issue", "execute"], back: ["execute", "rob", "ftq", "bpu"], color: "bad", rate: 1.6,
+      text: "실행해 보니 분기 방향이 틀렸다. 그 뒤에 들어온 명령은 모두 버리고 FTQ와 BPU가 올바른 주소에서 다시 시작한다(3·4·8장)." },
+    { name: "L1D 미스", chapter: "dcache", path: ["dispatch", "issue", "lsu", "dcache", "l2", "l3", "chi", "dram"], back: ["dram", "chi", "l3", "l2", "dcache", "lsu"], color: "ok", rate: 1.4,
+      text: "적재 명령이 L1D에서 놓치면 미스 처리 레지스터를 잡고 L2, OpenLLC를 거쳐 DRAM까지 다녀온다(9·10·12장)." },
+    { name: "TLB 미스", chapter: "mmu", path: ["issue", "lsu", "mmu", "l2", "mmu", "lsu", "dcache"], color: "warn", rate: 1.6,
+      text: "가상 주소의 변환이 TLB에 없으면 페이지 테이블 워커가 메모리에서 페이지 테이블을 단계별로 읽어 온다(11장)." },
+    { name: "인터럽트", chapter: "system", path: ["interrupt", "csr", "rob", "ftq", "bpu"], extra: [["execute", "pmu"], ["dcache", "pmu"], ["bpu", "pmu"]], color: "accent", rate: 1.8,
+      text: "인터럽트가 오면 CSR이 받을지 정하고, ROB가 정확한 지점에서 끊어 트랩 핸들러로 방향을 튼다. 곳곳의 사건은 HPM 카운터가 센다(13·14장)." },
+  ];
+  let sceneIndex = 0, isAuto = true, sinceSwitch = 0, spawnClock = 0, tokens = [], hoverBlock = null;
+  const bar = document.getElementById("hero-bar"), caption = document.getElementById("hero-cap");
+  bar.innerHTML = SCENES.map((s, i) => `<button data-i="${i}">${s.name}</button>`).join("");
+  bar.addEventListener("click", (event) => { const button = event.target.closest("button"); if (button) { isAuto = false; setScene(+button.dataset.i); } });
+  function setScene(index) {
+    sceneIndex = index; sinceSwitch = 0; tokens = [];
+    [].forEach.call(bar.children, (b, k) => b.classList.toggle("on", k === index));
+    const scene = SCENES[index];
+    caption.innerHTML = `<b>${scene.name}</b> · ${scene.text} <a href="chapters/${scene.chapter}.html">자세히 →</a>`;
+  }
+  const view = MB.canvas("#hero-cv", { aspect: 0.62, minHeight: 280, maxHeight: 440, draw });
+  function geometry(width, height) {
+    const scaleX = (width - 16) / 100, scaleY = (height - 16) / 56;
+    return { rect: (b) => ({ x: 8 + b.x * scaleX, y: 8 + b.y * scaleY, w: b.w * scaleX, h: b.h * scaleY }), center: (b) => ({ x: 8 + (b.x + b.w / 2) * scaleX, y: 8 + (b.y + b.h / 2) * scaleY }) };
+  }
+  function pointOnPath(path, progress, g) {
+    const segments = path.length - 1;
+    const position = Math.min(segments - 1e-6, Math.max(0, progress) * segments);
+    const k = Math.floor(position), t = position - k;
+    const a = g.center(BLOCKS[path[k]]), b = g.center(BLOCKS[path[k + 1]]);
+    return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t, block: t > 0.85 ? path[k + 1] : path[k] };
+  }
+  function draw(ctx, width, height) {
+    const g = geometry(width, height);
+    const scene = SCENES[sceneIndex];
+    const lit = {};
+    tokens.forEach((token) => { if (token.progress < 0) return; const p = pointOnPath(token.path, token.progress, g); lit[p.block] = 1; });
+    const isSmall = width < 520;
+    Object.entries(BLOCKS).forEach(([id, block]) => {
+      const r = g.rect(block);
+      const color = MB.css(AREA_COLOR[block.area]);
+      const isOnPath = scene.path.includes(id) || (scene.back || []).includes(id) || (scene.extra || []).some((pair) => pair.includes(id));
+      ctx.fillStyle = lit[id] ? MB.alpha(color, 0.28) : isOnPath ? MB.alpha(color, 0.1) : MB.css("surface");
+      MB.roundRect(ctx, r.x, r.y, r.w, r.h, 6); ctx.fill();
+      ctx.strokeStyle = hoverBlock === id ? MB.css("text") : isOnPath ? color : MB.css("border");
+      ctx.lineWidth = hoverBlock === id ? 2 : isOnPath ? 1.6 : 1; ctx.stroke();
+      MB.text(ctx, block.name, r.x + r.w / 2, r.y + r.h / 2, { align: "center", size: isSmall ? 9 : 11.5, weight: 700, color: isOnPath ? MB.css("text") : MB.css("text-dim"), mono: block.name.length < 9 });
+    });
+    // 영역 이름
+    const label = (text, x, y) => MB.text(ctx, text, 8 + x * (width - 16) / 100, 8 + y * (height - 16) / 56, { size: isSmall ? 8.5 : 10.5, color: MB.css("text-faint"), weight: 700 });
+    label("FRONTEND", 2, 1.2); label("BACKEND", 59, 1.2); label("MEMBLOCK · CACHE", 42, 28.2); label("SoC · UNCORE", 2, 43.2); label("가상 메모리", 72, 43.2);
+    tokens.forEach((token) => {
+      if (token.progress < 0) return;
+      const p = pointOnPath(token.path, token.progress, g);
+      ctx.fillStyle = MB.css(token.color);
+      ctx.beginPath(); ctx.arc(p.x, p.y, token.size, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = MB.css("bg-elev"); ctx.lineWidth = 1.5; ctx.stroke();
+    });
+  }
+  function spawn(scene) {
+    const make = (path, color, delay) => tokens.push({ path, color, progress: -delay, speed: 0.35 / Math.max(1, path.length / 5), size: 5 });
+    make(scene.path, scene.color, 0);
+    if (scene.double) make(scene.path, scene.color, 0.04);
+    if (scene.extra) scene.extra.forEach((pair) => make(pair, scene.color, Math.random() * 0.3));
+  }
+  function step(dt) {
+    const scene = SCENES[sceneIndex];
+    sinceSwitch += dt; spawnClock += dt;
+    if (isAuto && sinceSwitch > 7.5) setScene((sceneIndex + 1) % SCENES.length);
+    if (spawnClock > 1 / scene.rate) { spawnClock = 0; spawn(SCENES[sceneIndex]); }
+    const next = [];
+    tokens.forEach((token) => {
+      token.progress += dt * token.speed;
+      if (token.progress >= 1) {
+        // 되돌아오는 길(리다이렉트, 응답)이 있으면 이어서 보낸다.
+        if (token.path === scene.path && scene.back) next.push({ path: scene.back, color: scene.name === "분기 오예측" ? "bad" : token.color, progress: 0, speed: token.speed * 1.4, size: 4 });
+        return;
+      }
+      next.push(token);
+    });
+    tokens = next.slice(-60);
+    view.redraw();
+  }
+  view.onPointer("mousemove", (x, y) => {
+    const g = geometry(view.width, view.height);
+    hoverBlock = null;
+    Object.entries(BLOCKS).forEach(([id, block]) => { const r = g.rect(block); if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) hoverBlock = id; });
+    view.canvas.style.cursor = hoverBlock ? "pointer" : "default";
+  });
+  view.onPointer("click", () => { if (hoverBlock) location.href = `chapters/${BLOCKS[hoverBlock].chapter}.html`; });
+  setScene(0);
+  MB.loop(document.getElementById("hero"), step);
+})();
+</script>
+</body>
+</html>

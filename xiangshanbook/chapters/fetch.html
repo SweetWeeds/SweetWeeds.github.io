@@ -1,0 +1,899 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>명령어 인출 · XiangShanBook</title>
+<meta name="description" content="XiangShan 곤명호 v3의 명령어 인출 경로. FTQ 포인터와 2-fetch, ICache와 프리페치, RVC 명령어 경계 찾기, 프리디코드 예측 검사, IBuffer까지 kunminghu-v3 코드로 따라간다.">
+<link rel="icon" type="image/svg+xml" href="../favicon.svg">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/common.js"></script>
+<style>
+  .slot-grid { display: grid; grid-template-columns: repeat(16, minmax(0, 1fr)); gap: 3px; padding: 14px 18px 4px; }
+  .slot-grid button { font: inherit; font-family: var(--mono); font-size: 11px; padding: 6px 0; border-radius: 6px; border: 1px solid var(--border); background: var(--surface); color: var(--text-dim); cursor: pointer; line-height: 1.2; min-width: 0; }
+  .slot-grid button.rvc { background: var(--accent-2-soft); color: var(--accent-2); border-color: var(--accent-2); }
+  .slot-grid button.start { box-shadow: inset 0 3px 0 var(--accent); }
+  @media (max-width: 560px) { .slot-grid { grid-template-columns: repeat(8, minmax(0, 1fr)); } }
+  .inst-row { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 6px; padding: 14px 18px 4px; }
+  .inst-row .ctrl { min-width: 0; }
+  .inst-row select { width: 100%; font: inherit; font-size: 12.5px; padding: 5px 4px; border-radius: 7px; border: 1px solid var(--border); background: var(--bg-elev); color: var(--text); }
+  @media (max-width: 700px) { .inst-row { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+  .hexin { font: inherit; font-family: var(--mono); font-size: 14px; padding: 7px 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg-elev); color: var(--text); width: 100%; }
+</style>
+</head>
+<body data-chapter="fetch">
+<main class="chapter">
+  <header class="chapter-hero">
+    <div class="eyebrow">Chapter 05</div>
+    <h1>명령어 인출</h1>
+    <p class="lead">분기 예측기는 "다음엔 이 주소부터 이만큼 가져와라"라는 <b>페치 블록</b>을 만든다. 실제로 명령어 바이트를 가져와 디코더 앞에 줄 세우는 일은 그 뒤의 몫이다. 곤명호 v3에서는 FTQ가 예측을 쌓아 두고, ICache가 미리 캐시 줄을 당겨 오고, IFU가 64바이트 덩어리에서 16비트·32비트 명령어의 경계를 찾아 자른다. 그 과정에서 예측이 명백히 틀린 곳을 미리 고치고, 결과를 IBuffer에 쌓는다. 한 사이클에 페치 블록을 <b>두 개</b>까지 처리하는 2-fetch도 이 경로에 들어 있다.</p>
+    <ul class="objectives">
+      <li>FTQ의 다섯 포인터(bpu·pnr·pf·fetch·commit)가 무엇을 가리키며 왜 서로를 앞지르지 않는지 설명한다.</li>
+      <li>두 페치 블록을 한 사이클에 가져오는 2-fetch의 조건과, ICache 메타 포트 충돌을 피하는 네 가지 경우를 구분한다.</li>
+      <li>64KB ICache의 집합·뱅크·인터리브 구조와 FTQ가 이끄는 프리페치 파이프라인을 따라간다.</li>
+      <li>RVC 때문에 생기는 명령어 경계 문제를 점화식으로 풀고, 블록을 가로지르는 '반쪽 명령어'를 처리하는 법을 본다.</li>
+      <li>프리디코드 검사기가 잡아내는 다섯 가지 예측 오류와 IBuffer의 채움·비움을 실험한다.</li>
+    </ul>
+  </header>
+
+  <!-- ============================================================ 1 -->
+  <section id="path">
+    <h2>예측에서 디코드까지</h2>
+    <p>프런트엔드의 인출 경로는 여러 단계로 이어진다. BPU가 페치 블록을 예측하면 그 결과가 <span class="term">FTQ</span><span class="en">(Fetch Target Queue)</span>에 쓰인다. FTQ는 같은 블록을 두 번 내보낸다. 한 번은 ICache의 <b>프리페치 파이프</b>로 보내 ITLB 변환과 태그 검사를 먼저 끝내 두고, 그 결과(몇 번 웨이에 있는지)를 <span class="term">WayLookup</span> 큐에 남긴다. 다른 한 번은 ICache <b>메인 파이프</b>로 보내 데이터 SRAM을 읽는다. 메인 파이프는 WayLookup에서 웨이를 꺼내 쓰므로 태그 비교를 다시 하지 않는다. 읽은 데이터는 IFU의 세 단계(s0·s1·s2)를 지나 IBuffer에 들어가고, 한 사이클 뒤의 쓰기 되돌림(wb) 단계에서 검사 결과를 FTQ에 알린다.</p>
+    <figure class="play" id="fig-path">
+      <div class="play-view"><canvas id="cv-path"></canvas></div>
+      <div class="play-ctrl">
+        <div class="seg" id="path-mode"><button data-value="hit" class="on">ICache 적중</button><button data-value="miss">미스(프리페치가 가려 줌)</button><button data-value="fault">프리디코드 리다이렉트</button></div>
+        <button class="btn sm" id="path-play">⏸ 멈춤</button>
+      </div>
+      <div class="info-panel" id="path-info">블록을 누르면 설명이 나온다.</div>
+      <figcaption><span class="try">눌러 보기</span>윗줄은 FTQ에서 출발하는 두 흐름이다. 프리페치 파이프(ITLB와 메타 검사)는 WayLookup에 웨이 정보를 남기고, 메인 파이프는 그 정보로 데이터만 읽는다. '미스' 장면에서는 프리페치 파이프가 미리 MSHR에 요청을 넣어 두어, 메인 파이프가 도착할 무렵 줄이 채워진다. '프리디코드 리다이렉트' 장면에서는 IFU wb 단계가 FTQ로 되돌림 신호를 보내 BPU를 다시 시작시킨다. 각 블록을 누르면 코드 위치와 역할이 나온다.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ============================================================ 2 -->
+  <section id="ftq">
+    <h2>FTQ: 예측과 인출 사이의 완충 지대</h2>
+    <p>FTQ는 64칸짜리 원형 큐다(<code>FtqParameters.scala:23</code>). 한 칸에 담기는 페치 블록 정보는 놀랄 만큼 작다. 시작 PC, 블록이 taken 분기로 끝나는지, 그리고 끝 위치뿐이다(<code>ftq/Bundles.scala:35-39</code>). 예측기 학습에 필요한 메타데이터는 별도의 큐(<code>metaQueueResolve</code>, <code>metaQueueCommit</code>, <code>metaQueueRedirect</code>)에 같은 인덱스로 나란히 저장된다.</p>
+    <p>FTQ의 핵심은 포인터다. 모든 포인터는 "다음에 처리할 칸"을 가리킨다.</p>
+    <div class="table-wrap"><table>
+      <tr><th>포인터</th><th>가리키는 것</th><th>움직이는 주체</th></tr>
+      <tr><td class="mono">bpuPtr</td><td>BPU가 다음에 쓸 칸</td><td>BPU 예측 (s3 덮어쓰기 때는 되돌아감)</td></tr>
+      <tr><td class="mono">pnrPtr</td><td>BPU가 아직 되돌릴 수 있는 가장 오래된 칸 ('되돌릴 수 없는 지점')</td><td>BPU 마지막 덮어쓰기 단계 통과</td></tr>
+      <tr><td class="mono">pfPtr</td><td>프리페치 파이프에 보낼 다음 칸</td><td>ICache 프리페치 파이프</td></tr>
+      <tr><td class="mono">fetchPtr</td><td>메인 파이프·IFU에 보낼 다음 칸</td><td>ICache 메인 파이프</td></tr>
+      <tr><td class="mono">commitPtr</td><td>백엔드가 다음에 커밋할 칸</td><td>ROB 커밋</td></tr>
+    </table></div>
+<div class="callout code"><strong>FTQ 포인터</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/frontend/ftq/Ftq.scala:91-101</span>
+<span class="c">// FTQ pointers. All the pointers mean the pointed entry is *to be* processed</span>
+<span class="k">private val</span> bpuPtr    = RegInit(FtqPtrVec())
+<span class="k">private val</span> pfPtr     = RegInit(FtqPtrVec(2))
+<span class="k">private val</span> fetchPtr  = RegInit(FtqPtrVec(3))
+<span class="k">private val</span> commitPtr = RegInit(FtqPtrVec(2))
+<span class="c">// pnrPtr is the "Point of No Return" of Bpu: the oldest entry Bpu can still take back.</span>
+<span class="k">private val</span> pnrPtr = RegInit(FtqPtrVec())</code></pre>
+<p><code>FtqPtrVec(3)</code>처럼 같은 포인터를 여러 벌 두는 것은 타이밍 때문이다. 포인터 하나가 많은 곳에 연결되면 팬아웃이 커지므로 복사본을 둔다. 코드 바로 아래의 <code>XSError</code> 세 줄은 fetchPtr와 pfPtr가 bpuPtr를, pnrPtr가 bpuPtr를 앞지르지 않는지 시뮬레이션 내내 감시한다.</p>
+</div>
+    <div class="sim" id="sim-ftq">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>FTQ 64칸과 다섯 포인터</h3>
+        <div class="ctrl-row"><button class="btn sm" id="ftq-play">⏸ 멈춤</button><button class="btn sm" id="ftq-redirect">백엔드 리다이렉트</button><button class="btn sm" id="ftq-reset">처음</button></div>
+      </div>
+      <div class="sim-view"><canvas id="cv-ftq"></canvas></div>
+      <div class="sim-controls">
+        <label class="ctrl"><span>ICache 미스 비율 <output id="ftq-miss-out"></output></span><input type="range" id="ftq-miss" min="0" max="0.5" step="0.01" value="0.1"></label>
+        <label class="ctrl"><span>미스 지연(사이클) <output id="ftq-lat-out"></output></span><input type="range" id="ftq-lat" min="4" max="60" step="1" value="24"></label>
+        <label class="ctrl"><span>프리페치 거리 상한 <output id="ftq-depth-out"></output></span><input type="range" id="ftq-depth" min="0" max="32" step="1" value="32"></label>
+        <label class="ctrl"><span>백엔드 커밋 확률(사이클당 최대 2블록) <output id="ftq-commit-out"></output></span><input type="range" id="ftq-commit" min="0.2" max="1" step="0.05" value="0.7"></label>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">FTQ 점유</span><span class="v" id="ftq-occ">—</span></div>
+        <div class="stat"><span class="k">프리페치 앞섬(pf−fetch)</span><span class="v" id="ftq-ahead">—</span></div>
+        <div class="stat"><span class="k">인출 처리량</span><span class="v" id="ftq-stall">—</span></div>
+        <div class="stat"><span class="k">2-fetch 사이클</span><span class="v" id="ftq-two">—</span></div>
+      </div>
+      <figcaption><span class="try">돌려 보기</span>원 둘레의 칸 64개가 FTQ다. 색칠된 구간은 아직 커밋되지 않은 블록이고, 바깥 화살표가 각 포인터다. 프리페치 거리 상한을 0으로 내리면 메인 파이프가 미스를 직접 맞는다. 상한을 올리면 pfPtr가 fetchPtr보다 앞서 달리며 여러 미스를 겹쳐 처리한다(실제 상한은 <code>PrefetchDepth = 32</code>). 기본값(미스 10%, 지연 24사이클)에서 2만 사이클을 돌려 보면 인출 처리량이 달라진다. 상한 0이면 약 0.30 블록/사이클, 4면 0.45, 32면 1.00으로 BPU 속도(사이클당 1블록)에 닿는다. 미스 뒤에 쌓인 블록을 따라잡을 때는 2-fetch가 큰 몫을 한다. 리다이렉트 버튼은 fetchPtr 이후의 예측을 모두 버리고 BPU를 그 자리부터 다시 시작시킨다. 이 그림은 개념 모델이다. 블록 크기, 2-fetch 가능 여부, 미스 여부는 무작위로 정했다.</figcaption>
+    </div>
+  </section>
+
+  <!-- ============================================================ 3 -->
+  <section id="twofetch">
+    <h2>블록 두 개를 한 사이클에: 2-fetch</h2>
+    <p>taken 분기가 자주 나오는 코드에서는 페치 블록이 짧게 잘린다. 64바이트를 가져올 수 있는데 분기 때문에 12바이트에서 끝나면 디코더는 굶는다. 곤명호 v3의 프런트엔드는 <code>FetchPorts = 2</code>(<code>FrontendParameters.scala:29</code>)로, 조건이 맞으면 FTQ의 연속된 두 블록을 한 번에 메인 파이프로 보낸다.</p>
+<div class="callout code"><strong>두 번째 블록을 함께 보낼 조건</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/frontend/ftq/Ftq.scala:326-330</span>
+<span class="c">// as in 2-prefetch, the second fetch block must have passed the point of no return</span>
+<span class="k">private val</span> rawTwoFetchValid = passedPnr(fetchPtr(1)) &amp;&amp;
+  (fetchReq(0).size +&amp; fetchReq(1).size) &lt;= FetchBlockInstNum.U &amp;&amp; <span class="c">// unit: half-word</span>
+  fetchReq(0).vPageNumber === fetchReq(1).vPageNumber &amp;&amp;
+  !(hasBackendFlag &amp;&amp; (backendFlagPtr === fetchPtr(0) || backendFlagPtr === fetchPtr(1)))</code></pre>
+</div>
+    <p>조건은 네 가지다. ① 두 번째 블록이 BPU가 더 이상 덮어쓸 수 없는 지점을 지났을 것. ② 두 블록의 크기를 합쳐 32 하프워드(64바이트) 이하일 것. ③ 같은 가상 페이지에 있어 ITLB 변환 하나로 충분할 것. ④ 백엔드 예외 표시가 붙은 블록이 아닐 것. 여기에 ICache 쪽 제약이 하나 더 있다. 메타 SRAM은 홀수 집합과 짝수 집합을 다른 뱅크에 두어(<code>NumInterleavedBank = 2</code>) 한 사이클에 줄 두 개를 읽는다. 두 블록이 건드리는 캐시 줄 조합이 이 두 포트로 해결되어야 한다. 코드는 그 조합을 네 가지로 분류한다(<code>TwoFetch.scala</code>의 <code>TwoPrefetchCase</code>).</p>
+    <figure class="play" id="fig-two">
+      <div class="play-view"><canvas id="cv-two"></canvas></div>
+      <div class="play-ctrl">
+        <label class="ctrl"><span>블록 1 시작(줄 안 하프워드) <output id="two-s0-out"></output></span><input type="range" id="two-s0" min="0" max="31" value="4"></label>
+        <label class="ctrl"><span>블록 1 크기(하프워드) <output id="two-n0-out"></output></span><input type="range" id="two-n0" min="1" max="32" value="10"></label>
+        <label class="ctrl"><span>블록 2 줄 간격 <output id="two-gap-out"></output></span><input type="range" id="two-gap" min="0" max="5" value="0"></label>
+        <label class="ctrl"><span>블록 2 시작 <output id="two-s1-out"></output></span><input type="range" id="two-s1" min="0" max="31" value="20"></label>
+        <label class="ctrl"><span>블록 2 크기 <output id="two-n1-out"></output></span><input type="range" id="two-n1" min="1" max="32" value="8"></label>
+        <div class="ctrl-row"><label class="check"><input type="checkbox" id="two-pnr" checked> 블록 2가 PNR 통과</label><label class="check"><input type="checkbox" id="two-page" checked> 같은 페이지</label></div>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">FTQ 조건</span><span class="v" id="two-ftq">—</span></div>
+        <div class="stat"><span class="k">메타 포트 경우</span><span class="v" id="two-case">—</span></div>
+        <div class="stat"><span class="k">한 사이클 인출</span><span class="v" id="two-result">—</span></div>
+      </div>
+      <figcaption><span class="try">만져 보기</span>가로 띠는 연속된 캐시 줄이고, 위아래 막대가 두 페치 블록이다. 줄 간격 0은 같은 줄에서 시작한다는 뜻이다. 블록이 줄 경계를 넘으면 그 블록 하나만으로도 줄 두 개를 읽어야 한다. 줄 간격을 1 또는 3으로 두고 두 블록을 모두 줄 안에 넣으면 '인터리브'(짝수 줄 + 홀수 줄)가 된다. 간격이 짝수인데 두 블록 시작 줄의 홀짝이 같으면 메타 뱅크가 겹쳐 충돌한다. 경우 분류는 <code>TwoFetch.scala</code>의 <code>TwoPrefetchCase.apply</code> 식을 그대로 옮겼다.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ============================================================ 4 -->
+  <section id="icache">
+    <h2>ICache: 64KB, 4웨이, 8뱅크</h2>
+    <p>ICache의 기본 구성은 집합 256개 × 4웨이 × 64바이트 줄 = 64KB다(<code>icache/Parameters.scala:29-31</code>). 데이터는 한 줄을 8바이트씩 8개 뱅크로 나눠 저장하므로, 페치 블록이 실제로 필요한 뱅크만 켜서 읽을 수 있다. 메타데이터(물리 태그)는 짝수 집합과 홀수 집합을 다른 뱅크에 두어 연속된 두 줄을 동시에 검사한다. 교체 정책은 집합별 의사 LRU(<code>setplru</code>)다. 미스를 처리하는 MSHR은 인출용 4개와 프리페치용 10개로 나뉜다(<code>:37-38</code>). 기본값에서 메타와 데이터에는 패리티 검사가 붙는다.</p>
+    <p>메타데이터에는 태그 말고도 특이한 필드가 하나 있다. 줄 안 2바이트 칸마다 "여기서 RVC 명령어가 시작될 수 있는가"를 미리 계산한 32비트 지도 <code>maybeRvcMap</code>이다(<code>icache/Bundles.scala:49-53</code>). 줄을 채울 때 한 번 계산해 두면, 매 인출마다 IFU가 명령어 경계를 찾는 시간이 줄어든다. 다음 절에서 이 지도를 쓴다.</p>
+    <figure class="play" id="fig-addr">
+      <div class="play-ctrl" style="border-top:0;border-bottom:1px solid var(--border)">
+        <label class="ctrl" style="flex:2"><span>페치 블록 시작 가상 주소(16진수)</span><input class="hexin" id="addr-in" value="80003f2a"></label>
+        <label class="ctrl"><span>블록 크기(하프워드) <output id="addr-size-out"></output></span><input type="range" id="addr-size" min="1" max="32" value="20"></label>
+      </div>
+      <div class="play-view"><canvas id="cv-addr"></canvas></div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">집합(set)</span><span class="v" id="addr-set">—</span></div>
+        <div class="stat"><span class="k">메타 뱅크</span><span class="v" id="addr-meta">—</span></div>
+        <div class="stat"><span class="k">읽는 데이터 뱅크</span><span class="v" id="addr-banks">—</span></div>
+        <div class="stat"><span class="k">줄 경계 넘음</span><span class="v" id="addr-cross">—</span></div>
+      </div>
+      <figcaption><span class="try">입력해 보기</span>주소의 하위 6비트는 줄 안 위치이고, 그중 [5:3]이 데이터 뱅크 번호다. 그 위 8비트 [13:6]이 집합 번호이며, 집합 번호의 최하위 비트가 메타 뱅크(짝/홀)를 정한다. 블록이 줄 끝을 넘으면 다음 줄의 앞쪽 뱅크까지 읽는다. 0x...3f로 끝나는 주소 근처에서 크기를 늘려 보자. 페치 블록은 페이지를 넘지 않도록 BPU·FTQ가 보장한다(<code>ICachePrefetchPipe.scala</code>의 주석 참고).</figcaption>
+    </figure>
+    <div class="callout deep"><strong>가상 집합 번호와 물리 태그</strong>
+      <p>집합 번호 [13:6]은 4KB 페이지 오프셋(하위 12비트)을 넘어선다. 그래서 집합은 가상 주소로 고르고(<code>vSetIdx</code>), 웨이는 ITLB가 돌려준 물리 태그로 비교한다(<code>getWaymask(reqPTag, …)</code>, <code>icache/Helpers.scala:110-116</code>). 이 비교는 프리페치 파이프가 미리 해 두고, 결과를 WayLookup(깊이 <code>PrefetchDepth = 32</code>, <code>ICacheWayLookup.scala:60</code>)에 넣는다. 메인 파이프는 거기서 웨이 마스크를 꺼내 데이터 SRAM만 읽는다.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ 5 -->
+  <section id="boundary">
+    <h2>명령어는 어디서 시작하는가: RVC 경계</h2>
+    <p>RISC-V에는 32비트 명령어와 16비트 압축(RVC) 명령어가 섞여 있다. 명령어의 하위 2비트가 <code>11</code>이면 32비트, 아니면 16비트다. 그래서 64바이트 블록을 2바이트 칸 32개로 보면, 각 칸이 명령어의 시작인지는 바로 앞 칸이 무엇이었는지에 달려 있다. 앞 칸이 32비트 명령어의 시작이었다면 이 칸은 그 명령어의 뒷절반이다. IFU의 <code>InstrBoundary</code>는 이 의존성을 다음 점화식으로 계산한다.</p>
+    <div class="formula">$$b_0 = \lnot h, \qquad b_i = \lnot b_{i-1} \;\lor\; r_{i-1} \quad (1 \le i < 32)$$
+      <div class="where">\(b_i\): 칸 \(i\)가 명령어 시작이면 1. \(r_i\): 칸 \(i\)가 RVC일 수 있으면 1(ICache 메타의 <code>maybeRvcMap</code>). \(h\): 직전 블록이 32비트 명령어의 앞절반으로 끝났으면 1(<code>firstInstrIsHalfRvi</code>). 앞 칸이 시작이 아니었으면(뒷절반이었으면) 이 칸은 반드시 시작이고, 앞 칸이 시작이었다면 그것이 RVC일 때만 이 칸이 시작이다.</div></div>
+    <p>이 식은 체인이라 32단을 그대로 이으면 느리다. 코드는 블록을 앞뒤 절반으로 나눈다. 뒷절반은 "앞절반 마지막 칸이 32비트 명령어의 앞절반이었다/아니었다" 두 경우를 <b>동시에</b> 계산해 두고, 앞절반 결과가 나오면 둘 중 하나를 고른다(<code>InstrBoundary.scala:68-78</code>). 덧셈기의 캐리 선택 방식과 같은 기법이다.</p>
+    <div class="sim" id="sim-boundary">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>경계 찾기: 32칸</h3>
+        <div class="seg" id="bd-preset"><button data-value="mix" class="on">섞임</button><button data-value="allrvi">모두 32비트</button><button data-value="allrvc">모두 16비트</button><button data-value="random">무작위</button></div>
+      </div>
+      <div class="slot-grid" id="bd-grid"></div>
+      <div class="sim-view"><canvas id="cv-bd"></canvas></div>
+      <div class="sim-controls">
+        <div class="ctrl-row"><label class="check"><input type="checkbox" id="bd-half"> 직전 블록이 반쪽 명령어로 끝남 (h = 1)</label></div>
+        <label class="ctrl"><span>블록 끝 위치(taken 칸) <output id="bd-end-out"></output></span><input type="range" id="bd-end" min="0" max="31" value="31"></label>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">명령어 수</span><span class="v" id="bd-count">—</span></div>
+        <div class="stat"><span class="k">16비트 / 32비트</span><span class="v" id="bd-mix">—</span></div>
+        <div class="stat"><span class="k">끝이 반쪽 명령어</span><span class="v" id="bd-tail">—</span></div>
+        <div class="stat"><span class="k">뒷절반 선택</span><span class="v" id="bd-sel">—</span></div>
+      </div>
+      <figcaption><span class="try">눌러 보기</span>칸을 누르면 그 칸의 '하위 2비트가 11이 아님(RVC 가능)' 표시가 바뀐다. 보라색이 RVC 가능 칸이고, 윗변에 붉은 띠가 있는 칸이 계산된 명령어 시작이다. 아래 그림의 막대는 잘라 낸 명령어들이고, 두 줄의 후보는 뒷절반을 두 경우로 미리 계산한 결과다. 블록 끝 칸이 32비트 명령어의 시작이면 그 명령어는 다음 블록에서 나머지 절반을 기다린다. 이때 IFU는 반쪽 16비트를 레지스터에 보관했다가 다음 블록 앞에 붙인다(<code>Ifu.scala</code> s1의 <code>s1_prevEndHalfRviInfo</code>).</figcaption>
+    </div>
+    <div class="predict"><strong>maybeRvc가 틀릴 수도 있을까</strong>
+      <p>칸 \(i\)의 <code>maybeRvc</code>는 "하위 2비트가 11이 아님"만 본다. 32비트 명령어의 <b>뒷절반</b> 칸도 하위 2비트가 11이 아닐 수 있다. 그래도 결과가 맞는 이유는 무엇일까?</p>
+      <details><summary>답 보기</summary><p>뒷절반 칸의 \(r_i\) 값은 점화식에서 쓰이지 않는다. \(b_{i+1}\)을 정할 때 \(b_i = 0\)이면 \(\lnot b_i = 1\)이 되어 \(r_i\)와 상관없이 칸 \(i+1\)이 시작이 된다. 그래서 줄을 채울 때는 문맥 없이 모든 칸의 하위 2비트만 보고 지도를 미리 만들어 둘 수 있다.</p></details>
+    </div>
+  </section>
+
+  <!-- ============================================================ 6 -->
+  <section id="predecode">
+    <h2>프리디코드: 예측을 미리 검사하기</h2>
+    <p>IFU는 명령어를 자른 뒤 각 명령어의 종류를 간단히 디코드한다(<span class="term">프리디코드</span>). 조건 분기인지, 직접 점프(jal)인지, 간접 점프(jalr)인지, 복귀(ret)인지 정도다. 이 정보만 있어도 BPU가 낸 예측이 <b>명백히</b> 틀린 경우를 백엔드까지 가기 전에 잡을 수 있다. <code>PredChecker</code>가 잡는 오류는 다섯 가지다(<code>PredChecker.scala:82-99</code>).</p>
+    <div class="table-wrap"><table>
+      <tr><th>오류</th><th>조건</th><th>고친 뒤 목적지</th></tr>
+      <tr><td>jal 오류</td><td>직접 점프인데 taken으로 예측하지 않음</td><td>PC + 점프 오프셋</td></tr>
+      <tr><td>jalr 오류</td><td>복귀가 아닌 간접 점프인데 taken 예측 없음</td><td>(목적지를 모르므로) 다음 순차 PC</td></tr>
+      <tr><td>ret 오류</td><td>복귀인데 taken 예측 없음</td><td>다음 순차 PC</td></tr>
+      <tr><td>비분기 taken</td><td>분기가 아닌 명령어에서 taken으로 예측함</td><td>다음 순차 PC</td></tr>
+      <tr><td>무효 taken</td><td>32비트 명령어의 앞절반에서 taken으로 예측함</td><td>PC + 2</td></tr>
+    </table></div>
+    <p>오류가 여러 개면 가장 앞의 하나만 고친다. 코드는 오류 벡터에 접두 OR(<code>prefixOr</code>)를 걸어 첫 오류 뒤의 명령어를 모두 IBuffer에서 빼고(s2 단계), 다음 사이클 wb 단계에서 FTQ로 리다이렉트를 보낸다. 오류 종류 목록에는 '목적지 오류'(<code>TargetFault</code>)도 정의되어 있다. 하지만 이 커밋의 <code>PredChecker</code>는 그 경우를 만들지 않는다. 성능 분석 모듈도 해당 신호를 <code>false.B</code>로 묶어 둔다(<code>IfuPerfAnalysis.scala:129</code>).</p>
+    <div class="sim" id="sim-check">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>예측 검사기</h3>
+        <div class="seg" id="ck-preset"><button data-value="jal" class="on">놓친 jal</button><button data-value="notcfi">비분기 taken</button><button data-value="ret">놓친 ret</button><button data-value="ok">정상</button></div>
+      </div>
+      <div class="inst-row" id="ck-row"></div>
+      <div class="sim-view"><canvas id="cv-check"></canvas></div>
+      <div class="sim-controls">
+        <label class="ctrl"><span>BPU가 taken이라 한 위치 <output id="ck-taken-out"></output></span><input type="range" id="ck-taken" min="-1" max="7" value="-1"></label>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">첫 오류</span><span class="v" id="ck-first">—</span></div>
+        <div class="stat"><span class="k">IBuffer에 들어가는 명령어</span><span class="v" id="ck-kept">—</span></div>
+        <div class="stat"><span class="k">리다이렉트 목적지</span><span class="v" id="ck-target">—</span></div>
+      </div>
+      <figcaption><span class="try">바꿔 보기</span>여덟 칸이 한 블록의 명령어다. 각 칸의 종류를 고르고, BPU가 taken이라 예측한 위치를 슬라이더로 정한다(−1은 블록 끝까지 taken 없음). 빨간 칸이 오류, 회색 줄무늬가 버려지는 명령어다. '놓친 jal' 프리셋에서 taken 위치를 jal 칸에 맞추면 오류가 사라진다. jal보다 앞의 일반 명령어에 맞추면 '비분기 taken' 오류가 먼저 걸린다. 칸 주소는 0x1000부터 4바이트 간격(RVC 없음)이다.</figcaption>
+    </div>
+    <div class="callout tip"><strong>왜 wb 단계에서 리다이렉트하나</strong>
+      <p>검사 결과로 IBuffer에 넣을 명령어를 고르는 일(<code>stage1Out.fixedInstrValid</code>)은 s2에서 바로 한다. 반면 FTQ에 보내는 리다이렉트와 고친 목적지(<code>stage2Out.checkerRedirect</code>)는 레지스터를 한 단 거쳐 다음 사이클에 나간다(<code>PredChecker.scala</code>의 <code>RegEnable</code>들). 점프 오프셋 덧셈과 목적지 선택이 한 사이클에 몰리지 않게 나눈 것이다.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ 7 -->
+  <section id="ibuffer">
+    <h2>IBuffer: 디코더 앞의 대기열</h2>
+    <p>IFU가 내놓는 명령어 수는 사이클마다 들쭉날쭉하다. 긴 블록 두 개를 한 번에 가져오면 30개가 넘을 수도 있고, 미스가 나면 0개다. 디코더는 사이클마다 8개(<code>DecodeWidth = 8</code>)를 꾸준히 원한다. 그 사이를 48칸짜리 <span class="term">IBuffer</span>가 메운다(<code>ibuffer/Parameters.scala:23</code>). 쓰기는 4뱅크, 읽기는 8뱅크로 나뉜다. IFU는 IBuffer의 현재 꼬리 위치에 맞춰 명령어를 미리 정렬해 보낸다. 그래서 입력 포트 폭은 블록 칸 수 32에 쓰기 뱅크 수 4를 더한 36이다(<code>FrontendParameters.scala</code>의 <code>IBufferEnqueueWidth</code>). IBuffer가 비어 있으면 들어온 명령어를 큐에 쓰지 않고 출력으로 바로 넘기는 <b>바이패스</b> 경로도 있다.</p>
+    <div class="sim" id="sim-ibuf">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>IBuffer 48칸</h3>
+        <div class="ctrl-row"><button class="btn sm" id="ib-play">⏸ 멈춤</button></div>
+      </div>
+      <div class="sim-view"><canvas id="cv-ibuf"></canvas></div>
+      <div class="sim-controls">
+        <label class="ctrl"><span>평균 블록 길이(명령어) <output id="ib-len-out"></output></span><input type="range" id="ib-len" min="2" max="16" step="1" value="6"></label>
+        <label class="ctrl"><span>2-fetch 비율 <output id="ib-two-out"></output></span><input type="range" id="ib-two" min="0" max="1" step="0.05" value="0.5"></label>
+        <label class="ctrl"><span>ICache 미스 비율 <output id="ib-miss-out"></output></span><input type="range" id="ib-miss" min="0" max="0.2" step="0.01" value="0.02"></label>
+        <label class="ctrl"><span>백엔드 정지 확률 <output id="ib-stall-out"></output></span><input type="range" id="ib-stall" min="0" max="0.8" step="0.05" value="0.2"></label>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">평균 점유</span><span class="v" id="ib-occ">—</span></div>
+        <div class="stat"><span class="k">디코드 슬롯 채움</span><span class="v" id="ib-fill">—</span></div>
+        <div class="stat"><span class="k">IFU 막힘(가득 참)</span><span class="v" id="ib-full">—</span></div>
+        <div class="stat"><span class="k">바이패스 명령어</span><span class="v" id="ib-bypass">—</span></div>
+      </div>
+      <figcaption><span class="try">조절해 보기</span>위쪽 막대는 48칸의 현재 점유, 아래 곡선은 최근 200사이클 동안 디코드 슬롯 8칸 중 채워진 비율이다. 측정값은 '지금까지 누적'이다. 블록 길이를 3으로 줄이고 2-fetch 비율을 0으로 두면 IFU가 디코더를 따라가지 못한다. 2만 사이클을 돌리면 슬롯 채움이 약 38%에 그친다. 같은 조건에서 2-fetch 비율을 100%로 올리면 약 74%로 거의 두 배가 된다. 반대로 백엔드 정지 확률을 70%로 높이면(블록 길이 6, 2-fetch 50%) IBuffer가 자주 가득 찬다. 그러면 사이클의 약 39%에서 IFU가 막힌다. 미스 한 번에 12사이클을 쉰다고 가정했다. 미스 처리와 블록 길이 분포는 단순화한 모델이다.</figcaption>
+    </div>
+  </section>
+
+  <section class="keypoints">
+    <h2>핵심 정리</h2>
+    <ol>
+      <li>FTQ(64칸)는 페치 블록마다 시작 PC·taken 여부·끝 위치만 담고, bpu·pnr·pf·fetch·commit 다섯 포인터로 예측·프리페치·인출·커밋의 진행을 관리한다.</li>
+      <li>2-fetch는 두 번째 블록이 PNR을 지났고, 두 블록 합이 64바이트 이하이며, 같은 페이지에 있을 때 한 사이클에 두 블록을 메인 파이프로 보낸다. 메타 SRAM 포트 제약으로 줄 조합이 네 경우(같은 줄·겹침 두 가지·인터리브)일 때만 가능하다.</li>
+      <li>ICache는 256집합 × 4웨이 × 64B = 64KB, 데이터 8뱅크, 메타 짝홀 2뱅크다. 프리페치 파이프가 ITLB와 태그 검사를 먼저 끝내 WayLookup에 웨이를 남기고, 메인 파이프는 데이터만 읽는다.</li>
+      <li>명령어 경계는 \(b_i = \lnot b_{i-1} \lor r_{i-1}\) 점화식으로 정해진다. RVC 가능 지도는 줄을 채울 때 미리 계산하고, 경계 계산은 뒷절반을 두 경우로 미리 계산하는 캐리 선택 방식으로 빠르게 한다.</li>
+      <li>프리디코드 검사기는 놓친 jal·jalr·ret, 비분기 taken, 반쪽 명령어 taken을 잡아 IFU wb 단계에서 FTQ로 리다이렉트한다. IBuffer(48칸)는 들쭉날쭉한 인출과 일정한 8폭 디코드 사이를 메운다.</li>
+    </ol>
+  </section>
+
+  <section id="quiz">
+    <h2>확인 퀴즈</h2>
+    <div class="quiz">
+      <div class="quiz-q" data-answer="2"><p>Q1. FTQ의 한 칸(<code>FtqEntry</code>)에 직접 담기지 <b>않는</b> 것은?</p><div class="opts">
+        <button class="opt">시작 PC</button><button class="opt">블록이 taken으로 끝나는지</button><button class="opt">예측기 학습용 메타데이터</button><button class="opt">끝 위치</button></div>
+        <div class="quiz-exp">FtqEntry는 startPc, taken, endPosition 세 필드뿐이다. 학습용 메타는 같은 인덱스의 별도 큐(metaQueueResolve·Commit·Redirect)에 있다.</div></div>
+      <div class="quiz-q" data-answer="1"><p>Q2. 두 페치 블록이 각각 20 하프워드와 16 하프워드다. 둘 다 PNR을 지났고 같은 페이지다. 2-fetch가 되는가?</p><div class="opts">
+        <button class="opt">된다</button><button class="opt">안 된다. 합이 32 하프워드를 넘는다</button><button class="opt">ICache 미스일 때만 된다</button></div>
+        <div class="quiz-exp">조건 중 하나가 size0 + size1 ≤ FetchBlockInstNum(32 하프워드 = 64바이트)이다. 20 + 16 = 36이므로 한 사이클에 둘을 가져올 수 없다.</div></div>
+      <div class="quiz-q" data-answer="3"><p>Q3. h = 0이고, 칸 0이 32비트 명령어(RVC 아님), 칸 1·2가 RVC 가능이라면 명령어 시작 칸은? (칸 0~2만 본다)</p><div class="opts">
+        <button class="opt">0, 1, 2</button><button class="opt">0, 1</button><button class="opt">1, 2</button><button class="opt">0, 2</button></div>
+        <div class="quiz-exp">b0 = ¬h = 1. b1 = ¬b0 ∨ r0 = 0 ∨ 0 = 0(칸 1은 32비트 명령어의 뒷절반). b2 = ¬b1 ∨ r1 = 1. 그래서 시작 칸은 0과 2다.</div></div>
+      <div class="quiz-q" data-answer="0"><p>Q4. 블록 안에 jal이 있는데 BPU가 taken을 예측하지 않았다. 프리디코드 검사기가 내놓는 목적지는?</p><div class="opts">
+        <button class="opt">jal의 PC + 점프 오프셋</button><button class="opt">jal의 PC + 4</button><button class="opt">블록 시작 PC</button><button class="opt">고칠 수 없어 백엔드를 기다린다</button></div>
+        <div class="quiz-exp">jal의 목적지는 명령어 안의 즉치값만으로 계산되므로 IFU가 바로 고칠 수 있다(fixedIsJump → jumpTargets). jalr·ret은 목적지를 모르므로 순차 PC로 보낸다.</div></div>
+      <div class="quiz-q" data-answer="2"><p>Q5. ICache 메인 파이프가 태그 비교를 다시 하지 않아도 되는 이유는?</p><div class="opts">
+        <button class="opt">ICache가 직접 사상(direct-mapped)이라서</button><button class="opt">가상 태그를 쓰기 때문에</button><button class="opt">프리페치 파이프가 미리 비교한 웨이를 WayLookup에 넣어 두기 때문에</button><button class="opt">IFU가 대신 비교하기 때문에</button></div>
+        <div class="quiz-exp">프리페치 파이프가 ITLB 변환과 메타 읽기·태그 비교를 먼저 끝내고 웨이 마스크를 WayLookup에 쓴다. 메인 파이프는 그것을 꺼내 데이터 SRAM만 읽는다.</div></div>
+    </div>
+  </section>
+</main>
+
+<script>
+(function () {
+  "use strict";
+  const FTQ_SIZE = 64;
+  const PREFETCH_DEPTH_MAX = 32;
+  const HALF_WORDS_PER_BLOCK = 32;
+  const IBUFFER_SIZE = 48;
+  const DECODE_WIDTH = 8;
+
+  /* ================================================================ 그림 5-1: 인출 경로 */
+  const PATH_BLOCKS = [
+    { id: "bpu", name: "BPU", x: 0.02, y: 0.12, info: "<b>BPU</b> · 페치 블록(시작 PC, 끝 위치, taken)을 예측해 FTQ에 쓴다. 3장 참고." },
+    { id: "ftq", name: "FTQ", x: 0.17, y: 0.12, info: "<b>FTQ</b> · 64칸 원형 큐. pfPtr로 프리페치 파이프에, fetchPtr로 메인 파이프에 요청을 보낸다(<code>ftq/Ftq.scala</code>)." },
+    { id: "prefetch", name: "프리페치 파이프", short: "프리페치", x: 0.34, y: 0.02, info: "<b>ICachePrefetchPipe</b> · s0: FTQ 요청 수신, ITLB·메타 SRAM 요청. s1: ITLB 응답, 태그 비교, WayLookup 기록. s2: PMP 검사, 미스면 MSHR에 프리페치 요청." },
+    { id: "waylookup", name: "WayLookup", short: "Way LU", x: 0.52, y: 0.02, info: "<b>ICacheWayLookup</b> · 프리페치 파이프가 찾아 둔 웨이 마스크와 예외 정보를 32칸 큐에 보관한다." },
+    { id: "mshr", name: "MSHR · L2", x: 0.52, y: 0.62, info: "<b>ICacheMissUnit</b> · 인출 MSHR 4개, 프리페치 MSHR 10개. 줄을 채우면서 maybeRvcMap도 계산해 메타에 쓴다." },
+    { id: "main", name: "메인 파이프", short: "메인", x: 0.34, y: 0.32, info: "<b>ICacheMainPipe</b> · s0: WayLookup에서 웨이를 받아 데이터 SRAM을 읽는다. s1: SRAM·MSHR 데이터 정렬. s2: 패리티 검사." },
+    { id: "ifu", name: "IFU s0·s1·s2", short: "IFU", x: 0.52, y: 0.32, info: "<b>IFU</b> · s0: 명령어 경계, 압축. s1: 반쪽 명령어 이어 붙이기, PC 생성, 프리디코드 정보. s2: RVC 확장, 예측 검사, IBuffer로 전송(<code>ifu/Ifu.scala</code>)." },
+    { id: "wb", name: "IFU wb", x: 0.70, y: 0.62, info: "<b>IFU 쓰기 되돌림</b> · 프리디코드 정보를 FTQ에 쓰고, 예측 오류가 있으면 FTQ에 리다이렉트를 보낸다." },
+    { id: "ibuffer", name: "IBuffer", x: 0.70, y: 0.32, info: "<b>IBuffer</b> · 48칸 대기열. 사이클마다 최대 8개를 디코드로 내보낸다." },
+    { id: "decode", name: "Decode", x: 0.86, y: 0.32, info: "<b>Decode</b> · 6장. 명령어를 마이크로 연산으로 바꾼다." },
+  ];
+  const PATH_EDGES = [["bpu", "ftq"], ["ftq", "prefetch"], ["prefetch", "waylookup"], ["ftq", "main"], ["waylookup", "main"], ["main", "ifu"], ["ifu", "ibuffer"], ["ibuffer", "decode"], ["ifu", "wb"], ["prefetch", "mshr"], ["mshr", "main"]];
+  const PATH_SCENES = {
+    hit: { routes: [["bpu", "ftq", "prefetch", "waylookup", "main", "ifu", "ibuffer", "decode"]], text: "적중: 프리페치 파이프가 웨이를 찾아 두면, 메인 파이프가 데이터를 읽어 IFU로 넘긴다." },
+    miss: { routes: [["bpu", "ftq", "prefetch", "mshr", "main", "ifu", "ibuffer", "decode"]], text: "미스: 프리페치 파이프가 미리 MSHR에 요청을 넣는다. 메인 파이프가 그 블록에 도착할 때쯤 L2에서 줄이 돌아와 있다." },
+    fault: { routes: [["bpu", "ftq", "main", "ifu", "wb", "ftq", "bpu"]], text: "프리디코드 리다이렉트: IFU가 놓친 jal을 발견하면 wb 단계에서 FTQ로 알리고, BPU가 고친 목적지부터 다시 예측한다." },
+  };
+  let pathScene = "hit", pathTokens = [], pathClock = 0, pathSelected = null;
+  const pathView = MB.canvas("#cv-path", { aspect: 0.42, minHeight: 230, maxHeight: 330, draw: drawPath });
+  function pathRect(block, width, height) {
+    const blockWidth = width * 0.13, blockHeight = Math.max(30, height * 0.2);
+    return { x: block.x * width + 4, y: block.y * height + 12, w: blockWidth, h: blockHeight };
+  }
+  function pathCenter(id, width, height) {
+    const rect = pathRect(PATH_BLOCKS.find((b) => b.id === id), width, height);
+    return { x: rect.x + rect.w / 2, y: rect.y + rect.h / 2 };
+  }
+  function drawPath(ctx, width, height) {
+    const isSmall = width < 560;
+    PATH_EDGES.forEach(([from, to]) => {
+      const a = pathCenter(from, width, height), b = pathCenter(to, width, height);
+      ctx.strokeStyle = MB.css("border"); ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    });
+    const activeRoute = PATH_SCENES[pathScene].routes[0];
+    PATH_BLOCKS.forEach((block) => {
+      const rect = pathRect(block, width, height);
+      const isOnRoute = activeRoute.includes(block.id);
+      ctx.fillStyle = MB.css("bg-elev");
+      MB.roundRect(ctx, rect.x, rect.y, rect.w, rect.h, 7); ctx.fill();
+      ctx.fillStyle = isOnRoute ? MB.alpha(MB.css("accent"), 0.12) : MB.css("surface");
+      MB.roundRect(ctx, rect.x, rect.y, rect.w, rect.h, 7); ctx.fill();
+      ctx.strokeStyle = pathSelected === block.id ? MB.css("text") : isOnRoute ? MB.css("accent") : MB.css("border");
+      ctx.lineWidth = pathSelected === block.id ? 2 : 1.2; ctx.stroke();
+      MB.text(ctx, isSmall && block.short ? block.short : block.name, rect.x + rect.w / 2, rect.y + rect.h / 2, { align: "center", size: isSmall ? 8.5 : 11.5, weight: 700 });
+    });
+    pathTokens.forEach((token) => {
+      const route = token.route, segments = route.length - 1;
+      const position = Math.min(segments - 1e-6, token.progress * segments);
+      const index = Math.floor(position), fraction = position - index;
+      const a = pathCenter(route[index], width, height), b = pathCenter(route[index + 1], width, height);
+      const isBackward = pathScene === "fault" && index >= 4;
+      ctx.fillStyle = isBackward ? MB.css("bad") : MB.css("accent-2");
+      ctx.beginPath(); ctx.arc(a.x + (b.x - a.x) * fraction, a.y + (b.y - a.y) * fraction, 5, 0, Math.PI * 2); ctx.fill();
+    });
+  }
+  MB.seg("#path-mode", (value) => { pathScene = value; pathTokens = []; document.getElementById("path-info").innerHTML = PATH_SCENES[value].text; pathView.redraw(); });
+  pathView.onPointer("click", (x, y) => {
+    pathSelected = null;
+    PATH_BLOCKS.forEach((block) => {
+      const rect = pathRect(block, pathView.width, pathView.height);
+      if (x >= rect.x && x <= rect.x + rect.w && y >= rect.y && y <= rect.y + rect.h) pathSelected = block.id;
+    });
+    if (pathSelected) document.getElementById("path-info").innerHTML = PATH_BLOCKS.find((b) => b.id === pathSelected).info;
+    pathView.redraw();
+  });
+  const pathLoop = MB.loop(document.getElementById("fig-path"), (dt) => {
+    pathClock += dt;
+    if (pathClock > 0.7) { pathClock = 0; pathTokens.push({ route: PATH_SCENES[pathScene].routes[0], progress: 0 }); }
+    pathTokens.forEach((token) => (token.progress += dt * 0.28));
+    pathTokens = pathTokens.filter((token) => token.progress < 1);
+    pathView.redraw();
+  });
+  MB.playButton("path-play", pathLoop);
+  document.getElementById("path-info").innerHTML = PATH_SCENES.hit.text;
+
+  /* ================================================================ 그림 5-2: FTQ 포인터 */
+  const ftqSettings = { missRate: 0.1, latency: 24, depth: 32, commitProbability: 0.7 };
+  const WARMUP_CYCLES = 300; // 처음 화면이 비어 보이지 않도록 미리 돌리는 사이클
+  const BACKEND_DELAY_CYCLES = 10; // 인출에서 커밋까지 걸린다고 가정한 사이클
+  let ftqState, ftqRandom = MB.rng(5);
+  /** 포인터는 단조 증가하는 정수로 다루고, 칸 번호는 FTQ_SIZE로 나눈 나머지다. */
+  function resetFtq() {
+    ftqState = {
+      bpu: 0, pnr: 0, prefetch: 0, fetch: 0, commit: 0, cycle: 0,
+      entries: new Map(), // 포인터 → { size, isMiss, readyCycle, fetchedCycle }
+      stallCycles: 0, twoFetchCycles: 0, fetchCycles: 0, fetchedBlocks: 0, occupancySum: 0, aheadSum: 0,
+    };
+  }
+  function stepFtq() {
+    const s = ftqState;
+    s.cycle++;
+    // BPU: 사이클마다 한 블록. FTQ가 가득 차면(커밋 안 된 칸이 64) 멈춘다.
+    if (s.bpu - s.commit < FTQ_SIZE - 1) {
+      s.entries.set(s.bpu, { size: 2 + Math.floor(ftqRandom() * 18), isMiss: ftqRandom() < ftqSettings.missRate, readyCycle: Infinity, fetchedCycle: -1 });
+      s.bpu++;
+    }
+    // BPU의 마지막 덮어쓰기 단계를 지나면 PNR이 따라온다(여기서는 2블록 뒤).
+    s.pnr = Math.max(s.pnr, s.bpu - 2);
+    // 프리페치 파이프: fetch보다 depth칸 넘게 앞서지 않는다. 상한이 0이면 프리페치를 하지 않는다.
+    if (s.prefetch < s.fetch) s.prefetch = s.fetch;
+    for (let k = 0; k < 2 && ftqSettings.depth > 0; k++) {
+      if (s.prefetch < s.bpu && s.prefetch - s.fetch < ftqSettings.depth) {
+        const entry = s.entries.get(s.prefetch);
+        entry.readyCycle = s.cycle + (entry.isMiss ? ftqSettings.latency : 0);
+        s.prefetch++;
+      }
+    }
+    // 메인 파이프: 프리페치 상한이 0이면 직접 미스를 처리한다.
+    if (s.fetch < s.bpu) {
+      const first = s.entries.get(s.fetch);
+      if (first.readyCycle === Infinity && s.prefetch <= s.fetch) first.readyCycle = s.cycle + (first.isMiss ? ftqSettings.latency : 0);
+      if (first.readyCycle <= s.cycle) {
+        first.fetchedCycle = s.cycle;
+        s.fetch++; s.fetchCycles++; s.fetchedBlocks++;
+        const second = s.entries.get(s.fetch);
+        if (second && s.fetch < s.pnr && second.readyCycle <= s.cycle && first.size + second.size <= HALF_WORDS_PER_BLOCK) {
+          second.fetchedCycle = s.cycle; s.fetch++; s.twoFetchCycles++; s.fetchedBlocks++;
+        }
+      } else s.stallCycles++;
+    }
+    // 커밋: 인출된 지 10사이클 지난 블록을 사이클마다 최대 2개, 각각 확률적으로 커밋한다.
+    for (let k = 0; k < 2; k++) {
+      const head = s.entries.get(s.commit);
+      if (s.commit < s.fetch && head.fetchedCycle >= 0 && s.cycle - head.fetchedCycle > BACKEND_DELAY_CYCLES && ftqRandom() < ftqSettings.commitProbability) {
+        s.entries.delete(s.commit); s.commit++;
+      } else break;
+    }
+    s.occupancySum += s.bpu - s.commit;
+    s.aheadSum += s.prefetch - s.fetch;
+  }
+  function redirectFtq() {
+    const s = ftqState;
+    for (let pointer = s.fetch; pointer < s.bpu; pointer++) s.entries.delete(pointer);
+    s.bpu = s.pnr = s.prefetch = s.fetch;
+  }
+  const ftqView = MB.canvas("#cv-ftq", { aspect: 0.5, minHeight: 280, maxHeight: 400, draw: drawFtq });
+  function drawFtq(ctx, width, height) {
+    const s = ftqState;
+    if (!s) return;
+    const centerX = width / 2, centerY = height / 2 + 6;
+    const radius = Math.min(width, height) * 0.36, thickness = Math.max(12, radius * 0.16);
+    for (let slot = 0; slot < FTQ_SIZE; slot++) {
+      const start = (slot / FTQ_SIZE) * Math.PI * 2 - Math.PI / 2, end = ((slot + 1) / FTQ_SIZE) * Math.PI * 2 - Math.PI / 2;
+      let color = MB.css("surface");
+      // 이 칸을 차지한 포인터 값을 찾는다.
+      const pointer = s.commit + ((slot - (s.commit % FTQ_SIZE) + FTQ_SIZE) % FTQ_SIZE);
+      if (pointer < s.bpu) {
+        const entry = s.entries.get(pointer);
+        if (pointer < s.fetch) color = MB.alpha(MB.css("accent-2"), 0.55);
+        else if (entry && entry.readyCycle <= s.cycle) color = MB.alpha(MB.css("ok"), 0.6);
+        else if (entry && entry.readyCycle !== Infinity) color = MB.alpha(MB.css("warn"), 0.7);
+        else color = MB.alpha(MB.css("accent"), 0.35);
+      }
+      ctx.strokeStyle = color; ctx.lineWidth = thickness;
+      ctx.beginPath(); ctx.arc(centerX, centerY, radius, start + 0.01, end - 0.01); ctx.stroke();
+    }
+    const pointers = [["bpu", "bpuPtr", "accent"], ["pnr", "pnrPtr", "text-dim"], ["prefetch", "pfPtr", "warn"], ["fetch", "fetchPtr", "accent-2"], ["commit", "commitPtr", "ok"]];
+    const isSmall = width < 520;
+    const rankBySlot = {};
+    pointers.forEach(([key, label, color]) => {
+      const slot = s[key] % FTQ_SIZE;
+      const rank = rankBySlot[slot] || 0;
+      rankBySlot[slot] = rank + 1;
+      const angle = ((slot + 0.5) / FTQ_SIZE) * Math.PI * 2 - Math.PI / 2;
+      // 같은 칸을 가리키는 포인터는 바깥으로 한 줄씩 밀어 이름이 겹치지 않게 한다.
+      const inner = radius + thickness / 2 + 2, outer = radius + thickness / 2 + 16 + rank * 15;
+      MB.arrow(ctx, centerX + Math.cos(angle) * outer, centerY + Math.sin(angle) * outer, centerX + Math.cos(angle) * inner, centerY + Math.sin(angle) * inner, MB.css(color), 2, 6);
+      MB.text(ctx, label, centerX + Math.cos(angle) * (outer + 8), centerY + Math.sin(angle) * (outer + 8), { align: Math.cos(angle) >= 0 ? "left" : "right", size: isSmall ? 9.5 : 11, mono: true, weight: 700, color: MB.css(color) });
+    });
+    MB.text(ctx, `cycle ${s.cycle}`, centerX, centerY - 8, { align: "center", size: 12, mono: true, color: MB.css("text-dim") });
+    MB.text(ctx, `${s.bpu - s.commit} / 64`, centerX, centerY + 12, { align: "center", size: 16, mono: true, weight: 700 });
+    const legend = [["accent-2", "인출됨·커밋 대기"], ["ok", "줄 준비됨"], ["warn", "미스 처리 중"], ["accent", "예측만 됨"]];
+    legend.forEach(([color, text], k) => {
+      ctx.fillStyle = MB.alpha(MB.css(color), 0.7); ctx.fillRect(10, 10 + k * 18, 11, 11);
+      MB.text(ctx, text, 26, 16 + k * 18, { size: 11, color: MB.css("text-dim") });
+    });
+  }
+  function paintFtq() {
+    const s = ftqState;
+    MB.set("ftq-occ", `${(s.occupancySum / Math.max(1, s.cycle)).toFixed(1)} <small>칸</small>`);
+    MB.set("ftq-ahead", `${(s.aheadSum / Math.max(1, s.cycle)).toFixed(1)} <small>칸</small>`);
+    MB.set("ftq-stall", `${(s.fetchedBlocks / Math.max(1, s.cycle)).toFixed(2)} <small>블록/사이클</small>`);
+    MB.set("ftq-two", MB.pct(s.twoFetchCycles / Math.max(1, s.fetchCycles)));
+    ftqView.redraw();
+  }
+  MB.range("ftq-miss", (v) => { ftqSettings.missRate = v; }, (v) => MB.pct(v, 0));
+  MB.range("ftq-lat", (v) => { ftqSettings.latency = v; });
+  MB.range("ftq-depth", (v) => { ftqSettings.depth = v; });
+  MB.range("ftq-commit", (v) => { ftqSettings.commitProbability = v; }, (v) => v.toFixed(2));
+  document.getElementById("ftq-redirect").onclick = () => { redirectFtq(); paintFtq(); };
+  document.getElementById("ftq-reset").onclick = () => { resetFtq(); ftqRandom = MB.rng(5); for (let k = 0; k < WARMUP_CYCLES; k++) stepFtq(); paintFtq(); };
+  resetFtq();
+  let ftqClock = 0;
+  const ftqLoop = MB.loop(document.getElementById("sim-ftq"), (dt) => {
+    ftqClock += dt;
+    while (ftqClock > 0.05) { stepFtq(); ftqClock -= 0.05; }
+    paintFtq();
+  });
+  MB.playButton("ftq-play", ftqLoop);
+  for (let k = 0; k < WARMUP_CYCLES; k++) stepFtq();
+  paintFtq();
+
+  /* ================================================================ 그림 5-3: 2-fetch 조건 */
+  const twoInput = { start0: 4, size0: 10, gap: 0, start1: 20, size1: 8, isPnrPassed: true, isSamePage: true };
+  const twoView = MB.canvas("#cv-two", { aspect: 0.32, minHeight: 190, maxHeight: 260, draw: drawTwo });
+  /** 블록이 덮는 줄 목록과 줄 경계 넘음 여부. 첫 블록은 0번 줄에서 시작한다. */
+  function blockLines(lineIndex, startHalfWord, sizeHalfWords) {
+    const endHalfWord = startHalfWord + sizeHalfWords - 1;
+    const isCrossLine = endHalfWord >= HALF_WORDS_PER_BLOCK;
+    return { first: lineIndex, second: lineIndex + 1, isCrossLine };
+  }
+  function classifyTwo() {
+    const first = blockLines(0, twoInput.start0, twoInput.size0);
+    const second = blockLines(twoInput.gap, twoInput.start1, twoInput.size1);
+    // TwoFetch.scala TwoPrefetchCase.apply 식을 그대로 옮긴다.
+    const isSameLine = first.first === second.first;
+    const isOverlap1 = first.isCrossLine && !second.isCrossLine && first.second === second.first;
+    const isOverlap2 = !first.isCrossLine && second.isCrossLine && second.second === first.first;
+    const isInterleave = !first.isCrossLine && !second.isCrossLine && (first.first % 2) !== (second.first % 2);
+    let caseName = "Conflict";
+    if (isSameLine) caseName = "SameLine";
+    else if (isOverlap1) caseName = "Overlap1";
+    else if (isOverlap2) caseName = "Overlap2";
+    else if (isInterleave) caseName = "Interleave";
+    const isSizeOk = twoInput.size0 + twoInput.size1 <= HALF_WORDS_PER_BLOCK;
+    const isFtqOk = twoInput.isPnrPassed && isSizeOk && twoInput.isSamePage;
+    return { first, second, caseName, isSizeOk, isFtqOk, isTwo: isFtqOk && caseName !== "Conflict" };
+  }
+  function drawTwo(ctx, width, height) {
+    const result = classifyTwo();
+    const lineCount = Math.max(3, twoInput.gap + 3);
+    const left = 14, right = width - 14, lineWidth = (right - left) / lineCount;
+    const stripY = height * 0.45, stripHeight = 26;
+    for (let line = 0; line < lineCount; line++) {
+      ctx.fillStyle = line % 2 === 0 ? MB.css("surface") : MB.css("surface-2");
+      ctx.fillRect(left + line * lineWidth, stripY, lineWidth - 2, stripHeight);
+      MB.text(ctx, `줄 ${line} (${line % 2 === 0 ? "짝" : "홀"})`, left + line * lineWidth + lineWidth / 2, stripY + stripHeight / 2, { align: "center", size: 11, color: MB.css("text-dim"), mono: true });
+    }
+    const drawBlock = (lineIndex, start, size, y, color, label) => {
+      const x0 = left + (lineIndex + start / HALF_WORDS_PER_BLOCK) * lineWidth;
+      const x1 = left + (lineIndex + (start + size) / HALF_WORDS_PER_BLOCK) * lineWidth;
+      ctx.fillStyle = MB.alpha(MB.css(color), 0.75);
+      MB.roundRect(ctx, x0, y, Math.max(3, x1 - x0), 18, 5); ctx.fill();
+      MB.text(ctx, label, x0 + 4, y + 9, { size: 11, weight: 700, color: "#fff" });
+    };
+    drawBlock(0, twoInput.start0, twoInput.size0, stripY - 30, "accent", "fb1");
+    drawBlock(twoInput.gap, twoInput.start1, twoInput.size1, stripY + stripHeight + 12, "accent-2", "fb2");
+    MB.text(ctx, result.isTwo ? `한 사이클에 두 블록 (${result.caseName})` : `한 블록씩 (${!result.isFtqOk ? "FTQ 조건 불만족" : "메타 포트 충돌"})`, width / 2, height - 14, { align: "center", size: 13, weight: 700, color: result.isTwo ? MB.css("ok") : MB.css("bad") });
+  }
+  function paintTwo() {
+    const result = classifyTwo();
+    const reasons = [];
+    if (!twoInput.isPnrPassed) reasons.push("PNR 미통과");
+    if (!result.isSizeOk) reasons.push(`크기 합 ${twoInput.size0 + twoInput.size1} &gt; 32`);
+    if (!twoInput.isSamePage) reasons.push("페이지 다름");
+    MB.set("two-ftq", result.isFtqOk ? "만족" : reasons.join(", "), result.isFtqOk ? "good" : "bad");
+    MB.set("two-case", result.caseName, result.caseName === "Conflict" ? "bad" : "");
+    MB.set("two-result", result.isTwo ? "2블록" : "1블록", result.isTwo ? "good" : "");
+    twoView.redraw();
+  }
+  MB.range("two-s0", (v) => { twoInput.start0 = v; paintTwo(); });
+  MB.range("two-n0", (v) => { twoInput.size0 = v; paintTwo(); });
+  MB.range("two-gap", (v) => { twoInput.gap = v; paintTwo(); });
+  MB.range("two-s1", (v) => { twoInput.start1 = v; paintTwo(); });
+  MB.range("two-n1", (v) => { twoInput.size1 = v; paintTwo(); });
+  document.getElementById("two-pnr").onchange = (event) => { twoInput.isPnrPassed = event.target.checked; paintTwo(); };
+  document.getElementById("two-page").onchange = (event) => { twoInput.isSamePage = event.target.checked; paintTwo(); };
+  paintTwo();
+
+  /* ================================================================ 그림 5-4: ICache 주소 분해 */
+  const ICACHE_SETS = 256, LINE_BYTES = 64, BANK_BYTES = 8;
+  let addressValue = 0x80003f2a, addressSizeHalfWords = 20;
+  const addrView = MB.canvas("#cv-addr", { aspect: 0.3, minHeight: 200, maxHeight: 260, draw: drawAddress });
+  function decodeAddress() {
+    const offset = addressValue % LINE_BYTES;
+    const set = Math.floor(addressValue / LINE_BYTES) % ICACHE_SETS;
+    const endByte = offset + addressSizeHalfWords * 2 - 1;
+    const isCrossLine = endByte >= LINE_BYTES;
+    const banks = [];
+    for (let bank = Math.floor(offset / BANK_BYTES); bank <= Math.floor(Math.min(endByte, LINE_BYTES - 1) / BANK_BYTES); bank++) banks.push({ line: 0, bank });
+    if (isCrossLine) for (let bank = 0; bank <= Math.floor((endByte - LINE_BYTES) / BANK_BYTES); bank++) banks.push({ line: 1, bank });
+    return { offset, set, isCrossLine, banks, nextSet: (set + 1) % ICACHE_SETS };
+  }
+  function drawAddress(ctx, width, height) {
+    const decoded = decodeAddress();
+    const bits = 32, left = 12, right = width - 12, cellWidth = (right - left) / bits, top = 18;
+    for (let bit = bits - 1; bit >= 0; bit--) {
+      const x = left + (bits - 1 - bit) * cellWidth;
+      const value = Math.floor(addressValue / 2 ** bit) % 2;
+      let color = MB.css("surface");
+      if (bit < 3) color = MB.alpha(MB.css("text-faint"), 0.25);
+      else if (bit < 6) color = MB.alpha(MB.css("ok"), 0.35);
+      else if (bit < 14) color = MB.alpha(MB.css("accent-2"), bit === 6 ? 0.55 : 0.3);
+      ctx.fillStyle = color; ctx.fillRect(x + 1, top, cellWidth - 2, 24);
+      MB.text(ctx, String(value), x + cellWidth / 2, top + 12, { align: "center", size: width < 520 ? 9 : 11.5, mono: true });
+    }
+    const label = (from, to, text, color) => {
+      const x0 = left + (bits - 1 - to) * cellWidth, x1 = left + (bits - from) * cellWidth;
+      ctx.strokeStyle = MB.css(color); ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(x0 + 2, top + 30); ctx.lineTo(x1 - 2, top + 30); ctx.stroke();
+      MB.text(ctx, text, (x0 + x1) / 2, top + 42, { align: "center", size: width < 520 ? 9 : 11, color: MB.css(color), weight: 700 });
+    };
+    label(14, 31, "태그 쪽(물리 태그로 비교)", "text-dim");
+    label(6, 13, "집합 [13:6]", "accent-2");
+    label(3, 5, "뱅크", "ok");
+    label(0, 2, "", "text-faint");
+    const rowY = top + 66, bankWidth = (right - left) / 16;
+    for (let line = 0; line < 2; line++) {
+      for (let bank = 0; bank < 8; bank++) {
+        const x = left + (line * 8 + bank) * bankWidth;
+        const isUsed = decoded.banks.some((b) => b.line === line && b.bank === bank);
+        ctx.fillStyle = isUsed ? MB.alpha(MB.css("ok"), 0.6) : MB.css("surface");
+        ctx.fillRect(x + 1, rowY, bankWidth - 2, 26);
+        MB.text(ctx, `b${bank}`, x + bankWidth / 2, rowY + 13, { align: "center", size: 10.5, mono: true, color: isUsed ? MB.css("text") : MB.css("text-faint") });
+      }
+      MB.text(ctx, line === 0 ? `집합 ${decoded.set}` : `집합 ${decoded.nextSet}`, left + (line * 8 + 4) * bankWidth, rowY + 40, { align: "center", size: 11.5, mono: true, color: MB.css("text-dim") });
+    }
+  }
+  function paintAddress() {
+    const decoded = decodeAddress();
+    MB.set("addr-set", `${decoded.set} <small>0x${decoded.set.toString(16)}</small>`);
+    MB.set("addr-meta", decoded.set % 2 === 0 ? "짝수 뱅크" : "홀수 뱅크");
+    MB.set("addr-banks", decoded.banks.map((b) => (b.line ? "'" : "") + b.bank).join(" "));
+    MB.set("addr-cross", decoded.isCrossLine ? "예 (줄 2개)" : "아니오");
+    addrView.redraw();
+  }
+  document.getElementById("addr-in").addEventListener("input", (event) => {
+    const parsed = parseInt(event.target.value.replace(/^0x/i, ""), 16);
+    if (Number.isFinite(parsed)) { const unsigned = parsed >>> 0; addressValue = unsigned - (unsigned % 2); paintAddress(); }
+  });
+  MB.range("addr-size", (v) => { addressSizeHalfWords = v; paintAddress(); });
+  paintAddress();
+
+  /* ================================================================ 그림 5-5: 명령어 경계 */
+  const SLOT_COUNT = 32;
+  let maybeRvc = [], isFirstHalf = false, blockEnd = 31;
+  const presets = {
+    mix: [0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0],
+    allrvi: new Array(SLOT_COUNT).fill(0),
+    allrvc: new Array(SLOT_COUNT).fill(1),
+  };
+  /** 점화식 b_i = !b_{i-1} || r_{i-1}을 start..end 칸에 적용한다. */
+  function computeBoundary(start, end, isFirstHalfInput, previous) {
+    const boundary = previous ? previous.slice() : new Array(SLOT_COUNT).fill(false);
+    for (let i = start; i < end; i++) boundary[i] = i === start ? !isFirstHalfInput : (!boundary[i - 1] || maybeRvc[i - 1] === 1);
+    return boundary;
+  }
+  function boundaryResult() {
+    const half = SLOT_COUNT / 2;
+    const front = computeBoundary(0, half, isFirstHalf);
+    // 뒷절반 두 후보: 앞절반 마지막 칸이 32비트 명령어 시작이었는지에 따라
+    const candidateA = computeBoundary(half, SLOT_COUNT, true);
+    const candidateB = computeBoundary(half, SLOT_COUNT, false);
+    const isLastFrontRviStart = front[half - 1] && maybeRvc[half - 1] !== 1;
+    const boundary = front.slice(0, half).concat((isLastFrontRviStart ? candidateA : candidateB).slice(half));
+    return { boundary, candidateA, candidateB, isLastFrontRviStart };
+  }
+  const grid = document.getElementById("bd-grid");
+  grid.innerHTML = Array.from({ length: SLOT_COUNT }, (_, i) => `<button data-i="${i}">${i}</button>`).join("");
+  grid.addEventListener("click", (event) => {
+    const button = event.target.closest("button"); if (!button) return;
+    const i = +button.dataset.i; maybeRvc[i] = maybeRvc[i] ? 0 : 1; paintBoundary();
+  });
+  const boundaryView = MB.canvas("#cv-bd", { aspect: 0.24, minHeight: 170, maxHeight: 230, draw: drawBoundary });
+  function instructionsFrom(boundary) {
+    const list = [];
+    for (let i = 0; i <= blockEnd; i++) {
+      if (!boundary[i]) continue;
+      const isRvc = maybeRvc[i] === 1;
+      list.push({ start: i, length: isRvc ? 1 : 2, isRvc });
+    }
+    return list;
+  }
+  function drawBoundary(ctx, width, height) {
+    const result = boundaryResult();
+    const left = 12, right = width - 12, cellWidth = (right - left) / SLOT_COUNT;
+    const rows = [["선택된 결과", result.boundary, 14], ["뒷절반 후보 A (앞 칸이 RVI 앞절반)", result.candidateA, 74], ["뒷절반 후보 B", result.candidateB, 112]];
+    rows.forEach(([label, boundary, y], rowIndex) => {
+      MB.text(ctx, label, left, y - 4, { size: 11, color: MB.css("text-dim"), baseline: "bottom" });
+      if (rowIndex === 0) {
+        if (isFirstHalf) {
+          ctx.fillStyle = MB.alpha(MB.css("warn"), 0.6);
+          MB.roundRect(ctx, left + 1, y + 2, cellWidth - 2, 22, 4); ctx.fill();
+        }
+        instructionsFrom(boundary).forEach((instruction) => {
+          const x = left + instruction.start * cellWidth;
+          const instructionWidth = Math.min(instruction.length, SLOT_COUNT - instruction.start) * cellWidth;
+          const isHalfTail = !instruction.isRvc && instruction.start === blockEnd;
+          ctx.fillStyle = isHalfTail ? MB.alpha(MB.css("warn"), 0.7) : instruction.isRvc ? MB.alpha(MB.css("accent-2"), 0.6) : MB.alpha(MB.css("accent"), 0.55);
+          MB.roundRect(ctx, x + 1, y + 2, (isHalfTail ? cellWidth : instructionWidth) - 2, 22, 4); ctx.fill();
+        });
+        const endX = left + (blockEnd + 1) * cellWidth;
+        ctx.strokeStyle = MB.css("text"); ctx.setLineDash([3, 3]);
+        ctx.beginPath(); ctx.moveTo(endX, y - 2); ctx.lineTo(endX, y + 30); ctx.stroke(); ctx.setLineDash([]);
+      } else {
+        for (let i = SLOT_COUNT / 2; i < SLOT_COUNT; i++) {
+          if (!boundary[i]) continue;
+          const isChosen = (rowIndex === 1) === result.isLastFrontRviStart;
+          ctx.fillStyle = isChosen ? MB.alpha(MB.css("accent"), 0.7) : MB.alpha(MB.css("text-faint"), 0.35);
+          ctx.fillRect(left + i * cellWidth + 1, y + 2, cellWidth - 2, 12);
+        }
+      }
+    });
+  }
+  function paintBoundary() {
+    const result = boundaryResult();
+    [].forEach.call(grid.children, (button, i) => {
+      button.classList.toggle("rvc", maybeRvc[i] === 1);
+      button.classList.toggle("start", result.boundary[i] && i <= blockEnd);
+    });
+    const instructions = instructionsFrom(result.boundary);
+    const rvcCount = instructions.filter((x) => x.isRvc).length;
+    const lastInstruction = instructions[instructions.length - 1];
+    const isTailHalf = lastInstruction && !lastInstruction.isRvc && lastInstruction.start === blockEnd;
+    const joinedCount = isFirstHalf ? 1 : 0; // 앞 블록의 반쪽과 이어 붙인 명령어
+    MB.set("bd-count", String(instructions.length - (isTailHalf ? 1 : 0) + joinedCount) + (isTailHalf ? " <small>+ 끝 반쪽</small>" : "") + (joinedCount ? " <small>(이어 붙인 1개 포함)</small>" : ""));
+    MB.set("bd-mix", `${rvcCount} / ${instructions.length - rvcCount - (isTailHalf ? 1 : 0)}`);
+    MB.set("bd-tail", isTailHalf ? "예 (다음 블록에 이어짐)" : "아니오", isTailHalf ? "bad" : "");
+    MB.set("bd-sel", result.isLastFrontRviStart ? "후보 A" : "후보 B");
+    boundaryView.redraw();
+  }
+  MB.seg("#bd-preset", (value) => {
+    if (value === "random") { const random = MB.rng(Date.now() % 100000); maybeRvc = Array.from({ length: SLOT_COUNT }, () => (random() < 0.45 ? 1 : 0)); }
+    else maybeRvc = presets[value].slice();
+    paintBoundary();
+  });
+  maybeRvc = presets.mix.slice();
+  document.getElementById("bd-half").onchange = (event) => { isFirstHalf = event.target.checked; paintBoundary(); };
+  MB.range("bd-end", (v) => { blockEnd = v; paintBoundary(); });
+  paintBoundary();
+
+  /* ================================================================ 그림 5-6: 예측 검사기 */
+  const INSTRUCTION_TYPES = { plain: "일반", branch: "조건 분기", jal: "jal", jalr: "jalr", ret: "ret" };
+  const CHECK_PRESETS = {
+    jal: { types: ["plain", "plain", "branch", "plain", "jal", "plain", "plain", "plain"], taken: -1 },
+    notcfi: { types: ["plain", "plain", "plain", "branch", "plain", "plain", "plain", "plain"], taken: 1 },
+    ret: { types: ["plain", "branch", "plain", "ret", "plain", "plain", "plain", "plain"], taken: -1 },
+    ok: { types: ["plain", "plain", "branch", "plain", "plain", "jal", "plain", "plain"], taken: 5 },
+  };
+  const JUMP_OFFSET = 0x40;
+  let checkTypes = CHECK_PRESETS.jal.types.slice(), checkTaken = -1;
+  const row = document.getElementById("ck-row");
+  function buildCheckRow() {
+    row.innerHTML = checkTypes.map((type, i) => `<label class="ctrl"><span>#${i}</span><select data-i="${i}">${Object.entries(INSTRUCTION_TYPES).map(([key, name]) => `<option value="${key}"${key === type ? " selected" : ""}>${name}</option>`).join("")}</select></label>`).join("");
+  }
+  row.addEventListener("change", (event) => { const i = +event.target.dataset.i; checkTypes[i] = event.target.value; paintCheck(); });
+  /** PredChecker.scala의 remask 오류 규칙을 그대로 적용한다. */
+  function runCheck() {
+    // BPU가 taken이라 한 위치 뒤의 명령어는 원래 블록에 들어 있지 않다.
+    const validCount = checkTaken >= 0 ? checkTaken + 1 : checkTypes.length;
+    const faults = checkTypes.map((type, i) => {
+      if (i >= validCount) return null;
+      const isPredTaken = i === checkTaken;
+      if (type === "jal" && !isPredTaken) return "jal 오류";
+      if (type === "jalr" && !isPredTaken) return "jalr 오류";
+      if (type === "ret" && !isPredTaken) return "ret 오류";
+      if (type === "plain" && isPredTaken) return "비분기 taken";
+      return null;
+    });
+    const firstFault = faults.findIndex((fault) => fault !== null);
+    const keptCount = firstFault >= 0 ? firstFault + 1 : validCount;
+    let target = "—";
+    if (firstFault >= 0) {
+      const pc = 0x1000 + firstFault * 4;
+      target = checkTypes[firstFault] === "jal" ? `0x${(pc + JUMP_OFFSET).toString(16)} <small>점프 목적지</small>` : `0x${(pc + 4).toString(16)} <small>순차</small>`;
+    }
+    return { faults, firstFault, keptCount, validCount, target };
+  }
+  const checkView = MB.canvas("#cv-check", { aspect: 0.2, minHeight: 130, maxHeight: 170, draw: drawCheck });
+  function drawCheck(ctx, width, height) {
+    const result = runCheck();
+    const left = 18, right = width - 18, cellWidth = (right - left) / checkTypes.length, y = 30;
+    checkTypes.forEach((type, i) => {
+      const x = left + i * cellWidth;
+      const isOutside = i >= result.validCount;
+      const isDropped = i >= result.keptCount;
+      ctx.fillStyle = result.faults[i] ? MB.alpha(MB.css("bad"), 0.35) : isOutside ? MB.alpha(MB.css("text-faint"), 0.1) : MB.alpha(MB.css("accent-2"), 0.15);
+      MB.roundRect(ctx, x + 2, y, cellWidth - 4, 44, 6); ctx.fill();
+      if (isDropped) {
+        ctx.strokeStyle = MB.alpha(MB.css("text-faint"), 0.6); ctx.lineWidth = 1;
+        for (let k = -44; k < cellWidth; k += 8) { ctx.beginPath(); ctx.moveTo(x + 2 + Math.max(0, k), y + Math.max(0, -k)); ctx.lineTo(x + 2 + Math.min(cellWidth - 4, k + 44), y + Math.min(44, cellWidth - 4 - k)); ctx.stroke(); }
+      }
+      MB.text(ctx, INSTRUCTION_TYPES[type], x + cellWidth / 2, y + 16, { align: "center", size: width < 520 ? 9.5 : 12, weight: 700 });
+      MB.text(ctx, `0x${(0x1000 + i * 4).toString(16)}`, x + cellWidth / 2, y + 33, { align: "center", size: width < 520 ? 8.5 : 10.5, mono: true, color: MB.css("text-dim") });
+      if (result.faults[i]) MB.text(ctx, result.faults[i], x + cellWidth / 2, y + 58, { align: "center", size: width < 520 ? 8.5 : 10.5, weight: 700, color: MB.css("bad") });
+      if (i === checkTaken) MB.arrow(ctx, x + cellWidth / 2, 6, x + cellWidth / 2, y - 2, MB.css("taken"), 2, 6);
+    });
+    MB.text(ctx, checkTaken >= 0 ? "▼ BPU taken 예측" : "BPU: 블록 끝까지 taken 없음", left, 8, { size: 11, color: MB.css("taken"), weight: 700 });
+  }
+  function paintCheck() {
+    const result = runCheck();
+    MB.set("ck-first", result.firstFault >= 0 ? `#${result.firstFault} ${result.faults[result.firstFault]}` : "없음", result.firstFault >= 0 ? "bad" : "good");
+    MB.set("ck-kept", `${result.keptCount} / ${result.validCount}`);
+    MB.set("ck-target", result.target);
+    checkView.redraw();
+  }
+  MB.seg("#ck-preset", (value) => {
+    checkTypes = CHECK_PRESETS[value].types.slice();
+    document.getElementById("ck-taken").value = CHECK_PRESETS[value].taken;
+    checkTaken = CHECK_PRESETS[value].taken;
+    document.getElementById("ck-taken-out").textContent = checkTaken;
+    buildCheckRow(); paintCheck();
+  });
+  MB.range("ck-taken", (v) => { checkTaken = v; paintCheck(); });
+  buildCheckRow(); paintCheck();
+
+  /* ================================================================ 그림 5-7: IBuffer */
+  const ibufferSettings = { meanLength: 6, twoFetchRate: 0.5, missRate: 0.02, stallProbability: 0.2 };
+  let ibufferState, ibufferRandom = MB.rng(17);
+  const MISS_PENALTY_CYCLES = 12; // 미스 한 번에 IFU가 쉬는 사이클(모델 가정)
+  const HISTORY_WINDOW = 200;
+  function resetIbuffer() {
+    ibufferState = { occupancy: 0, cycle: 0, missRemaining: 0, occupancySum: 0, filledSlots: 0, fullCycles: 0, bypassed: 0, history: [] };
+  }
+  function blockLength() {
+    // 평균 meanLength의 기하 분포를 1~32로 자른다.
+    let length = 1;
+    while (length < 32 && ibufferRandom() > 1 / ibufferSettings.meanLength) length++;
+    return length;
+  }
+  /** IBuffer 한 사이클. 반환값: 디코드로 나간 명령어 수 */
+  function stepIbuffer() {
+    const s = ibufferState;
+    s.cycle++;
+    let incoming = 0;
+    if (s.missRemaining > 0) s.missRemaining--;
+    else if (ibufferRandom() < ibufferSettings.missRate) s.missRemaining = MISS_PENALTY_CYCLES;
+    else {
+      incoming = blockLength();
+      if (ibufferRandom() < ibufferSettings.twoFetchRate) incoming = Math.min(32, incoming + blockLength());
+    }
+    // IFU는 다음에 넣을 수가 빈 칸보다 적을 때만 보낸다(allowEnq).
+    if (incoming > IBUFFER_SIZE - s.occupancy) { incoming = 0; s.fullCycles++; }
+    const isBackendReady = ibufferRandom() >= ibufferSettings.stallProbability;
+    let out = 0;
+    if (isBackendReady) {
+      if (s.occupancy === 0 && incoming > 0) {
+        // 비어 있으면 큐를 거치지 않고 바로 디코드로(바이패스)
+        out = Math.min(DECODE_WIDTH, incoming);
+        s.bypassed += out;
+        s.occupancy = incoming - out;
+      } else {
+        out = Math.min(DECODE_WIDTH, s.occupancy);
+        s.occupancy = s.occupancy - out + incoming;
+      }
+    } else s.occupancy += incoming;
+    s.occupancySum += s.occupancy;
+    if (isBackendReady) s.filledSlots += out;
+    s.history.push(isBackendReady ? out / DECODE_WIDTH : null);
+    if (s.history.length > HISTORY_WINDOW) s.history.shift();
+    s.readyCycles = (s.readyCycles || 0) + (isBackendReady ? 1 : 0);
+    return out;
+  }
+  const ibufferView = MB.canvas("#cv-ibuf", { aspect: 0.34, minHeight: 210, maxHeight: 280, draw: drawIbuffer });
+  function drawIbuffer(ctx, width, height) {
+    const s = ibufferState;
+    if (!s) return;
+    const left = 14, right = width - 14, cellWidth = (right - left) / IBUFFER_SIZE;
+    for (let i = 0; i < IBUFFER_SIZE; i++) {
+      ctx.fillStyle = i < s.occupancy ? MB.alpha(MB.css("accent-2"), 0.6) : MB.css("surface");
+      ctx.fillRect(left + i * cellWidth + 1, 14, cellWidth - 2, 26);
+      if (i % 8 === 0) MB.text(ctx, String(i), left + i * cellWidth + 2, 48, { size: 10, mono: true, color: MB.css("text-faint") });
+    }
+    MB.text(ctx, `${s.occupancy} / 48`, right, 48, { align: "right", size: 11, mono: true, color: MB.css("text-dim") });
+    const chartTop = 64, chartBottom = height - 16;
+    ctx.strokeStyle = MB.css("grid");
+    [0, 0.5, 1].forEach((v) => {
+      const y = chartBottom - v * (chartBottom - chartTop);
+      ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(right, y); ctx.stroke();
+      MB.text(ctx, `${v * 100}%`, left, y - 6, { size: 10, mono: true, color: MB.css("text-faint") });
+    });
+    ctx.strokeStyle = MB.css("accent"); ctx.lineWidth = 1.6; ctx.beginPath();
+    let isDrawing = false;
+    s.history.forEach((value, i) => {
+      const x = left + (i / (HISTORY_WINDOW - 1)) * (right - left);
+      if (value === null) { isDrawing = false; return; }
+      const y = chartBottom - value * (chartBottom - chartTop);
+      if (isDrawing) ctx.lineTo(x, y); else { ctx.moveTo(x, y); isDrawing = true; }
+    });
+    ctx.stroke();
+    MB.text(ctx, "디코드 슬롯 채움(백엔드가 받을 수 있던 사이클만)", right, chartTop - 2, { align: "right", size: 10.5, color: MB.css("text-dim") });
+  }
+  function paintIbuffer() {
+    const s = ibufferState;
+    MB.set("ib-occ", `${(s.occupancySum / Math.max(1, s.cycle)).toFixed(1)} <small>칸</small>`);
+    MB.set("ib-fill", MB.pct(s.filledSlots / Math.max(1, (s.readyCycles || 0) * DECODE_WIDTH)));
+    MB.set("ib-full", MB.pct(s.fullCycles / Math.max(1, s.cycle)));
+    MB.set("ib-bypass", String(s.bypassed));
+    ibufferView.redraw();
+  }
+  const resetAndPaint = () => { resetIbuffer(); ibufferRandom = MB.rng(17); paintIbuffer(); };
+  MB.range("ib-len", (v) => { ibufferSettings.meanLength = v; resetAndPaint(); });
+  MB.range("ib-two", (v) => { ibufferSettings.twoFetchRate = v; resetAndPaint(); }, (v) => MB.pct(v, 0));
+  MB.range("ib-miss", (v) => { ibufferSettings.missRate = v; resetAndPaint(); }, (v) => MB.pct(v, 0));
+  MB.range("ib-stall", (v) => { ibufferSettings.stallProbability = v; resetAndPaint(); }, (v) => MB.pct(v, 0));
+  resetIbuffer();
+  let ibufferClock = 0;
+  const ibufferLoop = MB.loop(document.getElementById("sim-ibuf"), (dt) => {
+    ibufferClock += dt;
+    while (ibufferClock > 0.04) { stepIbuffer(); ibufferClock -= 0.04; }
+    paintIbuffer();
+  });
+  MB.playButton("ib-play", ibufferLoop);
+  for (let k = 0; k < WARMUP_CYCLES; k++) stepIbuffer();
+  paintIbuffer();
+  window.FetchChapterModels = { stepFtq, resetFtq, ftqSettings, getFtq: () => ftqState, stepIbuffer, resetIbuffer, ibufferSettings, getIbuffer: () => ibufferState, setFtqRandom: (r) => (ftqRandom = r), setIbufferRandom: (r) => (ibufferRandom = r) };
+})();
+</script>
+</body>
+</html>

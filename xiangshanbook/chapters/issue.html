@@ -1,0 +1,839 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>디스패치·이슈·실행 · XiangShanBook</title>
+<meta name="description" content="XiangShan 곤명호 v3 백엔드의 디스패치, 이슈 큐, 웨이크업과 취소, 나이 행렬 선택, 레지스터 파일 읽기 포트 중재, 정수·부동소수·벡터 실행 유닛의 지연 시간.">
+<link rel="icon" type="image/svg+xml" href="../favicon.svg">
+<link rel="stylesheet" href="../css/style.css">
+<script src="../js/common.js"></script>
+<style>
+  .iq-buttons { display: flex; flex-wrap: wrap; gap: 6px; }
+  .iq-buttons .btn.on { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); font-weight: 700; }
+  .wake-legend { display: flex; flex-wrap: wrap; gap: 6px 14px; padding: 10px 18px 0; font-size: 13px; color: var(--text-dim); }
+  .wake-legend i { display: inline-block; width: 12px; height: 12px; border-radius: 3px; vertical-align: -1px; margin-right: 5px; }
+  .fu-table td, .fu-table th { white-space: nowrap; }
+  .fu-table tr.pick { background: var(--accent-soft); }
+  .fu-table tr { cursor: pointer; }
+</style>
+</head>
+<body data-chapter="issue">
+<main class="chapter">
+  <header class="chapter-hero">
+    <div class="eyebrow">Chapter 07</div>
+    <h1>디스패치·이슈·실행</h1>
+    <p class="lead">리네임을 마친 명령어는 곧바로 실행되지 않는다. 먼저 자기를 실행할 수 있는 실행 유닛 앞의 <span class="term">이슈 큐</span><span class="en">(issue queue)</span>에 들어가 기다린다. 피연산자가 모두 준비되는 순간 큐에서 뽑혀 레지스터 파일을 읽고, 실행 유닛을 지나 결과를 쓴다. 비순차 코어의 속도는 이 "기다렸다가 준비되면 바로 출발" 과정을 얼마나 촘촘하게 돌리느냐에 달렸다. XiangShan 곤명호 v3는 정수·부동소수·벡터 세 스케줄러에 이슈 큐 23개를 두고, 결과가 나오기도 전에 다음 명령을 미리 깨우는 투기적 웨이크업을 쓴다.</p>
+    <ul class="objectives">
+      <li>정수·부동소수·벡터 스케줄러의 이슈 큐 구성과 각 큐에 붙은 실행 유닛을 실제 설정에서 읽어 낸다.</li>
+      <li>디스패치가 같은 종류의 이슈 큐 여러 개에 명령을 나눠 주는 균형 정책을 시뮬레이터로 비교한다.</li>
+      <li>나이 행렬로 "준비된 것 중 가장 오래된 명령"을 한 사이클에 고르는 원리를 직접 조작해 본다.</li>
+      <li>투기적 웨이크업과, 적재가 빗나갔을 때의 취소·재발행을 사이클 단위로 따라간다.</li>
+      <li>레지스터 파일 읽기 포트 공유와 우선순위 때문에 생기는 발행 실패를 확인한다.</li>
+    </ul>
+  </header>
+
+  <!-- ============================================================ 1 -->
+  <section id="map">
+    <h2>스케줄러 지도</h2>
+    <p>XiangShan의 백엔드는 <span class="term">토마술로 알고리즘</span><span class="en">(Tomasulo)</span>의 직계 후손이다(<code>backend/README.md</code>가 직접 이 논문을 인용한다). 리네임된 명령어는 <span class="term">디스패치</span><span class="en">(Dispatch)</span>에서 기능 유닛 종류<span class="en">(FuType)</span>를 보고 알맞은 이슈 큐로 보내진다. 이슈 큐는 세 스케줄러로 묶인다. 정수 스케줄러에 13개, 부동소수 스케줄러에 4개, 벡터 스케줄러에 6개다. 큐마다 실행 유닛<span class="en">(EXU)</span>이 하나나 둘 붙고, 실행 유닛 하나는 여러 기능 유닛<span class="en">(FU)</span>을 품는다. 예를 들어 첫 정수 큐는 ALU0과 BJU0 두 실행 유닛에 명령을 내보낸다. ALU0 안에는 ALU, CSR, Fence, Link가, BJU0 안에는 분기와 점프가 들어 있다.</p>
+    <div class="callout code"><strong>정수 스케줄러의 첫 이슈 큐</strong>
+      <p>설정 한 줄이 큐 크기, 실행 유닛, 기능 유닛, 쓰기 포트, 읽기 포트를 모두 정한다. <code>IntRD(포트, 우선순위)</code>는 몇 번 정수 레지스터 파일 읽기 포트를 어떤 우선순위로 쓰는지를 뜻한다.</p>
+<pre><code><span class="c">// src/main/scala/xiangshan/Parameters.scala:344-347</span>
+IssueBlockParams(Seq(
+  ExeUnitParams(<span class="s">"ALU0"</span>, Seq(AluCfg, CsrCfg, FenceCfg, LinkCfg), Seq(IntWB(port = 0, 0)),
+                Seq(Seq(IntRD(0, 0)), Seq(IntRD(1, 0))), true, 2),
+  ExeUnitParams(<span class="s">"BJU0"</span>, Seq(BrhCfg, NJmpCfg), Seq(), Seq(Seq(IntRD(1, 1)), Seq(IntRD(7, 2))))
+), numEntries = 18, numEnq = 2, numComp = 10),</code></pre>
+    </div>
+    <div class="sim" id="sim-map">
+      <div class="sim-head"><span class="sim-tag">EXPLORER</span><h3>이슈 큐 → 실행 유닛 → 기능 유닛</h3>
+        <div class="seg" id="map-schd"><button data-value="int" class="on">정수 (13)</button><button data-value="fp">부동소수 (4)</button><button data-value="vec">벡터 (6)</button></div>
+      </div>
+      <div class="sim-view"><canvas id="cv-map"></canvas></div>
+      <div class="info-panel" id="map-info">이슈 큐 상자를 누르면 자세한 정보가 여기에 나온다.</div>
+      <figcaption><span class="try">눌러 보기</span>왼쪽 열은 이슈 큐, 가운데 열은 실행 유닛, 오른쪽 칩은 그 실행 유닛 안의 기능 유닛이다. 큐 상자 안의 막대는 엔트리 구성이다. 들어오는 칸(enq), 단순 칸(simp), 복합 칸(comp)으로 나뉜다. 모든 값은 <code>Parameters.scala:341-550</code>의 기본 설정에서 옮겼다. 정수 큐 셋(IQ0~IQ2)이 실행 유닛을 둘씩 거느려 한 사이클에 명령을 두 개까지 내보낼 수 있다는 점, 적재·스토어 주소·스토어 데이터가 각각 따로 큐를 갖는다는 점을 눈여겨보자.</figcaption>
+    </div>
+    <p>표로 요약하면 다음과 같다. 전체 이슈 큐 엔트리는 정수 쪽 238개, 부동소수 쪽 80개, 벡터 쪽 96개다.</p>
+    <div class="table-wrap"><table>
+      <tr><th>스케줄러</th><th>이슈 큐</th><th class="num">엔트리</th><th>실행 유닛(기능 유닛)</th></tr>
+      <tr><td>정수</td><td>IQ0~IQ2</td><td class="num">18 × 3</td><td>ALU0~2(ALU 외 CSR·Fence·Link / DIV / I2F) + BJU0~2(분기·점프)</td></tr>
+      <tr><td>정수</td><td>IQ3~IQ5</td><td class="num">20 × 3</td><td>ALU3(ALU·BKU·VSET), ALU4·ALU5(ALU·MUL)</td></tr>
+      <tr><td>정수(메모리)</td><td>IQ6~IQ8</td><td class="num">20 × 3</td><td>LDU0~2(적재)</td></tr>
+      <tr><td>정수(메모리)</td><td>IQ9~IQ12</td><td class="num">16 × 4</td><td>STA0·1(스토어 주소, MOU), STD0·1(스토어 데이터, MOUD)</td></tr>
+      <tr><td>부동소수</td><td>FIQ0~FIQ3</td><td class="num">20 × 4</td><td>FEX0(FALU·FMUL·FCVT·FCMP), FEX1·2(FALU·FMUL·FDIV), FEX3(FALU·FMUL)</td></tr>
+      <tr><td>벡터</td><td>VIQ0~VIQ5</td><td class="num">16 × 6</td><td>VFEX0~3(정수·부동소수 벡터 연산), VSTD0·1(벡터 스토어 데이터)</td></tr>
+    </table></div>
+  </section>
+
+  <!-- ============================================================ 2 -->
+  <section id="dispatch">
+    <h2>디스패치: 어느 큐로 보낼까</h2>
+    <p>ALU 명령은 여섯 개 큐(IQ0~IQ5) 중 어디로 가도 실행될 수 있다. 적재는 세 큐(IQ6~IQ8) 중 어디로 가도 된다. 이렇게 같은 종류를 받는 큐가 여럿일 때, 디스패치는 <b>지금 덜 찬 큐부터</b> 채운다. <code>Dispatch.scala</code>는 큐마다 차 있는 엔트리 수를 비교해 큐들을 정렬해 두고, 한 묶음 안의 i번째 ALU 명령을 i번째로 덜 찬 큐로 보낸다. 큐마다 들어오는 칸이 두 개(<code>numEnq = 2</code>)라서, 한 사이클에 한 큐로는 최대 두 명령까지만 들어갈 수 있다.</p>
+    <div class="callout code"><strong>큐 정렬에 쓰는 비교</strong>
+      <p>기본값으로 켜져 있는 <code>EnableDispatchIQBalanceOpt</code>는 지금 차 있는 수에 이번 사이클에 들어갈 수까지 더해 비교한다.</p>
+<pre><code><span class="c">// src/main/scala/xiangshan/backend/dispatch/Dispatch.scala:484-485</span>
+<span class="k">else if</span> (i &lt; j) compareMatrixNew(i)(j) := IQSortValidCnt(startNum+i) + IQSortValidCntAddEnq(startNum+i) &lt;
+                                     IQSortValidCnt(startNum+j) + IQSortValidCntAddEnq(startNum+j)</code></pre>
+    </div>
+    <div class="sim" id="sim-dsp">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>ALU 명령 나눠 주기</h3>
+        <div class="seg" id="dsp-policy"><button data-value="sorted" class="on">덜 찬 순 (XS)</button><button data-value="fixed">고정 순서</button></div>
+      </div>
+      <div class="sim-view"><canvas id="cv-dsp"></canvas></div>
+      <div class="sim-controls">
+        <label class="ctrl"><span>한 묶음 중 ALU 명령 비율 <output id="dsp-mix-out"></output></span><input type="range" id="dsp-mix" min="0.2" max="1" step="0.05" value="0.5"></label>
+        <label class="ctrl"><span>엔트리가 한 사이클에 준비될 확률 <output id="dsp-ready-out"></output></span><input type="range" id="dsp-ready" min="0.05" max="0.6" step="0.01" value="0.12"></label>
+        <div class="ctrl-row"><button class="btn sm" id="dsp-reset">⏮ 처음부터</button><button class="btn sm" id="dsp-play">⏸ 멈춤</button></div>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">흐른 사이클</span><span class="v" id="dsp-cycle">0</span></div>
+        <div class="stat"><span class="k">디스패치 막힘</span><span class="v" id="dsp-stall">—</span></div>
+        <div class="stat"><span class="k">ALU 처리량</span><span class="v" id="dsp-ipc">—</span></div>
+        <div class="stat"><span class="k">가장 찬 큐 / 가장 빈 큐</span><span class="v" id="dsp-spread">—</span></div>
+      </div>
+      <figcaption><span class="try">비교해 보기</span>매 사이클 8개 명령 묶음이 도착하고, 그중 일부가 ALU 명령이다. 막대는 IQ0~IQ5의 점유, 점선은 큐 용량(18 또는 20)이다. 각 큐의 ALU는 준비된 엔트리가 하나라도 있으면 한 사이클에 하나를 내보낸다. '고정 순서'는 묶음의 i번째 ALU 명령을 무조건 IQ(i mod 6)로 보낸다. 묶음에 ALU 명령이 6개보다 적으면 IQ4·IQ5까지 차례가 잘 오지 않고 앞쪽 큐부터 가득 찬다. 그러면 아직 빈 큐가 있는데도 디스패치가 멈춘다. '덜 찬 순'으로 바꾸면 막대 높이가 고르게 맞춰진다. 기본값(ALU 50%, 준비 확률 0.12)으로 4,000사이클을 돌려 node에서 쟀다. '덜 찬 순'은 디스패치 막힘 0%에 ALU 처리량이 사이클당 4.00이었다. '고정 순서'는 막힘 14.7%에 3.54였다. 웹 모델은 준비 여부를 확률로 흉내 낸 것이다.</figcaption>
+    </div>
+  </section>
+
+  <!-- ============================================================ 3 -->
+  <section id="select">
+    <h2>가장 오래된 준비된 명령 고르기</h2>
+    <p>이슈 큐는 매 사이클 "피연산자가 모두 준비되었고, 아직 발행되지 않았고, 막혀 있지 않은" 엔트리를 찾는다(<code>EntryBundles.scala:40-42</code>의 <code>canIssue</code>). 여러 개라면 그중 <b>가장 오래된</b> 것을 고른다. 오래된 명령은 ROB 머리에 가깝다. 먼저 끝내야 커밋이 막히지 않고, 그 뒤에 줄 선 명령들도 깨울 수 있다.</p>
+    <p>"가장 오래된"을 한 사이클 안에 찾기 위해 XiangShan은 <span class="term">나이 행렬</span><span class="en">(age matrix)</span>을 쓴다. N개 엔트리마다 "i가 j보다 먼저 들어왔다"는 비트 age(i)(j)를 저장한다. 엔트리 i는 자기보다 오래된 준비된 엔트리가 하나도 없을 때 선택된다. 행렬은 대각선을 기준으로 대칭(서로 반대)이라 위 삼각형만 레지스터로 둔다.</p>
+    <div class="formula">$$\text{oldest}_i = \text{canIssue}_i \;\land\; \bigwedge_{j} \big(\text{age}(i,j) \lor \lnot\,\text{canIssue}_j\big)$$
+      <div class="where">age(i,i) = 1, i &lt; j면 age(i,j)를 레지스터에서 읽고, i &gt; j면 ¬age(j,i)로 대신한다. 새 엔트리 i가 들어오면 i행은 모두 0(가장 젊음), i열은 모두 1로 바뀐다(<code>AgeDetector.scala:60-84</code>).</div></div>
+    <div class="callout code"><strong>getOldestCanIssue</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/backend/issue/AgeDetector.scala:92-96</span>
+<span class="k">def</span> getOldestCanIssue(get: (Int, Int) =&gt; Bool, canIssue: UInt): UInt = {
+  VecInit((0 until numEntries).map(i =&gt; {
+    (VecInit((0 until numEntries).map(j =&gt; get(i, j))).asUInt | ~canIssue).andR &amp; canIssue(i)
+  })).asUInt
+}</code></pre>
+    </div>
+    <p>실제 큐는 엔트리를 세 무리로 나눈다. 디스패치에서 막 들어온 명령은 <b>들어오는 칸</b><span class="en">(enq entry, 2개)</span>에 머문다. 그 뒤 <b>복합 칸</b><span class="en">(complex entry)</span>으로 옮겨지는데, 자리가 없으면 <b>단순 칸</b><span class="en">(simple entry)</span>에 들렀다 간다. 선택은 무리마다 따로 나이 행렬로 한다. 그리고 복합 칸에서 뽑힌 것이 있으면 그것, 없으면 단순 칸, 그다음 들어오는 칸 순으로 고른다(<code>IssueQueue.scala:573-582</code>). 오래 머문 명령일수록 복합 칸에 있을 가능성이 크므로, 이 순서는 대체로 "오래된 것 먼저"를 지키면서 비교기 수를 줄인다.</p>
+    <div class="sim" id="sim-age">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>나이 행렬로 고르기</h3>
+        <div class="ctrl-row"><button class="btn sm" id="age-enq">새 명령 넣기</button><button class="btn sm primary" id="age-issue">발행 (1개)</button><button class="btn sm" id="age-clear">비우기</button></div>
+      </div>
+      <div class="sim-view"><canvas id="cv-age"></canvas></div>
+      <div class="info-panel" id="age-info">빈 칸을 누르면 그 칸에 명령이 들어오고, 찬 칸을 누르면 준비 상태가 바뀐다.</div>
+      <figcaption><span class="try">눌러 보기</span>왼쪽은 8칸 이슈 큐, 오른쪽은 나이 행렬이다. 칸 번호는 위치일 뿐 나이와 무관하다. 칸 안 숫자는 들어온 순서다. 행렬의 칸 (i, j)가 칠해져 있으면 "i가 j보다 오래됨"이다. 진한 칸은 레지스터에 저장되는 위 삼각형이고, 옅은 칸은 거기서 뒤집어 얻는 아래 삼각형이다. 준비된(초록) 칸 중 오래된 것이 굵게 표시되고, '발행'을 누르면 그 칸이 비워진다. 빈 칸에 새 명령을 넣으면 그 행이 모두 비고 그 열이 모두 채워지는 것을 볼 수 있다.</figcaption>
+    </div>
+  </section>
+
+  <!-- ============================================================ 4 -->
+  <section id="wakeup">
+    <h2>미리 깨우기와 취소</h2>
+    <p>소비자 명령은 생산자의 결과가 레지스터 파일에 쓰인 뒤에야 준비되는 것일까? 그렇게 하면 한 사이클짜리 덧셈 사슬도 매 명령마다 몇 사이클씩 쉬어야 한다. XiangShan은 생산자가 <b>발행되는 순간</b> 그 지연 시간을 알고 있으므로, "몇 사이클 뒤에 결과가 나온다"는 사실만으로 소비자를 미리 깨운다. 이것이 이슈 큐 사이의 <span class="term">웨이크업</span><span class="en">(IQ wakeup)</span>이다. 결과 자체는 실행 유닛 출구의 <span class="term">바이패스 네트워크</span><span class="en">(BypassNetwork)</span>로 바로 전달되므로, 지연 0인 ALU끼리는 매 사이클 연달아 발행할 수 있다. 어떤 실행 유닛이 어떤 큐를 깨울 수 있는지는 <code>Parameters.scala:556-576</code>의 <code>iqWakeUpParams</code>가 정한다. 정수 ALU 6개와 적재 3개는 정수 쪽 모든 큐를 깨우고, 적재는 부동소수 큐도 깨운다.</p>
+    <p>문제는 적재다. 적재의 지연 시간은 캐시 적중 여부에 달렸는데, 발행 시점에는 그걸 모른다. XiangShan은 적재가 <b>적중한다고 가정</b>하고 정해진 지연 값(<code>LduCfg</code>의 <code>UncertainLatency(3)</code>)으로 소비자를 깨운다. 나중에 적재 파이프라인이 미스를 알게 되면 <code>ld1Cancel</code>이나 <code>ld2Cancel</code> 신호를 낸다. 그 적재 결과를 믿고 이미 발행된 명령은 취소되고, 이슈 큐에 남아 있던 엔트리가 다시 '발행 안 됨'으로 돌아간다. 엔트리는 피연산자마다 2비트 <code>loadDependency</code>를 들고 다닌다. 그 비트로 "몇 사이클 전 어느 적재 파이프의 결과에 기대고 있는지"를 알아, 취소 신호가 오면 자기가 대상인지 판단한다.</p>
+    <div class="callout code"><strong>LoadShouldCancel</strong>
+<pre><code><span class="c">// src/main/scala/xiangshan/backend/Bundles.scala:1838-1844</span>
+<span class="k">object</span> LoadShouldCancel {
+  <span class="k">def</span> apply(loadDependency: Option[Seq[UInt]], ldCancel: Seq[LoadCancelIO]): Bool = {
+    <span class="k">val</span> ld1Cancel = loadDependency.map(_.zip(ldCancel.map(_.ld1Cancel)).map { <span class="k">case</span> (dep, cancel) =&gt; cancel &amp;&amp; dep(0)}.reduce(_ || _))
+    <span class="k">val</span> ld2Cancel = loadDependency.map(_.zip(ldCancel.map(_.ld2Cancel)).map { <span class="k">case</span> (dep, cancel) =&gt; cancel &amp;&amp; dep(1)}.reduce(_ || _))
+    ld1Cancel.map(_ || ld2Cancel.get).getOrElse(false.B)
+  }
+}</code></pre>
+    </div>
+    <div class="sim" id="sim-wake">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>투기적 웨이크업 타임라인</h3>
+        <div class="seg" id="wk-mode"><button data-value="spec" class="on">발행 시점에 깨움 (XS)</button><button data-value="late">쓰기 뒤에 깨움 (비교용)</button></div>
+      </div>
+      <div class="wake-legend"><span><i style="background:var(--accent-2)"></i>발행</span><span><i style="background:var(--warn)"></i>OG0·OG1 (레지스터 읽기)</span><span><i style="background:var(--ok)"></i>실행</span><span><i style="background:var(--bad)"></i>취소</span><span><i style="background:var(--surface-2)"></i>큐에서 대기</span></div>
+      <div class="sim-view"><canvas id="cv-wake"></canvas></div>
+      <div class="sim-controls">
+        <div class="ctrl"><span>적재 결과</span><div class="seg" id="wk-hit"><button data-value="hit" class="on">적중</button><button data-value="miss">미스</button></div></div>
+        <label class="ctrl"><span>미스일 때 추가 지연 <output id="wk-pen-out"></output></span><input type="range" id="wk-pen" min="6" max="30" step="1" value="12"></label>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">마지막 명령 실행 끝</span><span class="v" id="wk-end">—</span></div>
+        <div class="stat"><span class="k">취소된 발행</span><span class="v" id="wk-cancel">—</span></div>
+        <div class="stat"><span class="k">헛된 레지스터 읽기 사이클</span><span class="v" id="wk-waste">—</span></div>
+      </div>
+      <figcaption><span class="try">바꿔 보기</span>여섯 명령이 한 사슬로 묶여 있다. <code>ld x1</code> → <code>add x2,x1,1</code> → <code>mul x3,x2,x2</code> → <code>add x4,x3,x2</code> → <code>add x5,x4,x1</code> → <code>add x6,x5,1</code> 순이다. 웹 모델에서 소비자는 생산자 발행 후 (지연+1) 사이클에 발행할 수 있다. 지연은 ALU 0, MUL 2, 적재 3이다(<code>FuConfig.scala</code>). 발행 다음 두 사이클이 OG0·OG1(레지스터 읽기)이다. '미스'로 바꾸면 적재를 믿고 발행된 명령이 빨간 X로 취소되고, 데이터가 돌아온 뒤 다시 발행된다. 웹 모델은 미스 판명 시점을 '적재 발행 후 5사이클'로 단순화했다. '쓰기 뒤에 깨움'은 RTL에 없는 비교용 정책으로, 결과가 실행을 끝낸 다음에야 소비자를 깨운다.</figcaption>
+    </div>
+    <div class="predict"><strong>왜 그냥 미스가 판명될 때까지 기다리지 않을까?</strong>
+      <p>적재 결과를 믿고 소비자를 미리 발행했다가 취소하면 레지스터 읽기와 실행 슬롯을 헛되이 쓴다. 그럼에도 투기적으로 깨우는 이유는 무엇일까?</p>
+      <details><summary>답 보기</summary><p>적재는 대부분 L1 캐시에 적중한다. 적중을 기다렸다 깨우면 <b>모든</b> 적재 소비자가 매번 몇 사이클씩 늦어진다. 반면 투기적으로 깨우면 손해는 드문 미스 때만 본다. 위 시뮬레이터에서 '적중'일 때 두 정책의 마지막 사이클 차이를 보면, 매 적재마다 얼마를 아끼는지 알 수 있다.</p></details>
+    </div>
+  </section>
+
+  <!-- ============================================================ 5 -->
+  <section id="datapath">
+    <h2>레지스터 파일 읽기: OG0와 OG1</h2>
+    <p>이슈 큐에서 뽑힌 명령은 곧바로 실행 유닛으로 가지 않고 <code>DataPath</code>를 지난다. 첫 단계 <b>OG0</b>에서 레지스터 파일 읽기 포트를 중재받고, 둘째 단계 <b>OG1</b>에서 읽은 값을 받아 실행 유닛에 넘긴다. 정수 레지스터 파일은 물리 레지스터 224개, 4뱅크다(<code>Parameters.scala:121-126</code>). 읽기 포트는 12개(0~11번)뿐인데, 정수 쪽 실행 유닛이 원하는 피연산자는 그보다 많다. 그래서 포트 하나를 여러 실행 유닛이 <b>우선순위</b>를 두고 나눠 쓴다. <code>IntRD(7, 2)</code>는 "7번 포트를 우선순위 2로"라는 뜻이고, 숫자가 작을수록 먼저다.</p>
+    <p>중재에서 진 명령은 OG0에서 실패 응답(<code>og0Resp.failed</code>)을 받는다. 이슈 큐 엔트리는 '발행됨'을 지우고 다음 사이클에 다시 경쟁한다. 실행 유닛이 받을 수 없는 상태(나눗셈기처럼 파이프라인이 아닌 유닛이 바쁠 때)면 OG1에서 실패한다.</p>
+    <div class="sim" id="sim-port">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>정수 읽기 포트 12개 나눠 쓰기</h3>
+        <div class="seg" id="port-preset"><button data-value="alu" class="on">ALU 6개</button><button data-value="aluld">ALU 6 + 적재 3</button><button data-value="all">ALU 6 + 적재 3 + 분기 3</button><button data-value="st">스토어 + 분기</button></div>
+      </div>
+      <div class="iq-buttons" id="port-exus" style="padding:12px 18px 0"></div>
+      <div class="sim-view"><canvas id="cv-port"></canvas></div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">이번 사이클 발행 요청</span><span class="v" id="port-req">—</span></div>
+        <div class="stat"><span class="k">OG0 통과</span><span class="v" id="port-pass">—</span></div>
+        <div class="stat"><span class="k">포트 경쟁에 진 실행 유닛</span><span class="v" id="port-lose">—</span></div>
+      </div>
+      <figcaption><span class="try">눌러 보기</span>위 버튼으로 이번 사이클에 명령을 받은 실행 유닛을 고른다. 아래 그림은 12개 정수 읽기 포트이고, 각 포트로 향한 선이 요청이다. 선 옆 숫자는 우선순위다. 이긴 요청은 초록, 진 요청은 빨강이고, 피연산자 하나라도 지면 그 실행 유닛 전체가 이번 사이클에 실패한다. ALU0~2는 두 피연산자 모두 전용 포트를 우선순위 0으로 받아 지지 않는다. 그러나 ALU3~5의 둘째 피연산자는 적재와 같은 포트(7·9·11번)를 우선순위 1로 쓴다. 그래서 적재 셋이 함께 발행되면 ALU3~5가 양보한다. 분기 유닛(BJU)은 첫째 피연산자부터 ALU 포트를 우선순위 1로 빌려 쓰므로, 같은 큐의 ALU와 동시에 나가면 진다. 웹 모델은 4뱅크 분할과 레지스터 캐시(<code>regcache/</code>)에서 바로 읽는 경로는 그리지 않았다.</figcaption>
+    </div>
+    <div class="callout tip"><strong>왜 포트를 그냥 늘리지 않을까</strong>
+      <p>레지스터 파일의 면적과 지연은 포트 수에 따라 가파르게 커진다. 셀마다 포트 수만큼 단어선과 비트선이 지나가야 하기 때문이다. XiangShan은 ALU의 첫째 피연산자와 적재 주소에는 우선순위 0 포트를 주고, 분기·스토어 피연산자와 일부 ALU의 둘째 피연산자는 그 포트를 낮은 우선순위로 빌려 쓰게 했다. 또 값이 최근에 쓰였다면 작은 레지스터 캐시나 바이패스에서 꺼내 포트를 아예 쓰지 않게 했다.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ 6 -->
+  <section id="fu">
+    <h2>기능 유닛의 지연과 처리량</h2>
+    <p>실행 유닛 안의 기능 유닛은 두 성질로 나뉜다. 지연이 <b>정해진</b><span class="en">(CertainLatency)</span> 유닛과 <b>정해지지 않은</b><span class="en">(UncertainLatency)</span> 유닛이다. 그리고 <b>파이프라인</b><span class="en">(piped)</span>이라 매 사이클 새 명령을 받는 유닛과, 하나를 끝낼 때까지 바쁜 유닛이 있다. 지연이 정해진 유닛은 이슈 큐가 미리 소비자를 깨울 수 있다. 나눗셈기처럼 정해지지 않은 유닛은 결과가 나와야 깨울 수 있다.</p>
+    <div class="table-wrap"><table class="fu-table" id="fu-table"></table></div>
+    <div class="sim" id="sim-fu">
+      <div class="sim-head"><span class="sim-tag">SIMULATOR</span><h3>같은 유닛에 명령 열 개 보내기</h3>
+        <div class="seg" id="fu-dep"><button data-value="indep" class="on">서로 독립</button><button data-value="chain">한 사슬</button></div>
+      </div>
+      <div class="sim-view"><canvas id="cv-fu"></canvas></div>
+      <div class="sim-controls">
+        <label class="ctrl"><span>지연이 정해지지 않은 유닛의 예시 지연 <output id="fu-unc-out"></output></span><input type="range" id="fu-unc" min="4" max="24" step="1" value="12"></label>
+      </div>
+      <div class="sim-readout">
+        <div class="stat"><span class="k">고른 기능 유닛</span><span class="v" id="fu-name">—</span></div>
+        <div class="stat"><span class="k">열 개 끝내는 데 걸린 사이클</span><span class="v" id="fu-total">—</span></div>
+        <div class="stat"><span class="k">처리량</span><span class="v" id="fu-tp">—</span></div>
+      </div>
+      <figcaption><span class="try">눌러 보기</span>위 표의 줄을 누르면 그 기능 유닛 하나에 명령 열 개를 보낸 타임라인이 그려진다. 파이프라인 유닛은 독립 명령을 매 사이클 받아 처리량이 1에 가깝다. 파이프라인이 아닌 유닛(DIV, FDIV 등)은 앞 명령이 끝나야 다음을 받는다. '한 사슬'로 바꾸면 파이프라인 유닛도 매번 지연만큼 기다려야 한다. 지연이 정해지지 않은 유닛의 실제 지연은 피연산자 값에 따라 달라진다. 슬라이더 값은 설명을 위한 예시일 뿐 RTL 값이 아니다.</figcaption>
+    </div>
+    <p>쓰기 쪽에도 경쟁이 있다. 정수 레지스터 파일의 쓰기 포트는 9개다. ALU0~5가 0~5번, LDU0~2가 6~8번을 쓴다. 그런데 부동소수 FEX0(FCMP·FCVT 결과)은 3번 포트를, 벡터 VFEX0은 4번 포트를 우선순위 1로 함께 쓴다(<code>IntWB(port = 3, 1)</code> 등). 이렇게 공유된 쓰기 포트에서 두 결과가 부딪칠 것 같으면 <code>DataPath</code>의 쓰기 충돌 검사기(<code>IntRFWBCollideChecker</code> 등)가 OG0에서 진 쪽을 실패시킨다. 또 한 실행 유닛 안에서도 지연이 다른 기능 유닛(예: ALU4의 ALU와 MUL)의 결과가 같은 사이클에 출구로 나오면 안 된다. 그래서 이슈 큐는 <code>FuBusyTable</code>로 그 실행 유닛 출구가 몇 사이클 뒤에 쓰일지 기억해 두고, 겹칠 엔트리는 발행 후보에서 뺀다(<code>IssueQueue.scala:430-433</code>).</p>
+  </section>
+
+  <section class="keypoints">
+    <h2>핵심 정리</h2>
+    <ol>
+      <li>곤명호 v3의 이슈 큐는 정수 13개, 부동소수 4개, 벡터 6개다. 큐마다 실행 유닛 1~2개가 붙고, 모든 구성은 <code>Parameters.scala</code>의 <code>IssueBlockParams</code> 몇 줄로 정해진다.</li>
+      <li>같은 종류를 받는 큐가 여럿이면 디스패치는 점유가 낮은 큐부터 채워 부하를 고르게 한다.</li>
+      <li>이슈 큐는 나이 행렬로 준비된 것 중 가장 오래된 명령을 한 사이클에 고른다. 엔트리는 들어오는 칸, 단순 칸, 복합 칸으로 나뉘고, 고를 때는 복합 칸이 앞선다.</li>
+      <li>지연이 정해진 생산자는 발행 즉시 소비자를 깨운다. 적재는 적중을 가정해 깨웠다가, 미스면 <code>ld1Cancel/ld2Cancel</code>로 소비자를 취소하고 다시 발행한다.</li>
+      <li>레지스터 파일 읽기 포트는 우선순위를 두고 공유된다. 중재에서 진 명령은 OG0에서 실패해 큐로 돌아가 다시 경쟁한다.</li>
+    </ol>
+  </section>
+
+  <section id="quiz">
+    <h2>확인 퀴즈</h2>
+    <div class="quiz">
+      <div class="quiz-q" data-answer="2"><p>Q1. 정수 큐 IQ0(엔트리 18, numEnq 2, numComp 10)의 단순 칸은 몇 개인가?</p><div class="opts">
+        <button class="opt">0개</button><button class="opt">2개</button><button class="opt">6개</button><button class="opt">10개</button></div>
+        <div class="quiz-exp"><code>numSimp = numEntries − numEnq − numComp</code>(<code>IssueBlockParams.scala:167</code>)이므로 18 − 2 − 10 = 6이다.</div></div>
+      <div class="quiz-q" data-answer="1"><p>Q2. 나이 행렬에서 새 명령이 칸 i로 들어올 때 일어나는 일은?</p><div class="opts">
+        <button class="opt">i행이 모두 1이 된다 (가장 오래됨)</button><button class="opt">i행은 모두 0, i열은 모두 1이 된다 (가장 젊음)</button><button class="opt">행렬 전체가 초기화된다</button><button class="opt">아무 일도 없다</button></div>
+        <div class="quiz-exp">새로 들어온 명령은 누구보다도 젊다. 그래서 "i가 j보다 오래됨"은 모두 거짓이고, "j가 i보다 오래됨"은 모두 참이 된다.</div></div>
+      <div class="quiz-q" data-answer="3"><p>Q3. 적재를 믿고 발행된 소비자가 취소되는 계기는?</p><div class="opts">
+        <button class="opt">ROB가 가득 찼을 때</button><button class="opt">분기 오예측 리다이렉트</button><button class="opt">레지스터 파일 쓰기 포트 경쟁</button><button class="opt">적재 파이프라인의 ld1Cancel·ld2Cancel 신호</button></div>
+        <div class="quiz-exp">적재가 미스로 판명되면 적재 파이프라인이 취소 신호를 내고, <code>loadDependency</code>로 그 적재에 기댄 것으로 표시된 엔트리가 발행을 취소한다.</div></div>
+      <div class="quiz-q" data-answer="0"><p>Q4. 7번 정수 읽기 포트는 LDU0(우선순위 0), ALU3(1), BJU0(2)이 함께 쓴다. 셋이 같은 사이클에 요청하면?</p><div class="opts">
+        <button class="opt">LDU0만 통과하고 ALU3·BJU0은 OG0에서 실패한다</button><button class="opt">셋 다 통과한다</button><button class="opt">BJU0이 먼저다</button><button class="opt">가장 오래된 명령이 이긴다</button></div>
+        <div class="quiz-exp">설정의 우선순위 숫자가 작은 쪽이 이긴다. 진 실행 유닛은 실패 응답을 받고 다음 사이클에 다시 시도한다.</div></div>
+      <div class="quiz-q" data-answer="2"><p>Q5. 나눗셈기(DivCfg)의 설정으로 옳은 것은?</p><div class="opts">
+        <button class="opt">지연 2, 파이프라인</button><button class="opt">지연 0, 파이프라인</button><button class="opt">지연이 정해지지 않음, 파이프라인 아님</button><button class="opt">지연 3, 파이프라인 아님</button></div>
+        <div class="quiz-exp"><code>FuConfig.scala:367-376</code>: <code>piped = false</code>, <code>latency = UncertainLatency()</code>. 그래서 미리 깨울 수 없고, 하나를 끝낼 때까지 다음 명령을 받지 않는다.</div></div>
+    </div>
+  </section>
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ================================================================ 설정 데이터 (Parameters.scala:341-550) */
+  const SCHEDULERS = {
+    int: [
+      { name: "IQ0", entries: 18, enq: 2, comp: 10, exus: [{ name: "ALU0", fus: ["ALU", "CSR", "Fence", "Link"] }, { name: "BJU0", fus: ["BRH", "JMP"] }] },
+      { name: "IQ1", entries: 18, enq: 2, comp: 10, exus: [{ name: "ALU1", fus: ["ALU", "DIV"] }, { name: "BJU1", fus: ["BRH", "JMP"] }] },
+      { name: "IQ2", entries: 18, enq: 2, comp: 10, exus: [{ name: "ALU2", fus: ["ALU", "I2F"] }, { name: "BJU2", fus: ["BRH", "JMP"] }] },
+      { name: "IQ3", entries: 20, enq: 2, comp: 12, exus: [{ name: "ALU3", fus: ["ALU", "BKU", "VSET"] }] },
+      { name: "IQ4", entries: 20, enq: 2, comp: 12, exus: [{ name: "ALU4", fus: ["ALU", "MUL"] }] },
+      { name: "IQ5", entries: 20, enq: 2, comp: 12, exus: [{ name: "ALU5", fus: ["ALU", "MUL"] }] },
+      { name: "IQ6", entries: 20, enq: 2, comp: 12, exus: [{ name: "LDU0", fus: ["LDU"] }] },
+      { name: "IQ7", entries: 20, enq: 2, comp: 12, exus: [{ name: "LDU1", fus: ["LDU"] }] },
+      { name: "IQ8", entries: 20, enq: 2, comp: 12, exus: [{ name: "LDU2", fus: ["LDU"] }] },
+      { name: "IQ9", entries: 16, enq: 2, comp: 12, exus: [{ name: "STA0", fus: ["STA", "MOU"] }] },
+      { name: "IQ10", entries: 16, enq: 2, comp: 12, exus: [{ name: "STA1", fus: ["STA", "MOU"] }] },
+      { name: "IQ11", entries: 16, enq: 2, comp: 12, exus: [{ name: "STD0", fus: ["STD", "MOUD"] }] },
+      { name: "IQ12", entries: 16, enq: 2, comp: 12, exus: [{ name: "STD1", fus: ["STD", "MOUD"] }] },
+    ],
+    fp: [
+      { name: "FIQ0", entries: 20, enq: 2, comp: 18, exus: [{ name: "FEX0", fus: ["FALU", "FMUL", "FCVT", "FCMP"] }] },
+      { name: "FIQ1", entries: 20, enq: 2, comp: 18, exus: [{ name: "FEX1", fus: ["FALU", "FMUL", "FDIV"] }] },
+      { name: "FIQ2", entries: 20, enq: 2, comp: 18, exus: [{ name: "FEX2", fus: ["FALU", "FMUL", "FDIV"] }] },
+      { name: "FIQ3", entries: 20, enq: 2, comp: 18, exus: [{ name: "FEX3", fus: ["FALU", "FMUL"] }] },
+    ],
+    vec: [
+      { name: "VIQ0", entries: 16, enq: 2, comp: 14, exus: [{ name: "VFEX0", fus: ["VIALU", "VIMAC", "VMOVE", "VFCVT", "VFMAC"] }] },
+      { name: "VIQ1", entries: 16, enq: 2, comp: 14, exus: [{ name: "VFEX1", fus: ["VIALU", "VIDIV", "VFMAC", "VFDIV"] }] },
+      { name: "VIQ2", entries: 16, enq: 2, comp: 14, exus: [{ name: "VFEX2", fus: ["VIALU"] }] },
+      { name: "VIQ3", entries: 16, enq: 2, comp: 14, exus: [{ name: "VFEX3", fus: ["VIALU"] }] },
+      { name: "VIQ4", entries: 16, enq: 2, comp: 14, exus: [{ name: "VSTD0", fus: ["VSTD"] }] },
+      { name: "VIQ5", entries: 16, enq: 2, comp: 14, exus: [{ name: "VSTD1", fus: ["VSTD"] }] },
+    ],
+  };
+  /** 기능 유닛 표 (FuConfig.scala). latency: 숫자면 CertainLatency(합계), null이면 UncertainLatency */
+  const FUNCTION_UNITS = [
+    { name: "ALU",   config: "AluCfg",   line: 343, latency: 0, isPiped: true,  note: "기본값 CertainLatency(0)" },
+    { name: "BRH",   config: "BrhCfg",   line: 256, latency: 0, isPiped: true,  note: "조건 분기" },
+    { name: "JMP",   config: "NJmpCfg",  line: 235, latency: 0, isPiped: true,  note: "jal·jalr" },
+    { name: "MUL",   config: "MulCfg",   line: 355, latency: 2, isPiped: true,  note: "" },
+    { name: "BKU",   config: "BkuCfg",   line: 393, latency: 2, isPiped: true,  note: "비트 조작·암호 확장" },
+    { name: "I2F",   config: "I2fCfg",   line: 267, latency: 3, isPiped: true,  note: "CertainLatency(2, extra 1)" },
+    { name: "DIV",   config: "DivCfg",   line: 367, latency: null, isPiped: false, note: "" },
+    { name: "CSR",   config: "CsrCfg",   line: 329, latency: null, isPiped: false, note: "" },
+    { name: "LDU",   config: "LduCfg",   line: 465, latency: null, isPiped: false, note: "깨울 때는 3을 가정 (UncertainLatency(3))" },
+    { name: "STD",   config: "StdCfg",   line: 507, latency: 0, isPiped: true,  note: "스토어 데이터" },
+    { name: "FALU",  config: "FaluCfg",  line: 783, latency: 1, isPiped: true,  note: "" },
+    { name: "FMUL",  config: "FmulCfg",  line: 798, latency: 2, isPiped: true,  note: "" },
+    { name: "FCVT",  config: "FcvtCfg",  line: 828, latency: 3, isPiped: true,  note: "" },
+    { name: "FDIV",  config: "FdivCfg",  line: 813, latency: null, isPiped: false, note: "나눗셈·제곱근" },
+    { name: "VIALU", config: "VialuCfg", line: 586, latency: 1, isPiped: true,  note: "" },
+    { name: "VIMAC", config: "VimacCfg", line: 609, latency: 2, isPiped: true,  note: "" },
+    { name: "VFMAC", config: "VfmacCfg", line: 674, latency: 3, isPiped: true,  note: "" },
+    { name: "VIDIV", config: "VidivCfg", line: 632, latency: null, isPiped: false, note: "" },
+  ];
+  const FUNCTION_UNIT_LATENCY = { ALU: 0, MUL: 2, LDU: 3 };
+
+  /* ================================================================ 그림 7-1: 스케줄러 지도 */
+  let schedulerKey = "int", pickedQueue = 0;
+  let mapHitBoxes = [];
+  const mapView = MB.canvas("#cv-map", { aspect: 0.62, minHeight: 360, maxHeight: 640, draw: drawMap });
+  function queueColor(queue) {
+    const exuName = queue.exus[0].name;
+    if (exuName.startsWith("LDU") || exuName.startsWith("STA") || exuName.startsWith("STD") || exuName.startsWith("VSTD")) return "warn";
+    if (exuName.startsWith("FEX")) return "accent-2";
+    if (exuName.startsWith("VFEX")) return "color-purple";
+    return "accent";
+  }
+  function drawMap(ctx, width, height) {
+    const queues = SCHEDULERS[schedulerKey];
+    mapHitBoxes = [];
+    const isNarrow = width < 560;
+    const rowHeight = (height - 20) / queues.length;
+    const queueX = 8, queueWidth = isNarrow ? width * 0.3 : width * 0.24;
+    const exuX = queueX + queueWidth + (isNarrow ? 16 : 40), exuWidth = isNarrow ? width * 0.2 : width * 0.13;
+    const chipX = exuX + exuWidth + (isNarrow ? 8 : 24);
+    queues.forEach((queue, index) => {
+      const y = 10 + index * rowHeight;
+      const boxHeight = Math.max(14, rowHeight - 6);
+      const color = MB.css(queueColor(queue));
+      const isPicked = index === pickedQueue;
+      ctx.fillStyle = isPicked ? MB.alpha(color, 0.22) : MB.css("surface");
+      MB.roundRect(ctx, queueX, y, queueWidth, boxHeight, 5); ctx.fill();
+      ctx.strokeStyle = isPicked ? color : MB.css("border"); ctx.lineWidth = isPicked ? 2 : 1; ctx.stroke();
+      const labelSize = Math.min(12, boxHeight * 0.55);
+      MB.text(ctx, `${queue.name} · ${queue.entries}`, queueX + 6, y + boxHeight * 0.36, { size: labelSize, weight: 700, mono: true });
+      // 엔트리 구성 막대: enq | simp | comp
+      const simple = queue.entries - queue.enq - queue.comp;
+      const barY = y + boxHeight * 0.66, barHeight = Math.max(3, boxHeight * 0.22), barWidth = queueWidth - 12;
+      const unit = barWidth / queue.entries;
+      [[queue.enq, "accent-2"], [simple, "text-faint"], [queue.comp, "ok"]].reduce((offset, [count, token]) => {
+        if (count > 0) { ctx.fillStyle = MB.css(token); ctx.fillRect(queueX + 6 + offset * unit, barY, count * unit - 1, barHeight); }
+        return offset + count;
+      }, 0);
+      mapHitBoxes.push({ x: queueX, y, w: queueWidth, h: boxHeight, index });
+      // 실행 유닛과 기능 유닛
+      queue.exus.forEach((exu, exuIndex) => {
+        const exuHeight = boxHeight / queue.exus.length;
+        const exuY = y + exuIndex * exuHeight;
+        ctx.strokeStyle = MB.css("axis"); ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(queueX + queueWidth, y + boxHeight / 2); ctx.lineTo(exuX, exuY + exuHeight / 2); ctx.stroke();
+        ctx.fillStyle = MB.alpha(color, 0.12);
+        MB.roundRect(ctx, exuX, exuY + 1, exuWidth, exuHeight - 2, 4); ctx.fill();
+        MB.text(ctx, exu.name, exuX + exuWidth / 2, exuY + exuHeight / 2, { align: "center", size: Math.min(11.5, exuHeight * 0.6), weight: 700, mono: true, color });
+        let chipCursor = chipX;
+        exu.fus.forEach((fu) => {
+          ctx.font = `600 ${Math.min(10.5, exuHeight * 0.55)}px ${MB.css("mono")}`;
+          const chipWidth = ctx.measureText(fu).width + 10;
+          if (chipCursor + chipWidth > width - 4) return;
+          ctx.fillStyle = MB.css("surface");
+          MB.roundRect(ctx, chipCursor, exuY + 2, chipWidth, exuHeight - 4, 4); ctx.fill();
+          MB.text(ctx, fu, chipCursor + 5, exuY + exuHeight / 2, { size: Math.min(10.5, exuHeight * 0.55), mono: true, color: MB.css("text-dim") });
+          chipCursor += chipWidth + 4;
+        });
+      });
+    });
+  }
+  function paintMapInfo() {
+    const queue = SCHEDULERS[schedulerKey][pickedQueue];
+    const simple = queue.entries - queue.enq - queue.comp;
+    const exus = queue.exus.map((exu) => `<b>${exu.name}</b>(${exu.fus.join("·")})`).join(", ");
+    document.getElementById("map-info").innerHTML =
+      `<b>${queue.name}</b> · 엔트리 ${queue.entries}개 = 들어오는 칸 ${queue.enq} + 단순 칸 ${simple} + 복합 칸 ${queue.comp}. ` +
+      `한 사이클 최대 ${queue.enq}개 입장, ${queue.exus.length}개 발행. 실행 유닛: ${exus}.`;
+  }
+  MB.seg("#map-schd", (value) => { schedulerKey = value; pickedQueue = 0; paintMapInfo(); mapView.redraw(); });
+  mapView.onPointer("click", (x, y) => {
+    const hit = mapHitBoxes.find((box) => x >= box.x && x <= box.x + box.w && y >= box.y && y <= box.y + box.h);
+    if (hit) { pickedQueue = hit.index; paintMapInfo(); mapView.redraw(); }
+  });
+  paintMapInfo();
+
+  /* ================================================================ 그림 7-2: 디스패치 균형 */
+  const ALU_QUEUE_CAPACITY = [18, 18, 18, 20, 20, 20];
+  const DISPATCH_WIDTH = 8, ENQUEUE_PORTS_PER_QUEUE = 2, DISPATCH_HISTORY = 160;
+  let dispatchPolicy = "sorted", aluFraction = 0.5, readyProbability = 0.12;
+  let dispatchState;
+  function resetDispatch() {
+    dispatchState = { random: MB.rng(21), occupancy: [0, 0, 0, 0, 0, 0], cycle: 0, stallCycles: 0, issued: 0, history: [] };
+  }
+  function stepDispatch() {
+    const state = dispatchState;
+    // 1) 각 큐의 ALU가 준비된 엔트리 하나를 발행한다.
+    state.occupancy = state.occupancy.map((count) => {
+      if (count === 0) return 0;
+      const isAnyReady = state.random() < 1 - Math.pow(1 - readyProbability, count);
+      if (isAnyReady) { state.issued++; return count - 1; }
+      return count;
+    });
+    // 2) 8개 묶음 중 ALU 명령 수를 정하고 큐를 고른다.
+    let aluCount = 0;
+    for (let k = 0; k < DISPATCH_WIDTH; k++) if (state.random() < aluFraction) aluCount++;
+    const order = dispatchPolicy === "sorted"
+      ? [0, 1, 2, 3, 4, 5].sort((a, b) => state.occupancy[a] - state.occupancy[b] || a - b)
+      : [0, 1, 2, 3, 4, 5];
+    const enqueueThisCycle = [0, 0, 0, 0, 0, 0];
+    let isStalled = false;
+    for (let k = 0; k < aluCount; k++) {
+      const target = order[k % order.length];
+      if (state.occupancy[target] >= ALU_QUEUE_CAPACITY[target] || enqueueThisCycle[target] >= ENQUEUE_PORTS_PER_QUEUE) { isStalled = true; break; }
+      state.occupancy[target]++; enqueueThisCycle[target]++;
+    }
+    if (isStalled) state.stallCycles++;
+    state.cycle++;
+    state.history.push(state.occupancy.slice());
+    if (state.history.length > DISPATCH_HISTORY) state.history.shift();
+  }
+  resetDispatch();
+  const dispatchView = MB.canvas("#cv-dsp", { aspect: 0.42, minHeight: 230, maxHeight: 340, draw: drawDispatch });
+  function drawDispatch(ctx, width, height) {
+    const state = dispatchState;
+    const barAreaWidth = width * 0.42;
+    const left = 30, bottom = height - 26, top = 16;
+    const maxCapacity = 20;
+    const slot = (barAreaWidth - left) / 6;
+    state.occupancy.forEach((count, index) => {
+      const x = left + index * slot + slot * 0.15, barWidth = slot * 0.7;
+      const scale = (bottom - top) / maxCapacity;
+      ctx.fillStyle = MB.css("surface"); ctx.fillRect(x, bottom - ALU_QUEUE_CAPACITY[index] * scale, barWidth, ALU_QUEUE_CAPACITY[index] * scale);
+      const isFull = count >= ALU_QUEUE_CAPACITY[index];
+      ctx.fillStyle = isFull ? MB.css("bad") : MB.css("accent-2");
+      ctx.fillRect(x, bottom - count * scale, barWidth, count * scale);
+      ctx.strokeStyle = MB.css("axis"); ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.moveTo(x - 2, bottom - ALU_QUEUE_CAPACITY[index] * scale); ctx.lineTo(x + barWidth + 2, bottom - ALU_QUEUE_CAPACITY[index] * scale); ctx.stroke(); ctx.setLineDash([]);
+      MB.text(ctx, `IQ${index}`, x + barWidth / 2, bottom + 12, { align: "center", size: 11, mono: true, color: MB.css("text-dim") });
+      MB.text(ctx, String(count), x + barWidth / 2, bottom - count * scale - 8, { align: "center", size: 11, mono: true, weight: 700 });
+    });
+    // 오른쪽: 큐별 점유 시계열
+    const chartLeft = barAreaWidth + 40, chartRight = width - 10;
+    const colors = ["accent", "accent-2", "ok", "warn", "color-purple", "color-pink"];
+    ctx.strokeStyle = MB.css("grid");
+    ctx.strokeRect(chartLeft, top, chartRight - chartLeft, bottom - top);
+    MB.text(ctx, "큐별 점유 (최근 160사이클)", chartLeft, top - 4, { size: 11, color: MB.css("text-dim"), baseline: "bottom" });
+    for (let queue = 0; queue < 6; queue++) {
+      ctx.strokeStyle = MB.css(colors[queue]); ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      state.history.forEach((occupancy, k) => {
+        const x = chartLeft + (k / (DISPATCH_HISTORY - 1)) * (chartRight - chartLeft);
+        const y = bottom - (occupancy[queue] / maxCapacity) * (bottom - top);
+        if (k === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+      MB.text(ctx, `IQ${queue}`, chartLeft + 6 + queue * 38, bottom + 12, { size: 10.5, mono: true, color: MB.css(colors[queue]) });
+    }
+  }
+  function paintDispatch() {
+    const state = dispatchState;
+    MB.set("dsp-cycle", state.cycle);
+    MB.set("dsp-stall", state.cycle ? MB.pct(state.stallCycles / state.cycle) : "—", state.stallCycles / Math.max(1, state.cycle) > 0.1 ? "bad" : "");
+    MB.set("dsp-ipc", state.cycle ? `${MB.fmt(state.issued / state.cycle, 2)}<small>/사이클</small>` : "—");
+    MB.set("dsp-spread", `${Math.max(...state.occupancy)} / ${Math.min(...state.occupancy)}`);
+    dispatchView.redraw();
+  }
+  MB.seg("#dsp-policy", (value) => { dispatchPolicy = value; resetDispatch(); paintDispatch(); });
+  MB.range("dsp-mix", (value) => { aluFraction = value; resetDispatch(); paintDispatch(); }, (value) => MB.pct(value, 0));
+  MB.range("dsp-ready", (value) => { readyProbability = value; resetDispatch(); paintDispatch(); }, (value) => value.toFixed(2));
+  document.getElementById("dsp-reset").onclick = () => { resetDispatch(); paintDispatch(); };
+  resetDispatch();
+  const DISPATCH_STEPS_PER_SECOND = 20;
+  let dispatchAccumulator = 0;
+  const dispatchLoop = MB.loop(document.getElementById("sim-dsp"), (dt) => {
+    dispatchAccumulator += dt * DISPATCH_STEPS_PER_SECOND;
+    while (dispatchAccumulator >= 1) { stepDispatch(); dispatchAccumulator -= 1; }
+    paintDispatch();
+  });
+  MB.playButton("dsp-play", dispatchLoop, ["⏸ 멈춤", "▶ 재생"]);
+
+  /* ================================================================ 그림 7-3: 나이 행렬 */
+  const AGE_ENTRY_COUNT = 8;
+  let ageMatrix, ageSlots, ageSequence, lastIssued;
+  function clearAge() {
+    // ageMatrix[i][j] (i<j만 의미): i가 j보다 먼저 들어왔다
+    ageMatrix = Array.from({ length: AGE_ENTRY_COUNT }, () => new Array(AGE_ENTRY_COUNT).fill(false));
+    ageSlots = new Array(AGE_ENTRY_COUNT).fill(null);
+    ageSequence = 0; lastIssued = -1;
+  }
+  function getAge(row, column) {
+    if (row < column) return ageMatrix[row][column];
+    if (row === column) return true;
+    return !ageMatrix[column][row];
+  }
+  /** AgeDetector.scala:56-84 규칙: 들어온 i는 행이 0, 열이 1 */
+  function enqueueAt(slot) {
+    if (ageSlots[slot]) return;
+    for (let other = 0; other < AGE_ENTRY_COUNT; other++) {
+      if (other === slot) continue;
+      if (slot < other) ageMatrix[slot][other] = false; // i(=slot)는 other보다 젊다
+      else ageMatrix[other][slot] = true;              // other가 slot보다 오래됨
+    }
+    ageSequence++;
+    ageSlots[slot] = { order: ageSequence, isReady: false };
+  }
+  function oldestReady() {
+    const canIssue = ageSlots.map((slot) => !!(slot && slot.isReady));
+    for (let i = 0; i < AGE_ENTRY_COUNT; i++) {
+      if (!canIssue[i]) continue;
+      let isOldest = true;
+      for (let j = 0; j < AGE_ENTRY_COUNT; j++) if (!(getAge(i, j) || !canIssue[j])) { isOldest = false; break; }
+      if (isOldest) return i;
+    }
+    return -1;
+  }
+  let ageGeometry = null;
+  clearAge();
+  const ageView = MB.canvas("#cv-age", { aspect: 0.48, minHeight: 250, maxHeight: 400, draw: drawAge });
+  function drawAge(ctx, width, height) {
+    const isNarrow = width < 560;
+    const queueWidth = isNarrow ? width * 0.36 : width * 0.32;
+    const rowHeight = (height - 24) / AGE_ENTRY_COUNT;
+    const winner = oldestReady();
+    ageGeometry = { queueWidth, rowHeight };
+    for (let i = 0; i < AGE_ENTRY_COUNT; i++) {
+      const y = 12 + i * rowHeight;
+      const slot = ageSlots[i];
+      ctx.fillStyle = !slot ? MB.css("surface") : slot.isReady ? MB.alpha(MB.css("ok"), 0.25) : MB.alpha(MB.css("accent-2"), 0.14);
+      MB.roundRect(ctx, 8, y + 2, queueWidth - 16, rowHeight - 4, 6); ctx.fill();
+      ctx.strokeStyle = i === winner ? MB.css("ok") : i === lastIssued ? MB.css("warn") : MB.css("border");
+      ctx.lineWidth = i === winner ? 3 : 1; ctx.stroke();
+      MB.text(ctx, `칸 ${i}`, 16, y + rowHeight / 2, { size: 11.5, mono: true, color: MB.css("text-dim") });
+      const label = slot ? `#${slot.order} ${slot.isReady ? "준비" : "대기"}` : "비어 있음";
+      MB.text(ctx, label, queueWidth - 24, y + rowHeight / 2, { size: 12, align: "right", weight: slot ? 700 : 400, color: slot ? MB.css("text") : MB.css("text-faint") });
+    }
+    // 행렬
+    const matrixLeft = queueWidth + 30, size = Math.min(width - matrixLeft - 10, height - 40);
+    const cell = size / AGE_ENTRY_COUNT;
+    for (let i = 0; i < AGE_ENTRY_COUNT; i++) {
+      MB.text(ctx, String(i), matrixLeft - 10, 26 + i * cell + cell / 2, { size: 10.5, mono: true, align: "center", color: MB.css("text-faint") });
+      MB.text(ctx, String(i), matrixLeft + i * cell + cell / 2, 14, { size: 10.5, mono: true, align: "center", color: MB.css("text-faint") });
+      for (let j = 0; j < AGE_ENTRY_COUNT; j++) {
+        const x = matrixLeft + j * cell, y = 22 + i * cell;
+        const isStored = i < j;
+        const isMeaningful = ageSlots[i] && ageSlots[j];
+        const value = getAge(i, j);
+        ctx.fillStyle = i === j ? MB.css("surface-2") : value && isMeaningful ? MB.alpha(MB.css(isStored ? "accent" : "accent-2"), isStored ? 0.75 : 0.35) : MB.css("surface");
+        ctx.fillRect(x + 1, y + 1, cell - 2, cell - 2);
+        if (i === winner) { ctx.strokeStyle = MB.css("ok"); ctx.lineWidth = 2; ctx.strokeRect(x + 1, y + 1, cell - 2, cell - 2); }
+      }
+    }
+    MB.text(ctx, "age(i, j): i가 j보다 오래됨", matrixLeft, height - 6, { size: 11, color: MB.css("text-dim"), baseline: "bottom" });
+  }
+  function paintAge(message) {
+    const winner = oldestReady();
+    document.getElementById("age-info").innerHTML = message || (winner >= 0
+      ? `준비된 칸 중 가장 오래된 것은 <b>칸 ${winner}</b>(#${ageSlots[winner].order})이다. 행 ${winner}에서 준비된 다른 칸의 열이 모두 칠해져 있는지 확인해 보자.`
+      : "준비된 엔트리가 없다. 찬 칸을 눌러 준비 상태로 만들자.");
+    ageView.redraw();
+  }
+  ageView.onPointer("click", (x, y) => {
+    if (!ageGeometry || x > ageGeometry.queueWidth) return;
+    const slot = Math.floor((y - 12) / ageGeometry.rowHeight);
+    if (slot < 0 || slot >= AGE_ENTRY_COUNT) return;
+    if (!ageSlots[slot]) enqueueAt(slot); else ageSlots[slot].isReady = !ageSlots[slot].isReady;
+    paintAge();
+  });
+  document.getElementById("age-enq").onclick = () => {
+    const free = ageSlots.map((slot, index) => (slot ? -1 : index)).filter((index) => index >= 0);
+    if (!free.length) { paintAge("큐가 가득 찼다. 발행해서 칸을 비우자."); return; }
+    // 빈 칸 중 아무 데나 들어간다: 위치와 나이가 무관하다는 것을 보이려고 무작위로 고른다.
+    enqueueAt(free[Math.floor(Math.random() * free.length)]);
+    paintAge();
+  };
+  document.getElementById("age-issue").onclick = () => {
+    const winner = oldestReady();
+    if (winner < 0) { paintAge("준비된 엔트리가 없어 발행할 것이 없다."); return; }
+    const order = ageSlots[winner].order;
+    ageSlots[winner] = null; lastIssued = winner;
+    paintAge(`칸 ${winner}(#${order})을 발행했다. 행렬 값은 그대로 두지만, 빈 칸은 canIssue가 0이라 비교에서 빠진다.`);
+  };
+  document.getElementById("age-clear").onclick = () => { clearAge(); paintAge(); };
+  clearAge();
+  [5, 2, 7, 0, 3].forEach((slot) => enqueueAt(slot));
+  ageSlots[2].isReady = true; ageSlots[0].isReady = true; ageSlots[3].isReady = true;
+  paintAge();
+
+  /* ================================================================ 그림 7-4: 웨이크업 타임라인 */
+  const WAKE_PROGRAM = [
+    { text: "ld   x1, 0(x10)", unit: "LDU", sources: [] },
+    { text: "add  x2, x1, 1", unit: "ALU", sources: [0] },
+    { text: "mul  x3, x2, x2", unit: "MUL", sources: [1] },
+    { text: "add  x4, x3, x2", unit: "ALU", sources: [2, 1] },
+    { text: "add  x5, x4, x1", unit: "ALU", sources: [3, 0] },
+    { text: "add  x6, x5, 1", unit: "ALU", sources: [4] },
+  ];
+  const READ_STAGES = 2;           // OG0, OG1
+  const MISS_DETECT_AFTER_ISSUE = 5; // 웹 모델: 적재 발행 후 이 사이클에 미스가 판명된다
+  let wakeMode = "spec", isLoadHit = true, missPenalty = 12;
+  /**
+   * 사이클 단위 모델. 반환: 명령별 사건 목록 [{cycle, kind}] 과 통계.
+   * kind: issue | read | exec | cancel
+   */
+  function simulateWakeup() {
+    const count = WAKE_PROGRAM.length;
+    const issueCycle = new Array(count).fill(-1);
+    const wakeCycle = new Array(count).fill(Infinity);
+    const events = WAKE_PROGRAM.map(() => []);
+    let cancelCount = 0, wastedReads = 0;
+    let isMissResolved = false;
+    const executeLength = (index) => (WAKE_PROGRAM[index].unit === "LDU" && !isLoadHit ? FUNCTION_UNIT_LATENCY.LDU + 1 + missPenalty : FUNCTION_UNIT_LATENCY[WAKE_PROGRAM[index].unit] + 1);
+    const wakeDistance = (index) => {
+      const latency = FUNCTION_UNIT_LATENCY[WAKE_PROGRAM[index].unit];
+      return wakeMode === "spec" ? latency + 1 : READ_STAGES + latency + 2;
+    };
+    const dependsOnLoad = (index, visited = new Set()) => {
+      if (index === 0) return true;
+      if (visited.has(index)) return false;
+      visited.add(index);
+      return WAKE_PROGRAM[index].sources.some((source) => dependsOnLoad(source, visited));
+    };
+    for (let cycle = 0; cycle < 80; cycle++) {
+      // 미스 판명: 적재를 믿고 발행된 명령을 취소한다.
+      if (!isLoadHit && !isMissResolved && issueCycle[0] >= 0 && cycle === issueCycle[0] + MISS_DETECT_AFTER_ISSUE) {
+        isMissResolved = true;
+        for (let index = 1; index < count; index++) {
+          if (issueCycle[index] >= 0 && dependsOnLoad(index)) {
+            events[index].push({ cycle, kind: "cancel" });
+            wastedReads += Math.min(READ_STAGES, cycle - issueCycle[index]);
+            issueCycle[index] = -1; wakeCycle[index] = Infinity; cancelCount++;
+          }
+        }
+        // 실제 데이터가 돌아오는 시점으로 적재의 깨움 시각을 고친다.
+        wakeCycle[0] = issueCycle[0] + (wakeMode === "spec" ? FUNCTION_UNIT_LATENCY.LDU + 1 : READ_STAGES + FUNCTION_UNIT_LATENCY.LDU + 2) + missPenalty;
+      }
+      for (let index = 0; index < count; index++) {
+        if (issueCycle[index] >= 0) continue;
+        const isReady = WAKE_PROGRAM[index].sources.every((source) => issueCycle[source] >= 0 && wakeCycle[source] <= cycle);
+        if (!isReady) continue;
+        issueCycle[index] = cycle;
+        wakeCycle[index] = cycle + wakeDistance(index);
+        events[index].push({ cycle, kind: "issue" });
+      }
+    }
+    let lastCycle = 0;
+    for (let index = 0; index < count; index++) {
+      const start = issueCycle[index] + 1 + READ_STAGES;
+      const length = executeLength(index);
+      events[index].push({ cycle: issueCycle[index], kind: "final", start, length });
+      lastCycle = Math.max(lastCycle, start + length);
+    }
+    return { events, issueCycle, lastCycle, cancelCount, wastedReads };
+  }
+  const wakeView = MB.canvas("#cv-wake", { aspect: 0.4, minHeight: 240, maxHeight: 340, draw: drawWake });
+  function drawWake(ctx, width, height) {
+    const result = simulateWakeup();
+    const labelWidth = width < 560 ? 92 : 140;
+    const columns = Math.max(24, result.lastCycle + 2);
+    const cellWidth = (width - labelWidth - 10) / columns;
+    const rowHeight = (height - 30) / WAKE_PROGRAM.length;
+    for (let cycle = 0; cycle < columns; cycle += 5) {
+      MB.text(ctx, String(cycle), labelWidth + cycle * cellWidth, 10, { size: 10, mono: true, color: MB.css("text-faint") });
+    }
+    WAKE_PROGRAM.forEach((instruction, index) => {
+      const y = 22 + index * rowHeight;
+      MB.text(ctx, width < 560 ? instruction.text.split(",")[0] : instruction.text, 6, y + rowHeight / 2, { size: width < 560 ? 10 : 11.5, mono: true });
+      ctx.fillStyle = MB.css("surface-2");
+      const enterCycle = 0;
+      ctx.fillRect(labelWidth + enterCycle * cellWidth, y + rowHeight * 0.3, (result.issueCycle[index] - enterCycle) * cellWidth, rowHeight * 0.4);
+      const cell = (cycle, token, text) => {
+        ctx.fillStyle = MB.css(token);
+        ctx.fillRect(labelWidth + cycle * cellWidth + 0.5, y + 3, Math.max(1, cellWidth - 1), rowHeight - 6);
+        if (text && cellWidth > 9) MB.text(ctx, text, labelWidth + cycle * cellWidth + cellWidth / 2, y + rowHeight / 2, { size: 9.5, align: "center", color: "#fff", weight: 700 });
+      };
+      result.events[index].forEach((event) => {
+        if (event.kind === "cancel") cell(event.cycle, "bad", "X");
+        if (event.kind === "issue") {
+          const isCanceledLater = result.events[index].some((other) => other.kind === "cancel" && other.cycle > event.cycle && other.cycle - event.cycle <= READ_STAGES + 1);
+          cell(event.cycle, "accent-2", "I");
+          for (let k = 1; k <= READ_STAGES; k++) {
+            const cancelEvent = result.events[index].find((other) => other.kind === "cancel" && other.cycle > event.cycle);
+            if (cancelEvent && event.cycle + k >= cancelEvent.cycle) break;
+            cell(event.cycle + k, "warn", k === 1 ? "0" : "1");
+          }
+          if (isCanceledLater) return;
+        }
+        if (event.kind === "final") {
+          for (let k = 0; k < event.length; k++) cell(event.start + k, "ok", "");
+        }
+      });
+    });
+  }
+  function paintWake() {
+    const result = simulateWakeup();
+    MB.set("wk-end", `${result.lastCycle}<small>사이클</small>`);
+    MB.set("wk-cancel", String(result.cancelCount), result.cancelCount ? "bad" : "");
+    MB.set("wk-waste", String(result.wastedReads));
+    wakeView.redraw();
+  }
+  MB.seg("#wk-mode", (value) => { wakeMode = value; paintWake(); });
+  MB.seg("#wk-hit", (value) => { isLoadHit = value === "hit"; paintWake(); });
+  MB.range("wk-pen", (value) => { missPenalty = value; paintWake(); }, (value) => `${value}사이클`);
+  paintWake();
+
+  /* ================================================================ 그림 7-5: 읽기 포트 중재 */
+  // 정수 읽기 포트 사용표 (Parameters.scala:341-453의 IntRD(포트, 우선순위))
+  const READ_PORT_USERS = {
+    ALU0: [[0, 0], [1, 0]], BJU0: [[1, 1], [7, 2]],
+    ALU1: [[2, 0], [3, 0]], BJU1: [[3, 1], [9, 2]],
+    ALU2: [[4, 0], [5, 0]], BJU2: [[5, 1], [11, 2]],
+    ALU3: [[6, 0], [7, 1]], ALU4: [[8, 0], [9, 1]], ALU5: [[10, 0], [11, 1]],
+    LDU0: [[7, 0]], LDU1: [[9, 0]], LDU2: [[11, 0]],
+    STA0: [[6, 1]], STA1: [[8, 1]], STD0: [[0, 1]], STD1: [[2, 1]],
+  };
+  const PORT_EXU_NAMES = Object.keys(READ_PORT_USERS);
+  const PORT_PRESETS = {
+    alu: ["ALU0", "ALU1", "ALU2", "ALU3", "ALU4", "ALU5"],
+    aluld: ["ALU0", "ALU1", "ALU2", "ALU3", "ALU4", "ALU5", "LDU0", "LDU1", "LDU2"],
+    all: ["ALU0", "ALU1", "ALU2", "ALU3", "ALU4", "ALU5", "LDU0", "LDU1", "LDU2", "BJU0", "BJU1", "BJU2"],
+    st: ["STA0", "STA1", "STD0", "STD1", "BJU0", "BJU1", "BJU2", "ALU0", "ALU4"],
+  };
+  const INT_READ_PORT_COUNT = 12;
+  let activeExus = new Set(PORT_PRESETS.alu);
+  const exuButtons = document.getElementById("port-exus");
+  exuButtons.innerHTML = PORT_EXU_NAMES.map((name) => `<button class="btn sm" data-name="${name}">${name}</button>`).join("");
+  exuButtons.addEventListener("click", (event) => {
+    const button = event.target.closest("button"); if (!button) return;
+    const name = button.dataset.name;
+    if (activeExus.has(name)) activeExus.delete(name); else activeExus.add(name);
+    paintPorts();
+  });
+  function arbitratePorts() {
+    const requestsByPort = Array.from({ length: INT_READ_PORT_COUNT }, () => []);
+    activeExus.forEach((name) => READ_PORT_USERS[name].forEach(([port, priority], sourceIndex) => requestsByPort[port].push({ name, priority, sourceIndex })));
+    const losers = new Set();
+    const decisions = [];
+    requestsByPort.forEach((requests, port) => {
+      if (!requests.length) return;
+      const best = Math.min(...requests.map((request) => request.priority));
+      requests.forEach((request) => {
+        const isWinner = request.priority === best;
+        if (!isWinner) losers.add(request.name);
+        decisions.push({ port, ...request, isWinner });
+      });
+    });
+    return { decisions, losers };
+  }
+  const portView = MB.canvas("#cv-port", { aspect: 0.42, minHeight: 250, maxHeight: 360, draw: drawPorts });
+  function drawPorts(ctx, width, height) {
+    const { decisions, losers } = arbitratePorts();
+    const portY = height - 46;
+    const portSpacing = (width - 40) / INT_READ_PORT_COUNT;
+    const portX = (port) => 20 + port * portSpacing + portSpacing / 2;
+    const active = [...activeExus].sort((a, b) => PORT_EXU_NAMES.indexOf(a) - PORT_EXU_NAMES.indexOf(b));
+    const exuSpacing = (width - 40) / Math.max(1, active.length);
+    const exuX = (name) => 20 + active.indexOf(name) * exuSpacing + exuSpacing / 2;
+    const exuY = 30;
+    decisions.forEach((decision) => {
+      ctx.strokeStyle = decision.isWinner ? MB.css("ok") : MB.css("bad");
+      ctx.lineWidth = decision.isWinner ? 1.8 : 1.4;
+      ctx.setLineDash(decision.isWinner ? [] : [4, 3]);
+      ctx.beginPath(); ctx.moveTo(exuX(decision.name), exuY + 12); ctx.lineTo(portX(decision.port), portY - 14); ctx.stroke();
+      ctx.setLineDash([]);
+      const midX = exuX(decision.name) * 0.25 + portX(decision.port) * 0.75, midY = (exuY + 12) * 0.25 + (portY - 14) * 0.75;
+      MB.text(ctx, String(decision.priority), midX, midY, { size: 10, mono: true, align: "center", weight: 700, color: decision.isWinner ? MB.css("ok") : MB.css("bad") });
+    });
+    active.forEach((name) => {
+      const isLoser = losers.has(name);
+      ctx.fillStyle = isLoser ? MB.alpha(MB.css("bad"), 0.2) : MB.alpha(MB.css("ok"), 0.18);
+      MB.roundRect(ctx, exuX(name) - Math.min(30, exuSpacing / 2 - 2), exuY - 12, Math.min(60, exuSpacing - 4), 24, 6); ctx.fill();
+      MB.text(ctx, name, exuX(name), exuY, { size: width < 560 ? 8.5 : 11, mono: true, align: "center", weight: 700, color: isLoser ? MB.css("bad") : MB.css("text") });
+    });
+    for (let port = 0; port < INT_READ_PORT_COUNT; port++) {
+      const used = decisions.some((decision) => decision.port === port);
+      ctx.fillStyle = used ? MB.css("accent-2") : MB.css("surface-2");
+      MB.roundRect(ctx, portX(port) - portSpacing * 0.38, portY - 14, portSpacing * 0.76, 28, 5); ctx.fill();
+      MB.text(ctx, String(port), portX(port), portY, { size: 11, mono: true, align: "center", weight: 700, color: used ? "#fff" : MB.css("text-faint") });
+    }
+    MB.text(ctx, "정수 레지스터 파일 읽기 포트", 20, height - 12, { size: 11, color: MB.css("text-dim") });
+  }
+  function paintPorts() {
+    exuButtons.querySelectorAll("button").forEach((button) => button.classList.toggle("on", activeExus.has(button.dataset.name)));
+    const { losers } = arbitratePorts();
+    MB.set("port-req", String(activeExus.size));
+    MB.set("port-pass", String(activeExus.size - losers.size));
+    MB.set("port-lose", losers.size ? [...losers].join(", ") : "없음", losers.size ? "bad" : "good");
+    portView.redraw();
+  }
+  MB.seg("#port-preset", (value) => { activeExus = new Set(PORT_PRESETS[value]); paintPorts(); });
+  paintPorts();
+
+  /* ================================================================ 그림 7-6: 기능 유닛 지연·처리량 */
+  const OPERATION_COUNT = 10;
+  let pickedUnit = 3, dependencyMode = "indep", uncertainExample = 12;
+  const table = document.getElementById("fu-table");
+  table.innerHTML = "<tr><th>기능 유닛</th><th>설정</th><th class=\"num\">지연</th><th>파이프라인</th><th>비고</th></tr>" +
+    FUNCTION_UNITS.map((unit, index) => `<tr data-index="${index}"><td class="mono"><b>${unit.name}</b></td><td class="mono">FuConfig.scala:${unit.line}</td>` +
+      `<td class="num">${unit.latency === null ? "정해지지 않음" : unit.latency}</td><td>${unit.isPiped ? "예" : "아니오"}</td><td class="small dim">${unit.note}</td></tr>`).join("");
+  table.addEventListener("click", (event) => {
+    const row = event.target.closest("tr[data-index]"); if (!row) return;
+    pickedUnit = +row.dataset.index; paintUnits();
+  });
+  function simulateUnit() {
+    const unit = FUNCTION_UNITS[pickedUnit];
+    const latency = unit.latency === null ? uncertainExample : unit.latency;
+    const occupancy = latency + 1; // 실행 사이클 수
+    const spans = [];
+    let unitFreeAt = 0, previousDone = 0;
+    for (let k = 0; k < OPERATION_COUNT; k++) {
+      let start = k === 0 ? 0 : spans[k - 1].start + 1;
+      if (!unit.isPiped) start = Math.max(start, unitFreeAt);
+      if (dependencyMode === "chain") start = Math.max(start, previousDone);
+      spans.push({ start, length: occupancy });
+      unitFreeAt = start + occupancy;
+      previousDone = start + occupancy;
+    }
+    const total = Math.max(...spans.map((span) => span.start + span.length));
+    return { spans, total, unit };
+  }
+  const unitView = MB.canvas("#cv-fu", { aspect: 0.34, minHeight: 210, maxHeight: 300, draw: drawUnits });
+  function drawUnits(ctx, width, height) {
+    const { spans, total } = simulateUnit();
+    const left = 34, right = width - 10;
+    const columns = Math.max(total, 20);
+    const cellWidth = (right - left) / columns;
+    const rowHeight = (height - 24) / OPERATION_COUNT;
+    spans.forEach((span, index) => {
+      const y = 6 + index * rowHeight;
+      MB.text(ctx, `#${index}`, 4, y + rowHeight / 2, { size: 10.5, mono: true, color: MB.css("text-dim") });
+      ctx.fillStyle = MB.css("accent");
+      MB.roundRect(ctx, left + span.start * cellWidth, y + 2, span.length * cellWidth - 1, rowHeight - 4, 3); ctx.fill();
+    });
+    for (let cycle = 0; cycle <= columns; cycle += 5) MB.text(ctx, String(cycle), left + cycle * cellWidth, height - 8, { size: 10, mono: true, align: "center", color: MB.css("text-faint") });
+  }
+  function paintUnits() {
+    table.querySelectorAll("tr[data-index]").forEach((row) => row.classList.toggle("pick", +row.dataset.index === pickedUnit));
+    const { total, unit } = simulateUnit();
+    MB.set("fu-name", `${unit.name} <small>${unit.isPiped ? "파이프라인" : "비파이프라인"}</small>`);
+    MB.set("fu-total", `${total}<small>사이클</small>`);
+    MB.set("fu-tp", `${MB.fmt(OPERATION_COUNT / total, 2)}<small>/사이클</small>`);
+    unitView.redraw();
+  }
+  MB.seg("#fu-dep", (value) => { dependencyMode = value; paintUnits(); });
+  MB.range("fu-unc", (value) => { uncertainExample = value; paintUnits(); }, (value) => `${value}사이클 (예시)`);
+  paintUnits();
+})();
+</script>
+</body>
+</html>
